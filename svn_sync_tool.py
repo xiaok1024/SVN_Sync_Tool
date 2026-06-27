@@ -1,7 +1,7 @@
 ﻿# -*- coding: utf-8 -*-
-"""SVN 代码拉取 + 交叉文件覆盖 + 全自动提交"""
+"""SVN 代码拉取 + 交叉文件覆盖 + 全自动提交 + 文件路径导出"""
 
-import os, sys, subprocess, threading, shutil
+import os, sys, subprocess, threading, shutil, locale
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext, messagebox
 from pathlib import Path
@@ -10,13 +10,17 @@ except: import Queue as queue
 
 CREATE_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
 
+# 自动检测系统编码：中文 Windows 用 GBK，否则 UTF-8
+_SYS_ENC = locale.getpreferredencoding()
+_SVN_ENC = 'gbk' if _SYS_ENC.lower() in ('cp936', 'gbk', 'gb2312', 'gb18030') else 'utf-8'
+
 
 class SvnSyncTool:
     def __init__(self, root):
         self.root = root
         self.root.title("SVN 代码同步工具")
-        self.root.geometry("920x760")
-        self.root.minsize(760, 620)
+        self.root.geometry("920x820")
+        self.root.minsize(760, 660)
         style = ttk.Style()
         style.theme_use("vista" if "vista" in style.theme_names() else "clam")
         self.svn_url = tk.StringVar()
@@ -25,8 +29,9 @@ class SvnSyncTool:
         self.checkout_dir = tk.StringVar()
         self.source_dir = tk.StringVar()
         self.target_dir = tk.StringVar()
-        self.mode_var = tk.StringVar(value="auto")
+        self.mode_var = tk.StringVar(value="checkout")
         self.log_queue = queue.Queue()
+        self._commit_urls = []
         self._build_ui()
         self._poll_log_queue()
 
@@ -46,25 +51,25 @@ class SvnSyncTool:
     def _build_tab1(self, t1):
         row = 0
         ttk.Label(t1, text="SVN 仓库地址：", font=("Microsoft YaHei", 10)).grid(row=row, column=0, sticky=tk.W, pady=(0, 4)); row+=1
-        ttk.Entry(t1, textvariable=self.svn_url, font=("Consolas", 10)).grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(0, 6)); row+=1
+        ttk.Entry(t1, textvariable=self.svn_url, font=("Microsoft YaHei", 10)).grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(0, 6)); row+=1
         af = ttk.Frame(t1)
         af.grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(0, 6))
         ttk.Label(af, text="用户名：", font=("Microsoft YaHei", 9)).pack(side=tk.LEFT)
-        ttk.Entry(af, textvariable=self.svn_user, font=("Consolas", 9), width=18).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Entry(af, textvariable=self.svn_user, font=("Microsoft YaHei", 9), width=18).pack(side=tk.LEFT, padx=(0, 12))
         ttk.Label(af, text="密码：", font=("Microsoft YaHei", 9)).pack(side=tk.LEFT)
-        ttk.Entry(af, textvariable=self.svn_pass, font=("Consolas", 9), width=18, show="*").pack(side=tk.LEFT, padx=(0, 0))
+        ttk.Entry(af, textvariable=self.svn_pass, font=("Microsoft YaHei", 9), width=18, show="*").pack(side=tk.LEFT, padx=(0, 0))
         ttk.Label(af, text="（留空使用缓存）", font=("Microsoft YaHei", 8)).pack(side=tk.LEFT, padx=(6, 0))
         row += 1
         ttk.Label(t1, text="拉取到目录：", font=("Microsoft YaHei", 10)).grid(row=row, column=0, sticky=tk.W, pady=(0, 4)); row+=1
         frm = ttk.Frame(t1)
         frm.grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(0, 10))
-        ttk.Entry(frm, textvariable=self.checkout_dir, font=("Consolas", 10)).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Entry(frm, textvariable=self.checkout_dir, font=("Microsoft YaHei", 10)).pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(frm, text="浏览...", command=self._browse_checkout).pack(side=tk.RIGHT, padx=(6, 0))
         row+=1
         self.btn_co = ttk.Button(t1, text="拉取代码", command=self._start_checkout)
         self.btn_co.grid(row=row, column=0, columnspan=3, pady=(0, 10)); row+=1
         ttk.Label(t1, text="执行日志：", font=("Microsoft YaHei", 9)).grid(row=row, column=0, sticky=tk.W); row+=1
-        self.log_co = scrolledtext.ScrolledText(t1, height=14, font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4", insertbackground="white")
+        self.log_co = scrolledtext.ScrolledText(t1, height=14, font=("Microsoft YaHei", 9), bg="#1e1e1e", fg="#d4d4d4", insertbackground="white")
         self.log_co.grid(row=row, column=0, columnspan=3, sticky=tk.NSEW); row+=1
         t1.columnconfigure(1, weight=1)
         t1.rowconfigure(row, weight=1)
@@ -74,13 +79,13 @@ class SvnSyncTool:
         ttk.Label(t2, text="SVN 拉取目录（目标，被覆盖）：", font=("Microsoft YaHei", 10)).grid(row=row, column=0, sticky=tk.W, pady=(0, 4)); row+=1
         f2 = ttk.Frame(t2)
         f2.grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(0, 6))
-        ttk.Entry(f2, textvariable=self.target_dir, font=("Consolas", 10)).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Entry(f2, textvariable=self.target_dir, font=("Microsoft YaHei", 10)).pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(f2, text="浏览...", command=self._browse_target).pack(side=tk.RIGHT, padx=(6, 0))
         row+=1
         ttk.Label(t2, text="整理好的目录（来源，取文件）：", font=("Microsoft YaHei", 10)).grid(row=row, column=0, sticky=tk.W, pady=(0, 4)); row+=1
         f1 = ttk.Frame(t2)
         f1.grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(0, 10))
-        ttk.Entry(f1, textvariable=self.source_dir, font=("Consolas", 10)).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Entry(f1, textvariable=self.source_dir, font=("Microsoft YaHei", 10)).pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(f1, text="浏览...", command=self._browse_source).pack(side=tk.RIGHT, padx=(6, 0))
         row+=1
         bf = ttk.Frame(t2)
@@ -122,23 +127,23 @@ class SvnSyncTool:
         af = ttk.Frame(t3)
         af.grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(0, 8))
         ttk.Label(af, text="用户名：", font=("Microsoft YaHei", 9)).pack(side=tk.LEFT)
-        ttk.Entry(af, textvariable=self.svn_user, font=("Consolas", 9), width=16).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Entry(af, textvariable=self.svn_user, font=("Microsoft YaHei", 9), width=16).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Label(af, text="密码：", font=("Microsoft YaHei", 9)).pack(side=tk.LEFT)
-        ttk.Entry(af, textvariable=self.svn_pass, font=("Consolas", 9), width=16, show="*").pack(side=tk.LEFT, padx=(0, 0))
+        ttk.Entry(af, textvariable=self.svn_pass, font=("Microsoft YaHei", 9), width=16, show="*").pack(side=tk.LEFT, padx=(0, 0))
         ttk.Label(af, text="（留空使用缓存）", font=("Microsoft YaHei", 8)).pack(side=tk.LEFT, padx=(6, 0))
         row += 1
         ttk.Label(t3, text="SVN 仓库地址：", font=("Microsoft YaHei", 10)).grid(row=row, column=0, sticky=tk.W, pady=(0, 2)); row+=1
-        ttk.Entry(t3, textvariable=self.svn_url, font=("Consolas", 10)).grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(0, 6)); row+=1
+        ttk.Entry(t3, textvariable=self.svn_url, font=("Microsoft YaHei", 10)).grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(0, 6)); row+=1
         ttk.Label(t3, text="SVN 拉取目录：", font=("Microsoft YaHei", 10)).grid(row=row, column=0, sticky=tk.W, pady=(0, 2)); row+=1
         f_a = ttk.Frame(t3)
         f_a.grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(0, 6))
-        ttk.Entry(f_a, textvariable=self.checkout_dir, font=("Consolas", 10)).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Entry(f_a, textvariable=self.checkout_dir, font=("Microsoft YaHei", 10)).pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(f_a, text="浏览...", command=self._browse_checkout).pack(side=tk.RIGHT, padx=(6, 0))
         row+=1
         ttk.Label(t3, text="整理好的目录（来源取文件）：", font=("Microsoft YaHei", 10)).grid(row=row, column=0, sticky=tk.W, pady=(0, 2)); row+=1
         f_b = ttk.Frame(t3)
         f_b.grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(0, 10))
-        ttk.Entry(f_b, textvariable=self.source_dir, font=("Consolas", 10)).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Entry(f_b, textvariable=self.source_dir, font=("Microsoft YaHei", 10)).pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(f_b, text="浏览...", command=self._browse_source).pack(side=tk.RIGHT, padx=(6, 0))
         row+=1
         mode_f = ttk.Frame(t3)
@@ -148,18 +153,37 @@ class SvnSyncTool:
         ttk.Radiobutton(mode_f, text="update（已有则更新）", variable=self.mode_var, value="update").pack(side=tk.LEFT, padx=(0, 6))
         row += 1
         ttk.Label(t3, text="SVN 提交信息：", font=("Microsoft YaHei", 10)).grid(row=row, column=0, sticky=tk.W, pady=(0, 2)); row+=1
-        self.auto_msg = scrolledtext.ScrolledText(t3, height=4, font=("Microsoft YaHei", 10), wrap=tk.WORD)
+        self.auto_msg = scrolledtext.ScrolledText(t3, height=3, font=("Microsoft YaHei", 10), wrap=tk.WORD)
         self.auto_msg.grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(0, 8))
         self.auto_msg.insert(tk.END, "自动同步代码")
         row += 1
-        self.btn_auto = ttk.Button(t3, text="▶ 一键执行：拉取 -> 覆盖 -> 提交", command=self._start_auto_pipeline)
+        self.btn_auto = ttk.Button(t3, text="[>>] 一键执行：拉取 -> 覆盖 -> 提交", command=self._start_auto_pipeline)
         self.btn_auto.grid(row=row, column=0, columnspan=3, pady=(0, 10), ipady=4)
         row += 1
         ttk.Label(t3, text="执行日志：", font=("Microsoft YaHei", 9)).grid(row=row, column=0, sticky=tk.W); row+=1
-        self.log_auto = scrolledtext.ScrolledText(t3, height=12, font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4", insertbackground="white")
+        self.log_auto = scrolledtext.ScrolledText(t3, height=10, font=("Microsoft YaHei", 9), bg="#1e1e1e", fg="#d4d4d4", insertbackground="white")
         self.log_auto.grid(row=row, column=0, columnspan=3, sticky=tk.NSEW); row+=1
+        row += 1
+
+        # 文件路径导出区域
+        self.path_frame = ttk.LabelFrame(t3, text=" 提交文件路径 ", padding=(8, 4))
+        self.path_frame.grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(6, 4))
+        pf_row = 0
+        btn_copy_frame = ttk.Frame(self.path_frame)
+        btn_copy_frame.grid(row=pf_row, column=0, sticky=tk.W, pady=(2, 2))
+        self.btn_copy_paths = ttk.Button(btn_copy_frame, text="[复制] 复制文件路径", command=self._copy_commit_paths, state=tk.DISABLED)
+        self.btn_copy_paths.pack(side=tk.LEFT, padx=(0, 10))
+        self.lbl_paths_count = ttk.Label(btn_copy_frame, text="（暂无）", font=("Microsoft YaHei", 9))
+        self.lbl_paths_count.pack(side=tk.LEFT)
+        pf_row += 1
+        self.txt_paths = scrolledtext.ScrolledText(self.path_frame, height=4, font=("Microsoft YaHei", 9),
+                                                    bg="#1e1e1e", fg="#a0d0a0", insertbackground="white", state=tk.DISABLED)
+        self.txt_paths.grid(row=pf_row, column=0, sticky=tk.EW, pady=(2, 2))
+        self.path_frame.columnconfigure(0, weight=1)
+        row += 1
+
         t3.columnconfigure(1, weight=1)
-        t3.rowconfigure(row, weight=1)
+        t3.rowconfigure(row - 2, weight=1)
 
     def _browse_checkout(self):
         d = filedialog.askdirectory(title="选择 SVN 拉取目标目录")
@@ -198,11 +222,12 @@ class SvnSyncTool:
         return cmd
 
     def _run_svn(self, log_widget, *args):
+        """运行 svn 命令，用系统编码解码输出"""
         cmd = self._build_svn_cmd(*args)
         self._log(log_widget, ">> " + " ".join(cmd) + "\n")
         proc = subprocess.Popen(cmd,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            universal_newlines=True, encoding="utf-8", errors="replace",
+            universal_newlines=True, encoding=_SVN_ENC, errors="replace",
             creationflags=CREATE_NO_WINDOW)
         out_lines = []
         for line in proc.stdout:
@@ -210,6 +235,20 @@ class SvnSyncTool:
             out_lines.append(line)
         proc.wait()
         return proc.returncode, "".join(out_lines)
+
+    def _run_svn_bytes(self, *args):
+        """运行 svn 命令，返回原始字节（用于包含中文路径的输出）"""
+        cmd = self._build_svn_cmd(*args)
+        proc = subprocess.Popen(cmd,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            creationflags=CREATE_NO_WINDOW)
+        out, err = proc.communicate(timeout=30)
+        # 优先 GBK 解码，失败则 UTF-8
+        try:
+            text = out.decode(_SVN_ENC)
+        except (UnicodeDecodeError, LookupError):
+            text = out.decode('utf-8', errors='replace')
+        return proc.returncode, text
 
     def _start_checkout(self):
         url = self.svn_url.get().strip()
@@ -231,7 +270,6 @@ class SvnSyncTool:
                 self._log(self.log_co, "\n--- 错误: " + str(e) + " ---\n")
             finally:
                 self.root.after(0, lambda: self.btn_co.config(state=tk.NORMAL, text="拉取代码"))
-
         threading.Thread(target=run, daemon=True).start()
 
     def _scan_cross_files(self, tgt, src):
@@ -351,6 +389,7 @@ class SvnSyncTool:
         self.lbl_st.config(text="就绪"); self.lbl_cnt.config(text="共 0 个文件")
         self.btn_ow.config(state=tk.DISABLED)
 
+    # ═══════════════ 全自动流程 + 文件路径导出 ═══════════════
     def _start_auto_pipeline(self):
         url = self.svn_url.get().strip()
         dst = self.checkout_dir.get().strip()
@@ -365,12 +404,14 @@ class SvnSyncTool:
         msg = self.auto_msg.get(1.0, tk.END).strip()
         if not msg: messagebox.showwarning("提示", "请输入提交信息"); return
 
-        self.btn_auto.config(state=tk.DISABLED, text="⏳ 正在执行...")
+        self.btn_auto.config(state=tk.DISABLED, text="[..] 正在执行...")
         self.log_auto.delete(1.0, tk.END)
+        self._clear_paths_display()
 
         def run():
             log = self.log_auto
             overall_ok = True
+            rev = None
             try:
                 # Step 1
                 self._log(log, "【步骤 1/3】SVN 拉取\n")
@@ -384,13 +425,12 @@ class SvnSyncTool:
                         self._log(log, "目录已存在但选择 checkout 模式，先删除再拉取...\n")
                         shutil.rmtree(dst, ignore_errors=True)
                     rc, _ = self._run_svn(log, "checkout", url, dst)
-
                 if rc != 0:
-                    self._log(log, "\n❌ 步骤 1 失败，终止流程\n")
+                    self._log(log, "\n--- 步骤 1 失败，终止流程 ---\n")
                     self.root.after(0, lambda: self._auto_done(False))
                     return
                 self.target_dir.set(dst)
-                self._log(log, "\n✅ 步骤 1 完成\n\n")
+                self._log(log, "\n--- 步骤 1 完成 ---\n\n")
 
                 # Step 2
                 self._log(log, "【步骤 2/3】交叉文件覆盖\n")
@@ -411,38 +451,146 @@ class SvnSyncTool:
                             fail += 1
                     self._log(log, "覆盖结果: 成功 " + str(ok) + " 个")
                     if fail: self._log(log, ", 失败 " + str(fail) + " 个")
-                    self._log(log, "\n\n✅ 步骤 2 完成\n\n")
+                    self._log(log, "\n\n--- 步骤 2 完成 ---\n\n")
 
                 # Step 3
                 self._log(log, "【步骤 3/3】SVN 提交\n")
                 self._log(log, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
                 self._log(log, "检查变更状态...\n")
-                rc, status_out = self._run_svn(log, "status", dst)
+                _, status_out = self._run_svn(log, "status", dst)
                 changed = [l for l in status_out.split("\n") if l.strip() and ".svn" not in l]
                 if not changed:
                     self._log(log, "无变更需要提交\n")
                 else:
-                    self._log(log, "共 " + str(len(changed)) + " 个文件有变更\n")
-                    rc, _ = self._run_svn(log, "commit", dst, "-m", msg)
+                    self._log(log, "共 " + str(len(changed)) + " 个文件有变更，正在提交...\n")
+                    rc, commit_out = self._run_svn(log, "commit", dst, "-m", msg)
                     if rc == 0:
-                        self._log(log, "\n✅ 提交成功！\n")
+                        self._log(log, "\n--- 提交成功！---\n")
+                        rev = self._parse_revision(commit_out)
+                        if rev:
+                            self._log(log, "版本号: " + str(rev) + "\n")
+                            self.root.after(0, lambda r=rev: self._load_and_show_commit_paths(r))
+                        overall_ok = True
                     else:
-                        self._log(log, "\n❌ 提交失败，返回码: " + str(rc) + "\n")
+                        self._log(log, "\n--- 提交失败，返回码: " + str(rc) + " ---\n")
                         overall_ok = False
 
                 self._log(log, "\n" + "=" * 45 + "\n")
                 self._log(log, "全自动流程结束\n")
+
             except Exception as e:
-                self._log(log, "\n❌ 流程异常: " + str(e) + "\n")
+                self._log(log, "\n--- 流程异常: " + str(e) + " ---\n")
                 overall_ok = False
             finally:
                 self.root.after(0, lambda: self._auto_done(overall_ok))
 
         threading.Thread(target=run, daemon=True).start()
 
+    def _parse_revision(self, commit_output):
+        import re
+        m = re.search(r'Committed revision (\d+)', commit_output)
+        if m:
+            return int(m.group(1))
+        return None
+
+    def _load_and_show_commit_paths(self, rev):
+        dst = self.checkout_dir.get().strip()
+        if not dst or not os.path.isdir(dst):
+            return
+
+        def run():
+            try:
+                base_url = self._get_repo_root_http_url(dst)
+                if not base_url:
+                    return
+                changed_paths = self._get_changed_paths(dst, rev)
+                if not changed_paths:
+                    return
+                urls = []
+                for p in changed_paths:
+                    full_url = base_url.rstrip("/") + p + "(V" + str(rev) + ")"
+                    urls.append(full_url)
+                self.root.after(0, lambda: self._display_commit_paths(urls))
+            except Exception as e:
+                self._log(self.log_auto, "\n[路径导出] 获取提交文件路径失败: " + str(e) + "\n")
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _get_repo_root_http_url(self, checkout_dir):
+        """获取仓库根 URL（http 协议），使用系统编码"""
+        try:
+            rc, out = self._run_svn_bytes("info", checkout_dir)
+            if rc != 0:
+                return None
+            for line in out.split("\n"):
+                if line.startswith("Repository Root:"):
+                    root = line.split(":", 1)[1].strip()
+                    if root.startswith("https://"):
+                        root = "http://" + root[8:]
+                    elif root.startswith("svn://"):
+                        root = "http://" + root[6:]
+                    return root
+        except:
+            pass
+        return None
+
+    def _get_changed_paths(self, checkout_dir, rev):
+        """获取某次提交中变更的文件路径，使用系统编码"""
+        try:
+            rc, out = self._run_svn_bytes("log", "-r", str(rev), "-v", checkout_dir)
+            if rc != 0:
+                return []
+            paths = []
+            in_changed = False
+            for line in out.split("\n"):
+                sl = line.strip()
+                if sl.startswith("Changed paths:"):
+                    in_changed = True
+                    continue
+                if in_changed:
+                    if not sl:
+                        in_changed = False
+                        break
+                    for prefix in ("M ", "A ", "D ", "R "):
+                        if sl.startswith(prefix):
+                            paths.append(sl[len(prefix):].strip())
+                            break
+            return paths
+        except:
+            pass
+        return []
+
+    def _display_commit_paths(self, urls):
+        self._commit_urls = urls
+        self.txt_paths.config(state=tk.NORMAL)
+        self.txt_paths.delete(1.0, tk.END)
+        self.txt_paths.insert(tk.END, "\n".join(urls))
+        self.txt_paths.config(state=tk.DISABLED)
+        self.lbl_paths_count.config(text="共 " + str(len(urls)) + " 个文件")
+        self.btn_copy_paths.config(state=tk.NORMAL)
+
+    def _copy_commit_paths(self):
+        if not self._commit_urls:
+            return
+        text = "\n".join(self._commit_urls)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.btn_copy_paths.config(text="[OK] 已复制!")
+        self.root.after(2000, lambda: self.btn_copy_paths.config(text="[复制] 复制文件路径"))
+
+    def _clear_paths_display(self):
+        self._commit_urls = []
+        self.txt_paths.config(state=tk.NORMAL)
+        self.txt_paths.delete(1.0, tk.END)
+        self.txt_paths.config(state=tk.DISABLED)
+        self.lbl_paths_count.config(text="（暂无）")
+        self.btn_copy_paths.config(state=tk.DISABLED, text="[复制] 复制文件路径")
+
     def _auto_done(self, ok):
-        self.btn_auto.config(state=tk.NORMAL, text="▶ 一键执行：拉取 -> 覆盖 -> 提交")
-        if ok:
+        self.btn_auto.config(state=tk.NORMAL, text="[>>] 一键执行：拉取 -> 覆盖 -> 提交")
+        if ok and self._commit_urls:
+            messagebox.showinfo("完成", "全自动流程执行完成！\n提交文件路径已导出。")
+        elif ok:
             messagebox.showinfo("完成", "全自动流程执行完成！")
 
     def sync_checkout_to_target(self, *args):
