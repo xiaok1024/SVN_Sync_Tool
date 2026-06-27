@@ -1,0 +1,19 @@
+﻿# 构建中间件
+work/
+build/
+*.spec
+*.pyc
+*.pyo
+__pycache__/
+
+# 操作系统
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
