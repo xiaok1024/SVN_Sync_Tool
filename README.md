@@ -24,7 +24,7 @@ A Windows GUI tool for checking out code from SVN, overwriting cross-referenced 
 
 ## 截图 / Screenshot
 
-![SVN Sync Tool](README.assets\1782545885107.png)
+![SVN Sync Tool](./README.assets/1782545885107.png)
 
 *(截图未生成，运行工具即可查看界面 / Screenshot not generated, run the tool to see the interface)*
 
