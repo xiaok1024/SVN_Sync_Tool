@@ -1,6 +1,6 @@
 # SVN 代码同步工具 / SVN Code Sync Tool
 
-一个 Windows 图形化工具，用于从 SVN 拉取代码、用整理好的本地目录覆盖交叉文件、并自动提交变更。三步流程一键完成。
+一个 Windows 图形化工具，用于从 SVN 拉取代码、用整理好的本地目录覆盖交叉文件、并自动提交变更。三步流程一键完成，提交完成后可一键复制SVN提交记录。
 
 A Windows GUI tool for checking out code from SVN, overwriting cross-referenced files from a local organized directory, and automatically committing changes. Complete the three-step workflow with one click.
 

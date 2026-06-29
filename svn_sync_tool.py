@@ -508,7 +508,16 @@ class SvnSyncTool:
                     return
                 urls = []
                 for p in changed_paths:
-                    full_url = base_url.rstrip("/") + p + "(V" + str(rev) + ")"
+                    decoded_path = p
+                    # URL decode (unquote_to_bytes -> UTF-8, compatible Python 3.6)
+                    from urllib.parse import unquote_to_bytes
+                    raw = unquote_to_bytes(p)
+                    decoded_path = raw.decode("utf-8")
+                    # DEBUG: 打印日志排查乱码问题
+                    //self._log(self.log_auto, "[DEBUG] base_url: " + repr(base_url) + "\n")
+                    //self._log(self.log_auto, "[DEBUG] raw path p: " + repr(p) + "\n")
+                    //self._log(self.log_auto, "[DEBUG] decoded: " + repr(decoded_path) + "\n")
+                    full_url = base_url.rstrip("/") + decoded_path + "(V" + str(rev) + ")"
                     urls.append(full_url)
                 self.root.after(0, lambda: self._display_commit_paths(urls))
             except Exception as e:
@@ -529,6 +538,9 @@ class SvnSyncTool:
                         root = "http://" + root[8:]
                     elif root.startswith("svn://"):
                         root = "http://" + root[6:]
+                    # URL 解码中文路径（Repository Root 也可能被编码）
+                    from urllib.parse import unquote_to_bytes
+                    root = unquote_to_bytes(root).decode("utf-8")
                     return root
         except:
             pass
