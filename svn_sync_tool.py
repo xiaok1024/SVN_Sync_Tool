@@ -8,7 +8,14 @@ from pathlib import Path
 try: import queue
 except: import Queue as queue
 
-CREATE_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
+CREATE_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0) if os.name == 'nt' else 0
+SVN_EXECUTABLE = shutil.which("svn")
+if not SVN_EXECUTABLE:
+    for _svn_path in ("/opt/homebrew/bin/svn", "/usr/local/bin/svn", "/usr/bin/svn"):
+        if os.path.isfile(_svn_path) and os.access(_svn_path, os.X_OK):
+            SVN_EXECUTABLE = _svn_path
+            break
+SVN_EXECUTABLE = SVN_EXECUTABLE or "svn"
 
 # 自动检测系统编码：中文 Windows 用 GBK，否则 UTF-8
 _SYS_ENC = locale.getpreferredencoding()
@@ -208,7 +215,7 @@ class SvnSyncTool:
         self.root.after(100, self._poll_log_queue)
 
     def _build_svn_cmd(self, *args):
-        cmd = ["svn", "--non-interactive",
+        cmd = [SVN_EXECUTABLE, "--non-interactive",
                "--trust-server-cert-failures=unknown-ca,cn-mismatch,expired,not-yet-valid,other"]
         u = self.svn_user.get().strip()
         p = self.svn_pass.get().strip()
@@ -221,6 +228,16 @@ class SvnSyncTool:
         cmd.extend(args)
         return cmd
 
+    def _svn_env(self):
+        env = os.environ.copy()
+        if os.name != 'nt':
+            env["LANG"] = "zh_CN.UTF-8"
+            env["LC_ALL"] = "zh_CN.UTF-8"
+            env["LC_CTYPE"] = "zh_CN.UTF-8"
+            extra_path = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+            env["PATH"] = extra_path + (":" + env["PATH"] if env.get("PATH") else "")
+        return env
+
     def _run_svn(self, log_widget, *args):
         """运行 svn 命令，用系统编码解码输出"""
         cmd = self._build_svn_cmd(*args)
@@ -228,6 +245,7 @@ class SvnSyncTool:
         proc = subprocess.Popen(cmd,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             universal_newlines=True, encoding=_SVN_ENC, errors="replace",
+            env=self._svn_env(),
             creationflags=CREATE_NO_WINDOW)
         out_lines = []
         for line in proc.stdout:
@@ -241,6 +259,7 @@ class SvnSyncTool:
         cmd = self._build_svn_cmd(*args)
         proc = subprocess.Popen(cmd,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=self._svn_env(),
             creationflags=CREATE_NO_WINDOW)
         out, err = proc.communicate(timeout=30)
         # 优先 GBK 解码，失败则 UTF-8
@@ -514,9 +533,9 @@ class SvnSyncTool:
                     raw = unquote_to_bytes(p)
                     decoded_path = raw.decode("utf-8")
                     # DEBUG: 打印日志排查乱码问题
-                    //self._log(self.log_auto, "[DEBUG] base_url: " + repr(base_url) + "\n")
-                    //self._log(self.log_auto, "[DEBUG] raw path p: " + repr(p) + "\n")
-                    //self._log(self.log_auto, "[DEBUG] decoded: " + repr(decoded_path) + "\n")
+                    # self._log(self.log_auto, "[DEBUG] base_url: " + repr(base_url) + "\n")
+                    # self._log(self.log_auto, "[DEBUG] raw path p: " + repr(p) + "\n")
+                    # self._log(self.log_auto, "[DEBUG] decoded: " + repr(decoded_path) + "\n")
                     full_url = base_url.rstrip("/") + decoded_path + "(V" + str(rev) + ")"
                     urls.append(full_url)
                 self.root.after(0, lambda: self._display_commit_paths(urls))
@@ -612,5 +631,8 @@ class SvnSyncTool:
 if __name__ == "__main__":
     root = tk.Tk()
     app = SvnSyncTool(root)
-    app.checkout_dir.trace("w", app.sync_checkout_to_target)
+    if hasattr(app.checkout_dir, "trace_add"):
+        app.checkout_dir.trace_add("write", app.sync_checkout_to_target)
+    else:
+        app.checkout_dir.trace("w", app.sync_checkout_to_target)
     root.mainloop()
