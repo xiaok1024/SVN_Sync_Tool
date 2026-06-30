@@ -8,7 +8,14 @@ from pathlib import Path
 try: import queue
 except: import Queue as queue
 
-CREATE_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
+CREATE_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0) if os.name == 'nt' else 0
+SVN_EXECUTABLE = shutil.which("svn")
+if not SVN_EXECUTABLE:
+    for _svn_path in ("/opt/homebrew/bin/svn", "/usr/local/bin/svn", "/usr/bin/svn"):
+        if os.path.isfile(_svn_path) and os.access(_svn_path, os.X_OK):
+            SVN_EXECUTABLE = _svn_path
+            break
+SVN_EXECUTABLE = SVN_EXECUTABLE or "svn"
 
 # 自动检测系统编码：中文 Windows 用 GBK，否则 UTF-8
 _SYS_ENC = locale.getpreferredencoding()
@@ -513,8 +520,10 @@ class SvnSyncTool:
                     from urllib.parse import unquote_to_bytes
                     raw = unquote_to_bytes(p)
                     decoded_path = raw.decode("utf-8")
-                  
-                  
+                    # DEBUG: 打印日志排查乱码问题
+                    # self._log(self.log_auto, "[DEBUG] base_url: " + repr(base_url) + "\n")
+                    # self._log(self.log_auto, "[DEBUG] raw path p: " + repr(p) + "\n")
+                    # self._log(self.log_auto, "[DEBUG] decoded: " + repr(decoded_path) + "\n")
                     full_url = base_url.rstrip("/") + decoded_path + "(V" + str(rev) + ")"
                     urls.append(full_url)
                 self.root.after(0, lambda: self._display_commit_paths(urls))
