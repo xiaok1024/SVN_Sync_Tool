@@ -824,18 +824,22 @@ class SvnSyncTool:
         t4.rowconfigure(7, weight=2)
 
     # ---- tab4 剪贴板读取（分平台）----
-    def _read_clipboard_html(self):
+    def _read_clipboard_content(self):
+        """读取剪贴板内容，返回 (text, kind)。kind 为 'html' 或 'text'（纯文本兜底）。"""
         if IS_WINDOWS:
-            return self._read_clipboard_html_windows()
-        if IS_MACOS:
+            html = self._read_clipboard_html_windows()
+            if html and html.strip():
+                return html, "html"
+        elif IS_MACOS:
             html = self._read_clipboard_html_macos()
-            if html:
-                return html
+            if html and html.strip():
+                return html, "html"
         # 兜底：纯文本（无颜色信息，红/黑会全部判为黑）
         try:
-            return self.root.clipboard_get()
+            text = self.root.clipboard_get()
         except Exception:
-            return ""
+            text = ""
+        return text, "text"
 
     def _read_clipboard_html_macos(self):
         script = (
@@ -865,13 +869,27 @@ class SvnSyncTool:
             import ctypes
             user32 = ctypes.windll.user32
             kernel32 = ctypes.windll.kernel32
+            # 关键：显式声明返回值/参数类型，否则 64 位 Windows 上句柄/指针会被截断为 32 位
+            user32.RegisterClipboardFormatW.restype = ctypes.c_uint
+            user32.RegisterClipboardFormatW.argtypes = [ctypes.c_wchar_p]
+            user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+            user32.GetClipboardData.restype = ctypes.c_void_p
+            user32.GetClipboardData.argtypes = [ctypes.c_uint]
+            kernel32.GlobalLock.restype = ctypes.c_void_p
+            kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+            kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+            kernel32.GlobalSize.restype = ctypes.c_size_t
+            kernel32.GlobalSize.argtypes = [ctypes.c_void_p]
+
             cf_html = user32.RegisterClipboardFormatW("HTML Format")
-            if not user32.OpenClipboard(0):
+            if not cf_html:
+                return ""
+            if not user32.OpenClipboard(None):
                 return ""
             try:
                 handle = user32.GetClipboardData(cf_html)
                 if not handle:
-                    return ""  # 剪贴板里没有 HTML 格式
+                    return ""  # 剪贴板里没有 HTML 格式（多为纯文本来源）
                 ptr = kernel32.GlobalLock(handle)
                 if not ptr:
                     return ""
@@ -907,19 +925,24 @@ class SvnSyncTool:
 
         def run():
             try:
-                html = self._read_clipboard_html()
-                if not html or not html.strip():
+                content_text, kind = self._read_clipboard_content()
+                if not content_text or not content_text.strip():
                     self.root.after(0, lambda: self.rt_status.config(text="剪贴板没有内容，请先从网页复制带颜色的升级清单"))
                     return
-                lines = rt_extract_list_from_html(html)
+                lines = rt_extract_list_from_html(content_text)
                 file_lines = [l for l in lines if l.startswith(RT_COLOR_PREFIXES)]
                 if not file_lines:
-                    self.root.after(0, lambda: self.rt_status.config(text="未识别到红色/黑色 SVN 文件行；请确认复制的是带样式的升级清单（非纯文本）"))
+                    if kind == "text":
+                        msg = "剪贴板只有纯文本（拿不到颜色）：请从浏览器/富文本复制带样式的升级清单；若已是富文本仍失败，可截图反馈"
+                    else:
+                        msg = "未识别到 SVN 文件行：请确认清单里包含形如 https://.../svn/客户/路径(V版本) 的 URL"
+                    self.root.after(0, lambda: self.rt_status.config(text=msg))
                     return
                 content = "\n".join(lines)
                 qc_count = sum(1 for l in lines if l.startswith("QC"))
+                degraded = "（纯文本，红/黑均按黑处理）" if kind == "text" else ""
                 self.root.after(0, lambda: (self._rt_set_list(content),
-                                            self.rt_status.config(text="提取完成：%d 个 QC，%d 个文件行" % (qc_count, len(file_lines)))))
+                                            self.rt_status.config(text="提取完成：%d 个 QC，%d 个文件行%s" % (qc_count, len(file_lines), degraded))))
             except Exception as e:
                 self.root.after(0, lambda: self.rt_status.config(text="提取失败: " + str(e)))
         threading.Thread(target=run, daemon=True).start()
