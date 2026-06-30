@@ -532,10 +532,6 @@ class SvnSyncTool:
                     from urllib.parse import unquote_to_bytes
                     raw = unquote_to_bytes(p)
                     decoded_path = raw.decode("utf-8")
-                    # DEBUG: 打印日志排查乱码问题
-                    # self._log(self.log_auto, "[DEBUG] base_url: " + repr(base_url) + "\n")
-                    # self._log(self.log_auto, "[DEBUG] raw path p: " + repr(p) + "\n")
-                    # self._log(self.log_auto, "[DEBUG] decoded: " + repr(decoded_path) + "\n")
                     full_url = base_url.rstrip("/") + decoded_path + "(V" + str(rev) + ")"
                     urls.append(full_url)
                 self.root.after(0, lambda: self._display_commit_paths(urls))
@@ -553,10 +549,12 @@ class SvnSyncTool:
             for line in out.split("\n"):
                 if line.startswith("Repository Root:"):
                     root = line.split(":", 1)[1].strip()
-                    if root.startswith("https://"):
-                        root = "http://" + root[8:]
-                    elif root.startswith("svn://"):
-                        root = "http://" + root[6:]
+                    # 修复后：仅对 svn:// 协议做兼容处理，保留 https/http 原样
+                    if root.startswith("svn://"):
+                        # svn:// 协议无法直接在浏览器访问，按需转换为 http/https
+                        # 如果你的服务器同时支持 https，建议改为 "https://"
+                        root = "https://" + root[6:]
+                    # https:// 和 http:// 保持不变，不做任何替换
                     # URL 解码中文路径（Repository Root 也可能被编码）
                     from urllib.parse import unquote_to_bytes
                     root = unquote_to_bytes(root).decode("utf-8")
