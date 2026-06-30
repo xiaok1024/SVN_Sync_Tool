@@ -2,8 +2,10 @@
 """SVN 代码拉取 + 交叉文件覆盖 + 全自动提交 + 文件路径导出"""
 
 import os, sys, subprocess, threading, shutil, locale, tempfile, atexit
-import urllib.parse, unicodedata
+import urllib.parse, unicodedata, re
 import xml.etree.ElementTree as ET
+from collections import Counter, OrderedDict, defaultdict
+from html.parser import HTMLParser
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext, messagebox
 from pathlib import Path
@@ -28,6 +30,571 @@ _SVN_ENC = 'gbk' if _SYS_ENC.lower() in ('cp936', 'gbk', 'gb2312', 'gb18030') el
 # macOS 必须先把 smb:// 挂载到本地挂载点才能用 POSIX 文件接口访问。
 IS_WINDOWS = (os.name == 'nt')
 IS_MACOS = (sys.platform == 'darwin')
+
+
+# ═══════════════ 升级清单提取逻辑（对标 Alfred redtext 链路） ═══════════════
+# 移植自 script 仓库的 clipboard_extract_red_text.py / generate_upgrade_md.py
+# / generate_upgrade_ai_md.py，纯 Python 实现，跨平台、可随 GUI 一起打包。
+
+RT_NAMED_COLORS = {"red": (255, 0, 0), "darkred": (139, 0, 0), "crimson": (220, 20, 60), "firebrick": (178, 34, 34)}
+RT_EXCLUDED_LINE_PREFIXES = ("PC端需要打包", "Mobile端需要打包", "本次总共需要修改")
+RT_LOOSE_SVN_URL_RE = re.compile(r"https?://[^/]+/svn/\S+?\([Vv]\d+\)")
+RT_COLOR_PREFIXES = ("[red] ", "[black] ")
+
+RT_QC_HEADER_RE = re.compile(r"^(QC\d+)\s+(.+?)\s+——\s+(.+)$")
+RT_MD_SVN_URL_RE = re.compile(r"https?://[^/]+/svn/([^/]+)/(.+?)\(([Vv]\d+)\)")
+RT_MARKED_LINE_RE = re.compile(r"^\[(red|black)\]\s+(.+)$", re.IGNORECASE)
+
+RT_BINARY_SUFFIXES = {
+    ".class", ".jar", ".zip", ".war", ".ear", ".rar", ".7z", ".gz", ".tar",
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".pdf",
+    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+}
+RT_SQL_SUFFIXES = {".sql"}
+RT_UTF8_SUFFIXES = {".java", ".js", ".jsx", ".ts", ".tsx", ".jsp", ".xml", ".html", ".htm", ".css"}
+RT_GBK_SUFFIXES = {".properties", ".sql"}
+
+
+def rt_parse_style_declarations(style):
+    declarations = {}
+    for part in (style or "").split(";"):
+        if ":" not in part:
+            continue
+        name, value = part.split(":", 1)
+        declarations[name.strip().lower()] = value.strip()
+    return declarations
+
+
+def rt_parse_color(value):
+    if not value:
+        return None
+    color = value.strip().lower()
+    color = re.sub(r"\s*!important\s*$", "", color).strip()
+    if color in RT_NAMED_COLORS:
+        return RT_NAMED_COLORS[color]
+    hex_match = re.fullmatch(r"#([0-9a-f]{3}|[0-9a-f]{6})", color)
+    if hex_match:
+        value = hex_match.group(1)
+        if len(value) == 3:
+            value = "".join(char * 2 for char in value)
+        return tuple(int(value[index: index + 2], 16) for index in (0, 2, 4))
+    rgb_match = re.match(r"rgba?\((.*)\)", color)
+    if rgb_match:
+        values = []
+        for item in re.findall(r"[\d.]+%?", rgb_match.group(1))[:3]:
+            if item.endswith("%"):
+                values.append(round(float(item[:-1]) * 255 / 100))
+            else:
+                values.append(round(float(item)))
+        if len(values) == 3:
+            return tuple(max(0, min(255, v)) for v in values)
+    return None
+
+
+def rt_is_red_color(value, strict=False):
+    rgb = rt_parse_color(value)
+    if not rgb:
+        return False
+    red, green, blue = rgb
+    if strict:
+        return (red, green, blue) == (255, 0, 0)
+    return red >= 170 and green <= 120 and blue <= 120 and red > green * 1.4 and red > blue * 1.4
+
+
+def rt_extract_color_from_style(style):
+    return rt_parse_style_declarations(style).get("color")
+
+
+def rt_split_selectors(selector_text):
+    return [s.strip() for s in selector_text.split(",") if s.strip()]
+
+
+def rt_parse_css_color_rules(css_text):
+    rules = []
+    for selector_text, body in re.findall(r"([^{}]+)\{([^{}]+)\}", css_text or ""):
+        color = rt_extract_color_from_style(body)
+        if not color:
+            continue
+        for selector in rt_split_selectors(selector_text):
+            if " " in selector or ">" in selector or ":" in selector:
+                continue
+            rules.append((selector, color))
+    return rules
+
+
+def rt_selector_color(selector, attrs, css_rules):
+    tag = selector.lower()
+    element_id = attrs.get("id", "")
+    classes = set(attrs.get("class", "").split())
+    color = None
+    for rule_selector, rule_color in css_rules:
+        rule_selector = rule_selector.strip()
+        if rule_selector == tag:
+            color = rule_color
+        elif rule_selector.startswith(".") and rule_selector[1:] in classes:
+            color = rule_color
+        elif rule_selector.startswith("#") and rule_selector[1:] == element_id:
+            color = rule_color
+        elif "." in rule_selector and not rule_selector.startswith("."):
+            rule_tag, rule_class = rule_selector.split(".", 1)
+            if rule_tag.lower() == tag and rule_class in classes:
+                color = rule_color
+    return color
+
+
+def rt_normalize_line(text):
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def rt_should_exclude_line(text):
+    return text.startswith(RT_EXCLUDED_LINE_PREFIXES)
+
+
+class RedTextHTMLParser(HTMLParser):
+    def __init__(self, strict=False, css_rules=None):
+        super().__init__(convert_charrefs=True)
+        self.strict = strict
+        self.css_rules = list(css_rules or [])
+        self.color_stack = [None]
+        self.line_records = []
+        self.current_line_parts = []
+        self.current_red_parts = []
+        self.current_line_segments = []
+        self.in_style = False
+        self.style_buffer = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag.lower() == "style":
+            self.in_style = True
+            self.style_buffer = []
+        color = self.color_stack[-1]
+        css_color = rt_selector_color(tag, attrs, self.css_rules)
+        inline_color = rt_extract_color_from_style(attrs.get("style", ""))
+        font_color = attrs.get("color") if tag.lower() == "font" else None
+        color = font_color or inline_color or css_color or color
+        self.color_stack.append(color)
+        if tag.lower() in {"br", "tr", "p", "div", "li"}:
+            self._flush_line()
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "style":
+            self.css_rules.extend(rt_parse_css_color_rules("".join(self.style_buffer)))
+            self.in_style = False
+            self.style_buffer = []
+        if len(self.color_stack) > 1:
+            self.color_stack.pop()
+        if tag.lower() in {"p", "div", "li", "tr"}:
+            self._flush_line()
+
+    def handle_data(self, data):
+        if self.in_style:
+            self.style_buffer.append(data)
+            return
+        color = self.color_stack[-1]
+        red = rt_is_red_color(color, strict=self.strict)
+        self._append_line_text(data, red=red)
+
+    def close(self):
+        super().close()
+        self._flush_line()
+
+    def _append_line_text(self, text, red=False):
+        if not text:
+            return
+        self.current_line_parts.append(text)
+        self.current_line_segments.append((text, red))
+        if red:
+            self.current_red_parts.append(text)
+        elif self.current_red_parts and not text.strip():
+            self.current_red_parts.append(text)
+
+    def _flush_line(self):
+        text = rt_normalize_line("".join(self.current_line_parts))
+        red_text = rt_normalize_line("".join(self.current_red_parts))
+        if text or red_text:
+            self.line_records.append({"text": text, "red_text": red_text, "segments": list(self.current_line_segments)})
+        self.current_line_parts = []
+        self.current_red_parts = []
+        self.current_line_segments = []
+
+    def get_line_records(self):
+        return self.line_records
+
+
+def rt_analyze_html(html, strict=False):
+    css_rules = []
+    for style_text in re.findall(r"<style\b[^>]*>(.*?)</style>", html, flags=re.I | re.S):
+        css_rules.extend(rt_parse_css_color_rules(style_text))
+    parser = RedTextHTMLParser(strict=strict, css_rules=css_rules)
+    parser.feed(html)
+    parser.close()
+    return parser.get_line_records()
+
+
+def rt_contains_svn_url(text):
+    return bool(RT_LOOSE_SVN_URL_RE.search(text or ""))
+
+
+def rt_marked_line(color, text):
+    return "[%s] %s" % (color, rt_normalize_line(text))
+
+
+def rt_marked_file_lines_from_record(record):
+    lines = []
+    segments = record.get("segments") or []
+    red_text = rt_normalize_line("".join(t for t, red in segments if red))
+    black_text = rt_normalize_line("".join(t for t, red in segments if not red))
+    if red_text and rt_contains_svn_url(red_text) and not rt_should_exclude_line(red_text):
+        lines.append(rt_marked_line("red", red_text))
+    if black_text and rt_contains_svn_url(black_text) and not rt_should_exclude_line(black_text):
+        lines.append(rt_marked_line("black", black_text))
+    if not lines:
+        text = record.get("text", "")
+        if rt_contains_svn_url(text) and not rt_should_exclude_line(text):
+            color = "red" if record.get("red_text") else "black"
+            lines.append(rt_marked_line(color, text))
+    return lines
+
+
+def rt_sort_grouped_texts(texts):
+    grouped = OrderedDict()
+    current_qc = None
+    for text in texts:
+        if text.startswith("QC"):
+            current_qc = text
+            grouped[current_qc] = []
+        elif current_qc:
+            grouped[current_qc].append(text)
+    out = []
+    for qc, paths in grouped.items():
+        out.append(qc)
+        out.extend(sorted(paths))
+        out.append("")
+    return out
+
+
+def rt_extract_qc_and_marked_texts(line_records):
+    texts = []
+    has_qc = False
+    for record in line_records:
+        text = record["text"]
+        if text.startswith("QC"):
+            has_qc = True
+            texts.append(text)
+            continue
+        texts.extend(rt_marked_file_lines_from_record(record))
+    if not has_qc:
+        return [line for record in line_records for line in rt_marked_file_lines_from_record(record)]
+    return rt_sort_grouped_texts(texts)
+
+
+def rt_extract_list_from_html(html, strict=False):
+    """HTML → 升级清单文本行（QC 分组 + [red]/[black] URL）。"""
+    records = rt_analyze_html(html, strict=strict)
+    return rt_extract_qc_and_marked_texts(records)
+
+
+# ---- 清单 TXT → Markdown ----
+
+class RTFileEntry:
+    def __init__(self, path):
+        self.path = path
+        self.versions = []
+        self.marker_colors = set()
+
+    def marker_color(self):
+        if "red" in self.marker_colors:
+            return "red"
+        if "black" in self.marker_colors:
+            return "black"
+        return "red"
+
+
+class RTQCEntry:
+    def __init__(self, code, title, module):
+        self.code = code
+        self.title = title
+        self.module = module
+        self.files = OrderedDict()
+
+
+def rt_parse_qc_header(line):
+    match = RT_QC_HEADER_RE.match(line.strip())
+    if not match:
+        raise ValueError("无法解析 QC 标题行: " + line)
+    return match.group(1), match.group(2).strip(), match.group(3).strip()
+
+
+def rt_normalize_version(version):
+    if version and version[0] in {"v", "V"}:
+        return "V" + version[1:]
+    return version
+
+
+def rt_version_number(version):
+    match = re.fullmatch(r"V(\d+)", rt_normalize_version(version))
+    if not match:
+        raise ValueError("无法解析版本号: " + version)
+    return int(match.group(1))
+
+
+def rt_sort_versions(versions):
+    return sorted(versions, key=rt_version_number)
+
+
+def rt_parse_svn_urls_from_line(line):
+    return [
+        (customer, path, rt_normalize_version(version))
+        for customer, path, version in RT_MD_SVN_URL_RE.findall(line.strip())
+    ]
+
+
+def rt_is_standard_ecology_file(customer_name, relative_path):
+    normalized = relative_path.replace("\\", "/")
+    return customer_name == "ecology" and (normalized.startswith("trunk/") or normalized.startswith("branches/"))
+
+
+def rt_parse_line_marker(line):
+    match = RT_MARKED_LINE_RE.match(line.strip())
+    if not match:
+        return "red", line
+    return match.group(1).lower(), match.group(2).strip()
+
+
+def rt_color_label(color):
+    return {"red": "红色", "black": "黑色"}.get(color, color)
+
+
+def rt_split_blocks(text):
+    blocks = []
+    current = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            if current:
+                blocks.append(current)
+                current = []
+            continue
+        current.append(line)
+    if current:
+        blocks.append(current)
+    return blocks
+
+
+def rt_select_customer_name(customer_names):
+    unique = list(OrderedDict.fromkeys(customer_names))
+    if not unique:
+        raise ValueError("解析不到客户名，请确认清单中至少包含一条合法 SVN URL")
+    if len(unique) == 1:
+        return unique[0]
+    # 多客户名时取出现次数最多的（GUI 下不强制本地目录校验）
+    return Counter(customer_names).most_common(1)[0][0]
+
+
+def rt_parse_txt(text):
+    """清单文本 → (QC 列表, 客户名, 原始计数)。"""
+    blocks = rt_split_blocks(text)
+    if not blocks:
+        raise ValueError("清单内容为空，未找到任何 QC 块")
+    entries = []
+    customer_names = []
+    raw_counter = Counter()
+    for block in blocks:
+        code, title, module = rt_parse_qc_header(block[0])
+        entry = RTQCEntry(code, title, module)
+        for line in block[1:]:
+            marker_color, url_line = rt_parse_line_marker(line)
+            parsed_urls = rt_parse_svn_urls_from_line(url_line)
+            if not parsed_urls:
+                raise ValueError("无法解析 SVN URL: " + line)
+            for customer, relative_path, version in parsed_urls:
+                if rt_is_standard_ecology_file(customer, relative_path):
+                    continue
+                customer_names.append(customer)
+                raw_counter[(code, relative_path, version)] += 1
+                file_entry = entry.files.setdefault(relative_path, RTFileEntry(relative_path))
+                file_entry.marker_colors.add(marker_color)
+                if version not in file_entry.versions:
+                    file_entry.versions.append(version)
+        for file_entry in entry.files.values():
+            file_entry.versions = rt_sort_versions(file_entry.versions)
+        entries.append(entry)
+    return entries, rt_select_customer_name(customer_names), raw_counter
+
+
+def rt_build_human_md(entries):
+    sections = []
+    for entry in entries:
+        lines = ["## " + entry.code, "- 标题: " + entry.title, "- 模块: " + entry.module]
+        if entry.files:
+            lines.append("- 文件:")
+            for relative_path, file_entry in entry.files.items():
+                version_text = ", ".join(file_entry.versions)
+                marker_text = rt_color_label(file_entry.marker_color())
+                lines.append(
+                    "  - [`%s`](%s) `版本: %s` `标识: %s`" % (relative_path, relative_path, version_text, marker_text)
+                )
+        else:
+            lines.append("- 文件: （当前清单未列出文件）")
+        sections.append("\n".join(lines))
+    return "\n\n".join(sections) + "\n"
+
+
+def rt_generated_or_minified_reason(path):
+    normalized = path.replace("\\", "/")
+    parts = [p for p in normalized.split("/") if p]
+    name = parts[-1] if parts else normalized
+    lower_name = name.lower()
+    patterns = (
+        r"\.map$", r"(^|[.-])chunk(\.|-|$).*\.js$", r"\.chunk\.js$",
+        r"\.[a-f0-9]{8,}\.(js|css|map|json|html)$", r"\.min([.-].*)?\.(js|css)$", r"_wev.*\.(js|css)$",
+    )
+    if {"dist", "build"}.intersection(p.lower() for p in parts):
+        return "generated-or-minified-file"
+    if any(re.search(pattern, lower_name) for pattern in patterns):
+        return "generated-or-minified-file"
+    return None
+
+
+def rt_default_skip_reason(path):
+    normalized = path.replace("\\", "/")
+    lower_path = normalized.lower()
+    suffix = os.path.splitext(lower_path)[1]
+    if lower_path.startswith("cloudstore/resource/"):
+        return "cloudstore-resource-file"
+    if suffix in RT_BINARY_SUFFIXES:
+        return "binary-file"
+    if suffix in RT_SQL_SUFFIXES:
+        return "sql-file"
+    return rt_generated_or_minified_reason(normalized)
+
+
+def rt_classify_path(path):
+    suffix = os.path.splitext(path.lower())[1]
+    skip_reason = rt_default_skip_reason(path)
+    if skip_reason == "cloudstore-resource-file":
+        return "cloudstore-resource", "skip", skip_reason, "n/a"
+    if skip_reason == "binary-file":
+        return "binary", "skip", "binary-file", "n/a"
+    if skip_reason == "sql-file":
+        return "sql", "skip", "sql-file", "gbk"
+    if skip_reason == "generated-or-minified-file":
+        return "generated-asset", "skip", "generated-or-minified-file", "utf-8"
+    if suffix in RT_GBK_SUFFIXES:
+        return "source", "migrate", "manual-diff", "gbk"
+    return "source", "migrate", "manual-diff", "utf-8"
+
+
+def rt_collect_duplicate_files(entries):
+    occurrences = defaultdict(list)
+    for entry in entries:
+        for file_entry in entry.files.values():
+            occurrences[file_entry.path].append((entry.code, file_entry.versions))
+    return OrderedDict(
+        (path, values) for path, values in sorted(occurrences.items()) if len(values) > 1
+    )
+
+
+def rt_collect_stats(entries):
+    unique_files = OrderedDict()
+    stats = OrderedDict([
+        ("qc", len(entries)), ("file_entries", 0), ("unique_files", 0), ("migrate", 0),
+        ("skip_binary", 0), ("skip_sql", 0), ("skip_generated_asset", 0),
+        ("skip_black_context", 0), ("empty_qc", 0),
+    ])
+    for entry in entries:
+        if not entry.files:
+            stats["empty_qc"] += 1
+        for file_entry in entry.files.values():
+            stats["file_entries"] += 1
+            unique_files.setdefault(file_entry.path, None)
+            if file_entry.marker_color() == "black":
+                stats["skip_black_context"] += 1
+                continue
+            file_type, action, reason, _enc = rt_classify_path(file_entry.path)
+            if action == "migrate":
+                stats["migrate"] += 1
+            elif file_type == "binary":
+                stats["skip_binary"] += 1
+            elif file_type == "sql":
+                stats["skip_sql"] += 1
+            elif reason == "generated-or-minified-file":
+                stats["skip_generated_asset"] += 1
+    stats["unique_files"] = len(unique_files)
+    stats["duplicate_files"] = len(rt_collect_duplicate_files(entries))
+    return stats
+
+
+def rt_duplicate_raw_inputs(raw_counter):
+    duplicates = [
+        (code, path, version, count)
+        for (code, path, version), count in raw_counter.items()
+        if count > 1
+    ]
+    return sorted(duplicates, key=lambda item: (item[0], item[1], rt_version_number(item[2])))
+
+
+def rt_build_ai_md(entries, customer_name, raw_counter):
+    stats = rt_collect_stats(entries)
+    duplicate_files = rt_collect_duplicate_files(entries)
+    raw_duplicates = rt_duplicate_raw_inputs(raw_counter)
+    lines = [
+        "# E9 Upgrade AI File List",
+        "",
+        "> This file is generated for AI execution. Human-readable review should use `upgrade-file-list.md`.",
+        "",
+        "## Metadata",
+        "- customer: `%s`" % customer_name,
+        "- path_base: customer SVN working copy root",
+        "- version_rule: versions are unique and sorted numerically within each QC/file",
+        "",
+        "## Stats",
+    ]
+    for key, value in stats.items():
+        lines.append("- %s: %s" % (key, value))
+    lines.extend(["", "## Duplicate Files"])
+    if duplicate_files:
+        for path, occurrences in duplicate_files.items():
+            lines.append("- path: `%s`" % path)
+            for code, versions in occurrences:
+                lines.append("  - qc: `%s` versions: `%s`" % (code, ", ".join(versions)))
+    else:
+        lines.append("- none")
+    lines.extend(["", "## Deduplicated Raw Inputs"])
+    if raw_duplicates:
+        for code, path, version, count in raw_duplicates:
+            lines.append("- qc: `%s` path: `%s` version: `%s` raw_count: %s" % (code, path, version, count))
+    else:
+        lines.append("- none")
+    lines.extend(["", "## QC Entries"])
+    for entry in entries:
+        lines.extend(["", "### " + entry.code, "- title: " + entry.title, "- module: " + entry.module, "- files:"])
+        if not entry.files:
+            lines.append("  - none")
+            continue
+        for file_entry in entry.files.values():
+            marker_color = file_entry.marker_color()
+            file_type, action, reason, encoding = rt_classify_path(file_entry.path)
+            upgrade_scope = "upgrade-migrate"
+            if marker_color == "black":
+                action = "skip"
+                reason = "black-context-file"
+                upgrade_scope = "context-only"
+            versions = file_entry.versions
+            lines.extend([
+                "  - path: `%s`" % file_entry.path,
+                "    versions: `%s`" % ", ".join(versions),
+                "    min_version: `%s`" % versions[0],
+                "    max_version: `%s`" % versions[-1],
+                "    type: `%s`" % file_type,
+                "    action: `%s`" % action,
+                "    reason: `%s`" % reason,
+                "    encoding: `%s`" % encoding,
+                "    marker_color: `%s`" % marker_color,
+                "    upgrade_scope: `%s`" % upgrade_scope,
+            ])
+    return "\n".join(lines) + "\n"
 
 
 class SvnSyncTool:
@@ -67,6 +634,9 @@ class SvnSyncTool:
         t3 = ttk.Frame(nb, padding=12)
         nb.add(t3, text="  3. 全自动流程  ")
         self._build_tab3(t3)
+        t4 = ttk.Frame(nb, padding=12)
+        nb.add(t4, text="  4. 升级清单提取  ")
+        self._build_tab4(t4)
 
     def _build_tab1(self, t1):
         row = 0
@@ -220,6 +790,214 @@ class SvnSyncTool:
 
         t3.columnconfigure(1, weight=1)
         t3.rowconfigure(row - 2, weight=1)
+
+    def _build_tab4(self, t4):
+        row = 0
+        ttk.Label(t4, text="从复制的带颜色升级清单提取，生成清单与升级 Markdown", font=("Microsoft YaHei", 9)).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 6)); row += 1
+        bf = ttk.Frame(t4)
+        bf.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 6))
+        ttk.Button(bf, text="从剪贴板提取", command=self._rt_extract).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(bf, text="清空", command=self._rt_clear).pack(side=tk.LEFT)
+        row += 1
+        ttk.Label(t4, text="提取清单（可编辑，按 QC 分组，[red]/[black] + SVN URL）：", font=("Microsoft YaHei", 9)).grid(row=row, column=0, columnspan=3, sticky=tk.W); row += 1
+        self.rt_list = scrolledtext.ScrolledText(t4, height=12, font=("Microsoft YaHei", 9), bg="#1e1e1e", fg="#d4d4d4", insertbackground="white", wrap=tk.NONE)
+        self.rt_list.grid(row=row, column=0, columnspan=3, sticky=tk.NSEW); row += 1
+        gen_f = ttk.Frame(t4)
+        gen_f.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(6, 6))
+        ttk.Button(gen_f, text="复制清单", command=self._rt_copy_list).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(gen_f, text="生成升级 Markdown", command=self._rt_gen_human).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(gen_f, text="生成 AI Markdown", command=self._rt_gen_ai).pack(side=tk.LEFT)
+        row += 1
+        res_f = ttk.Frame(t4)
+        res_f.grid(row=row, column=0, columnspan=3, sticky=tk.EW)
+        ttk.Label(res_f, text="生成结果：", font=("Microsoft YaHei", 9)).pack(side=tk.LEFT)
+        ttk.Button(res_f, text="另存为...", command=self._rt_save_result).pack(side=tk.RIGHT)
+        ttk.Button(res_f, text="复制结果", command=self._rt_copy_result).pack(side=tk.RIGHT, padx=(0, 8))
+        row += 1
+        self.rt_result = scrolledtext.ScrolledText(t4, height=10, font=("Microsoft YaHei", 9), bg="#1e1e1e", fg="#a0d0a0", insertbackground="white", wrap=tk.NONE)
+        self.rt_result.grid(row=row, column=0, columnspan=3, sticky=tk.NSEW); row += 1
+        self.rt_status = ttk.Label(t4, text="就绪", font=("Microsoft YaHei", 9))
+        self.rt_status.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(4, 0)); row += 1
+        self._rt_result_default_name = "upgrade-file-list.md"
+        t4.columnconfigure(1, weight=1)
+        t4.rowconfigure(3, weight=3)
+        t4.rowconfigure(7, weight=2)
+
+    # ---- tab4 剪贴板读取（分平台）----
+    def _read_clipboard_html(self):
+        if IS_WINDOWS:
+            return self._read_clipboard_html_windows()
+        if IS_MACOS:
+            html = self._read_clipboard_html_macos()
+            if html:
+                return html
+        # 兜底：纯文本（无颜色信息，红/黑会全部判为黑）
+        try:
+            return self.root.clipboard_get()
+        except Exception:
+            return ""
+
+    def _read_clipboard_html_macos(self):
+        script = (
+            'ObjC.import("AppKit");'
+            '(function(){var pb=$.NSPasteboard.generalPasteboard;'
+            'var types=["public.html","Apple HTML pasteboard type","HTML Format"];'
+            'for(var i=0;i<types.length;i++){var v=pb.stringForType(types[i]);'
+            'if(v){return ObjC.unwrap(v);}}return "";})()'
+        )
+        try:
+            r = subprocess.run(["osascript", "-l", "JavaScript", "-e", script],
+                               capture_output=True, text=True, errors="ignore")
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout
+        except Exception:
+            pass
+        try:
+            r = subprocess.run(["pbpaste", "-Prefer", "html"], capture_output=True, text=True, errors="ignore")
+            if r.returncode == 0:
+                return r.stdout
+        except Exception:
+            pass
+        return ""
+
+    def _read_clipboard_html_windows(self):
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            cf_html = user32.RegisterClipboardFormatW("HTML Format")
+            if not user32.OpenClipboard(0):
+                return ""
+            try:
+                handle = user32.GetClipboardData(cf_html)
+                if not handle:
+                    return ""  # 剪贴板里没有 HTML 格式
+                ptr = kernel32.GlobalLock(handle)
+                if not ptr:
+                    return ""
+                try:
+                    size = kernel32.GlobalSize(handle)
+                    data = ctypes.string_at(ptr, size)
+                finally:
+                    kernel32.GlobalUnlock(handle)
+            finally:
+                user32.CloseClipboard()
+            # CF_HTML 头部为 ASCII，StartHTML 给出 HTML 片段的字节偏移
+            m = re.search(rb"StartHTML:(\d+)", data)
+            if m:
+                start = int(m.group(1))
+                if 0 <= start < len(data):
+                    return data[start:].decode("utf-8", errors="replace")
+            idx = data.find(b"<")
+            return data[idx:].decode("utf-8", errors="replace") if idx >= 0 else data.decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+
+    # ---- tab4 动作 ----
+    def _rt_set_list(self, text):
+        self.rt_list.delete(1.0, tk.END)
+        self.rt_list.insert(tk.END, text)
+
+    def _rt_set_result(self, text):
+        self.rt_result.delete(1.0, tk.END)
+        self.rt_result.insert(tk.END, text)
+
+    def _rt_extract(self):
+        self.rt_status.config(text="正在读取剪贴板...")
+
+        def run():
+            try:
+                html = self._read_clipboard_html()
+                if not html or not html.strip():
+                    self.root.after(0, lambda: self.rt_status.config(text="剪贴板没有内容，请先从网页复制带颜色的升级清单"))
+                    return
+                lines = rt_extract_list_from_html(html)
+                file_lines = [l for l in lines if l.startswith(RT_COLOR_PREFIXES)]
+                if not file_lines:
+                    self.root.after(0, lambda: self.rt_status.config(text="未识别到红色/黑色 SVN 文件行；请确认复制的是带样式的升级清单（非纯文本）"))
+                    return
+                content = "\n".join(lines)
+                qc_count = sum(1 for l in lines if l.startswith("QC"))
+                self.root.after(0, lambda: (self._rt_set_list(content),
+                                            self.rt_status.config(text="提取完成：%d 个 QC，%d 个文件行" % (qc_count, len(file_lines)))))
+            except Exception as e:
+                self.root.after(0, lambda: self.rt_status.config(text="提取失败: " + str(e)))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _rt_clear(self):
+        self._rt_set_list("")
+        self._rt_set_result("")
+        self.rt_status.config(text="就绪")
+
+    def _rt_copy_list(self):
+        text = self.rt_list.get(1.0, tk.END).strip()
+        if not text:
+            self.rt_status.config(text="清单为空，无可复制内容")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.rt_status.config(text="清单已复制到剪贴板")
+
+    def _rt_gen_human(self):
+        text = self.rt_list.get(1.0, tk.END).strip()
+        if not text:
+            self.rt_status.config(text="请先提取或填写清单")
+            return
+        try:
+            entries, customer, _raw = rt_parse_txt(text)
+            md = rt_build_human_md(entries)
+        except Exception as e:
+            self.rt_status.config(text="生成升级 Markdown 失败: " + str(e))
+            return
+        self._rt_set_result(md)
+        self._rt_result_default_name = "upgrade-file-list.md"
+        self.rt_status.config(text="已生成升级 Markdown（客户: %s，%d 个 QC）" % (customer, len(entries)))
+
+    def _rt_gen_ai(self):
+        text = self.rt_list.get(1.0, tk.END).strip()
+        if not text:
+            self.rt_status.config(text="请先提取或填写清单")
+            return
+        try:
+            entries, customer, raw = rt_parse_txt(text)
+            md = rt_build_ai_md(entries, customer, raw)
+        except Exception as e:
+            self.rt_status.config(text="生成 AI Markdown 失败: " + str(e))
+            return
+        self._rt_set_result(md)
+        self._rt_result_default_name = "upgrade-file-list-ai.md"
+        self.rt_status.config(text="已生成 AI Markdown（客户: %s，%d 个 QC）" % (customer, len(entries)))
+
+    def _rt_copy_result(self):
+        text = self.rt_result.get(1.0, tk.END).strip()
+        if not text:
+            self.rt_status.config(text="结果为空，无可复制内容")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.rt_status.config(text="结果已复制到剪贴板")
+
+    def _rt_save_result(self):
+        text = self.rt_result.get(1.0, tk.END).strip()
+        if not text:
+            self.rt_status.config(text="结果为空，无可保存内容")
+            return
+        init_dir = self.checkout_dir.get().strip() or os.path.expanduser("~/Desktop")
+        path = filedialog.asksaveasfilename(
+            title="保存 Markdown",
+            initialdir=init_dir if os.path.isdir(init_dir) else os.path.expanduser("~"),
+            initialfile=getattr(self, "_rt_result_default_name", "upgrade-file-list.md"),
+            defaultextension=".md",
+            filetypes=[("Markdown", "*.md"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text + ("\n" if not text.endswith("\n") else ""))
+            self.rt_status.config(text="已保存: " + path)
+        except OSError as e:
+            self.rt_status.config(text="保存失败: " + str(e))
 
     def _browse_checkout(self):
         d = filedialog.askdirectory(title="选择 SVN 拉取目标目录")
