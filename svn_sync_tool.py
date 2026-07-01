@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """SVN 代码拉取 + 交叉文件覆盖 + 全自动提交 + 文件路径导出"""
 
 import os, sys, subprocess, threading, shutil, locale, tempfile, atexit
@@ -9,6 +9,7 @@ from html.parser import HTMLParser
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext, messagebox
 from pathlib import Path
+from svn_path_generator import SvnPathGeneratorTab
 try: import queue
 except: import Queue as queue
 
@@ -637,6 +638,9 @@ class SvnSyncTool:
         t4 = ttk.Frame(nb, padding=12)
         nb.add(t4, text="  4. 升级清单提取  ")
         self._build_tab4(t4)
+        t5 = ttk.Frame(nb, padding=12)
+        nb.add(t5, text="  5. 版本号路径生成  ")
+        self._build_tab5(t5)
 
     def _build_tab1(self, t1):
         row = 0
@@ -1668,6 +1672,11 @@ class SvnSyncTool:
             messagebox.showinfo("完成", "全自动流程执行完成！\n提交文件路径已导出。")
         elif ok:
             messagebox.showinfo("完成", "全自动流程执行完成！")
+
+    def _build_tab5(self, t5):
+        from svn_path_generator import SvnPathGeneratorTab
+        self._tab5 = SvnPathGeneratorTab(t5)
+        self._tab5.build()
 
     def sync_checkout_to_target(self, *args):
         self.target_dir.set(self.checkout_dir.get())
