@@ -231,17 +231,71 @@ class SvnPathGeneratorTab:
         self.parent.rowconfigure(row - 2, weight=1)  # txt_preview 行
 
     def _start_generate(self):
-        """启动后台线程生成路径"""
+        """生成并排序文件路径
+        如果填了 SVN 地址+版本号，则从服务器查询；
+        否则从下方文本框读取已有内容进行排序。
+        """
         url = self.svn_url.get().strip()
         spec = self.revision_spec.get().strip()
         
-        if not url:
-            messagebox.showwarning("提示", "请先输入 SVN 仓库地址")
-            return
-        if not spec:
-            messagebox.showwarning("提示", "请先输入 SVN 版本号")
+        # 模式1: SVN 查询模式
+        if url and spec:
+            self._generate_from_svn(url, spec)
             return
         
+        # 模式2: 本地排序模式
+        self._sort_local_content()
+
+    def _sort_local_content(self):
+        """从文本框读取内容进行本地排序"""
+        content = self.txt_preview.get("1.0", tk.END).strip()
+        if not content:
+            messagebox.showwarning("提示", "请先在下方文本框中输入或粘贴 SVN 文件路径")
+            return
+        
+        lines = [l.strip() for l in content.split("\n") if l.strip()]
+        if not lines:
+            messagebox.showwarning("提示", "无有效的文件路径")
+            return
+        
+        sort_mode = self.sort_mode.get()
+        
+        # 解析每行为 (url, revision, filename) 元组
+        parsed = []
+        for line in lines:
+            rev = 0
+            text = line
+            # 尝试提取 (Vxxx) 格式的版本号
+            m = re.search(r'\(V(\d+)\)', text)
+            if m:
+                rev = int(m.group(1))
+                text = text[:m.start()] + text[m.end():]
+            filename = os.path.basename(text.rstrip("/"))
+            parsed.append((line, rev, filename))
+        
+        # 排序
+        if sort_mode == "按路径排序":
+            parsed.sort(key=lambda x: x[0].lower())
+        elif sort_mode == "按版本排序":
+            parsed.sort(key=lambda x: (x[1], x[0].lower()))
+        elif sort_mode == "按文件名排序":
+            parsed.sort(key=lambda x: (x[2].lower(), x[0].lower()))
+        
+        sorted_lines = [p[0] for p in parsed]
+        
+        self._generated_urls = sorted_lines
+        self._generated_results = [(p[0], p[1]) for p in parsed]
+        
+        self.txt_preview.config(state=tk.NORMAL)
+        self.txt_preview.delete(1.0, tk.END)
+        self.txt_preview.insert(tk.END, "\n".join(sorted_lines))
+        
+        self.lbl_status.config(text="排序完成")
+        self.lbl_count.config(text="共 %d 条路径（排序: %s）" % (len(sorted_lines), sort_mode))
+        self.btn_copy.config(state=tk.NORMAL)
+
+    def _generate_from_svn(self, url, spec):
+        """从 SVN 服务器查询版本的文件路径，再按选择的排序方式排列"""
         revisions = parse_revision_spec(spec)
         if not revisions:
             messagebox.showwarning("提示", "无法解析版本号，请检查格式")
@@ -292,6 +346,7 @@ class SvnPathGeneratorTab:
         self.root = self.parent.winfo_toplevel()
         threading.Thread(target=run, daemon=True).start()
 
+
     def _display_results(self, results, errors):
         """显示生成结果"""
         if not results and not errors:
@@ -335,7 +390,6 @@ class SvnPathGeneratorTab:
         self.txt_preview.config(state=tk.NORMAL)
         self.txt_preview.delete(1.0, tk.END)
         self.txt_preview.insert(tk.END, "\n".join(display_lines).rstrip("\n"))
-        self.txt_preview.config(state=tk.DISABLED)
         
         # 状态
         status_parts = []
@@ -355,7 +409,6 @@ class SvnPathGeneratorTab:
         self.txt_preview.config(state=tk.NORMAL)
         self.txt_preview.delete(1.0, tk.END)
         self.txt_preview.insert(tk.END, "错误: " + err_msg)
-        self.txt_preview.config(state=tk.DISABLED)
         self.lbl_status.config(text="查询失败")
         self.btn_copy.config(state=tk.DISABLED)
         self._set_ui_busy(False)
@@ -376,7 +429,6 @@ class SvnPathGeneratorTab:
         self._generated_urls = []
         self.txt_preview.config(state=tk.NORMAL)
         self.txt_preview.delete(1.0, tk.END)
-        self.txt_preview.config(state=tk.DISABLED)
         self.lbl_status.config(text="就绪")
         self.lbl_count.config(text="")
         self.btn_copy.config(state=tk.DISABLED, text="复制结果")
