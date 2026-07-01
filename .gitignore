@@ -2,6 +2,7 @@
 work/
 build/
 *.spec
+!SVN_Sync_Tool.spec
 *.pyc
 *.pyo
 __pycache__/

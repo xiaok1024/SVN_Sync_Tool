@@ -9,7 +9,7 @@
 当前主要技术栈：
 
 - Python 单文件应用：`svn_sync_tool.py`
-- GUI：`tkinter` / `ttk`
+- GUI：`tkinter` / `ttkbootstrap`（基于 `ttk`）
 - SVN 操作：通过系统 `svn` CLI 调用
 - macOS / Windows 打包：PyInstaller
 - 发布产物：`outputs/`
