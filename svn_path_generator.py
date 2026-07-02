@@ -333,6 +333,10 @@ class SvnPathGeneratorTab:
                             continue
                         
                         for p in paths:
+                            # 只保留文件，过滤掉目录
+                            kind = p.get("kind", "")
+                            if kind != "file":
+                                continue
                             path_text = p.text.strip() if p.text else ""
                             if path_text:
                                 results.append((path_text, rev))
