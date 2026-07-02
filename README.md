@@ -132,8 +132,8 @@ The "organized directory (source)" accepts a **network share address** in additi
 
 ### 前置条件 / Prerequisites
 
-- **Python 3.6+**
-- **PyInstaller**
+- **Python 3.10+**
+- **requirements.txt 中的打包依赖**（PyInstaller、ttkbootstrap）
 - **SVN CLI**（`svn` / `svn.exe` 需在 PATH 中；macOS 可用 Homebrew 安装：`brew install subversion`）
 
 ### 打包命令 / Build Command
@@ -141,10 +141,13 @@ The "organized directory (source)" accepts a **network share address** in additi
 **Windows**（单文件 exe）：
 
 ```bat
-pip install pyinstaller
+py -m pip install -r requirements.txt
+
+REM 可选：直接从源码启动检查界面
+py svn_sync_tool.py
 
 REM 打包为单文件 exe（无控制台窗口）
-pyinstaller --onefile --windowed --name "SVN_Sync_Tool" svn_sync_tool.py
+py -m PyInstaller --onefile --windowed --name "SVN_Sync_Tool" --collect-all ttkbootstrap svn_sync_tool.py
 
 REM 产物在 dist\ 下，复制到 outputs\
 copy dist\SVN_Sync_Tool.exe outputs\
@@ -153,18 +156,18 @@ copy dist\SVN_Sync_Tool.exe outputs\
 **macOS**（`.app` 应用包）：
 
 ```bash
-pip install pyinstaller
+pip install -r requirements.txt
 
-# 使用本地生成的 SVN_Sync_Tool.spec 打包（产出 .app）
+# 使用项目内 SVN_Sync_Tool.spec 打包（产出 .app，并收集 ttkbootstrap 资源）
 pyinstaller SVN_Sync_Tool.spec
 # 或直接从脚本打包：
-# pyinstaller --windowed --name "SVN_Sync_Tool" svn_sync_tool.py
+# pyinstaller --windowed --name "SVN_Sync_Tool" --collect-all ttkbootstrap svn_sync_tool.py
 
 # 产物 SVN_Sync_Tool.app 在 dist/ 下，压缩到 outputs/
 cd dist && zip -r ../outputs/SVN_Sync_Tool-macos-arm64.zip SVN_Sync_Tool.app
 ```
 
-> `*.spec`、`build/`、`dist/` 均已在 `.gitignore` 中忽略，仓库只保留 `outputs/` 下的成品。
+> `build/`、`dist/` 均已在 `.gitignore` 中忽略；`SVN_Sync_Tool.spec` 纳入版本库，用于稳定收集 `ttkbootstrap` 打包资源。仓库只保留 `outputs/` 下的成品。
 
 ### 参数说明 / Arguments Explained
 
@@ -179,10 +182,12 @@ cd dist && zip -r ../outputs/SVN_Sync_Tool-macos-arm64.zip SVN_Sync_Tool.app
 
 ## 技术栈 / Tech Stack
 
-- **语言**: Python 3.6+
-- **GUI**: tkinter / ttk
+- **语言**: Python 3.10+
+- **GUI**: tkinter / ttkbootstrap（基于 ttk）
 - **SVN**: 通过 subprocess 调用系统 svn CLI
 - **打包**: PyInstaller（Windows 出 exe，macOS 出 .app）
+
+> Windows/macOS 预编译产物会内嵌 Python 依赖（包括 `ttkbootstrap`），普通用户无需安装 Python、PyInstaller 或 pip 依赖；运行 SVN 功能仍需系统已安装 SVN 命令行工具。
 
 ---
 
@@ -191,8 +196,9 @@ cd dist && zip -r ../outputs/SVN_Sync_Tool-macos-arm64.zip SVN_Sync_Tool.app
 ```
 .
 ├── .gitignore                          # Git 排除规则
+├── requirements.txt                    # 打包依赖
 ├── svn_sync_tool.py                    # 单文件源码（GUI + SVN/共享地址处理）
-├── SVN_Sync_Tool.spec                  # PyInstaller 打包配置（本地生成，已 gitignore）
+├── SVN_Sync_Tool.spec                  # PyInstaller 打包配置
 ├── outputs/                            # 预编译成品（纳入版本库）
 │   ├── SVN_Sync_Tool.exe               #   Windows 可执行文件
 │   └── SVN_Sync_Tool-macos-arm64.zip   #   macOS (Apple Silicon) 应用包压缩
@@ -211,4 +217,4 @@ cd dist && zip -r ../outputs/SVN_Sync_Tool-macos-arm64.zip SVN_Sync_Tool.app
 - macOS 上由工具临时挂载的共享会在关闭窗口时自动卸载；访达手动连接的挂载不会被卸载
 - 全自动流程提交成功后会列出本次提交文件的可访问 URL，可一键复制；提交解析使用 `svn info/log --xml`，不受中文（GBK/本地化）输出影响
 - 若本次运行无变更（不产生新提交），会回退导出工作副本当前版本的文件路径，方便随时复制
-- 源码使用 Python 3.6 编写，兼容 3.6+ 全系列版本
+- 源码打包环境要求 Python 3.10+（`ttkbootstrap` 依赖要求）；普通用户运行预编译产物无需安装 Python
