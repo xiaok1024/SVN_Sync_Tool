@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """SVN 代码拉取 + 交叉文件覆盖 + 全自动提交 + 文件路径导出"""
 
 import os, sys, subprocess, threading, shutil, locale, tempfile, atexit
@@ -8,9 +8,10 @@ from collections import Counter, OrderedDict, defaultdict
 from html.parser import HTMLParser
 import tkinter as tk
 from tkinter import filedialog, scrolledtext, messagebox, font as tkfont
-import ttkbootstrap as ttk
+from ttkbootstrap import Style
+from tkinter import ttk
 from pathlib import Path
-from svn_path_generator import SvnPathGeneratorTab
+import svn_path_generator
 try: import queue
 except: import Queue as queue
 
@@ -658,9 +659,8 @@ class SvnSyncTool:
         self.root.configure(bg=self.colors["bg"])
         self.root.option_add("*Font", self.fonts["body"])
 
-        self.style = ttk.Style()
-        if self.style.theme.name != "flatly":
-            self.style.theme_use("flatly")
+        self.style = Style()
+        self.style.theme_use("flatly")
 
         self.style.configure("TFrame", background=self.colors["panel"])
         self.style.configure("App.TFrame", background=self.colors["bg"])
@@ -720,10 +720,10 @@ class SvnSyncTool:
         t4 = ttk.Frame(nb, padding=18, style="Panel.TFrame")
         nb.add(t4, text="  4. 升级清单提取  ")
         self._build_tab4(t4)
-        t5 = ttk.Frame(nb, padding=12)
+
+        t5 = ttk.Frame(nb, padding=18, style="Panel.TFrame")
         nb.add(t5, text="  5. 版本号路径生成  ")
         self._build_tab5(t5)
-
     def _build_tab1(self, t1):
         row = 0
         ttk.Label(t1, text="SVN 仓库地址：").grid(row=row, column=0, sticky=tk.W, pady=(0, 6)); row+=1
@@ -740,9 +740,9 @@ class SvnSyncTool:
         frm = ttk.Frame(t1)
         frm.grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(0, 14))
         ttk.Entry(frm, textvariable=self.checkout_dir).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(frm, text="浏览...", command=self._browse_checkout, bootstyle="secondary-outline").pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(frm, text="浏览...", command=self._browse_checkout).pack(side=tk.RIGHT, padx=(6, 0))
         row+=1
-        self.btn_co = ttk.Button(t1, text="拉取代码", command=self._start_checkout, bootstyle="primary")
+        self.btn_co = ttk.Button(t1, text="拉取代码", command=self._start_checkout)
         self.btn_co.grid(row=row, column=0, columnspan=3, pady=(0, 14)); row+=1
         ttk.Label(t1, text="执行日志：", style="Muted.TLabel").grid(row=row, column=0, sticky=tk.W, pady=(0, 6)); row+=1
         self.log_co = scrolledtext.ScrolledText(t1, height=14)
@@ -757,13 +757,13 @@ class SvnSyncTool:
         f2 = ttk.Frame(t2)
         f2.grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(0, 10))
         ttk.Entry(f2, textvariable=self.target_dir).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(f2, text="浏览...", command=self._browse_target, bootstyle="secondary-outline").pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(f2, text="浏览...", command=self._browse_target).pack(side=tk.RIGHT, padx=(6, 0))
         row+=1
         ttk.Label(t2, text="整理好的目录（来源，取文件）：").grid(row=row, column=0, sticky=tk.W, pady=(0, 6)); row+=1
         f1 = ttk.Frame(t2)
         f1.grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(0, 10))
         ttk.Entry(f1, textvariable=self.source_dir).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(f1, text="浏览...", command=self._browse_source, bootstyle="secondary-outline").pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(f1, text="浏览...", command=self._browse_source).pack(side=tk.RIGHT, padx=(6, 0))
         row+=1
         sf2 = ttk.Frame(t2)
         sf2.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 12))
@@ -775,13 +775,13 @@ class SvnSyncTool:
         row+=1
         bf = ttk.Frame(t2)
         bf.grid(row=row, column=0, columnspan=3, pady=(0, 14))
-        self.btn_scan = ttk.Button(bf, text="扫描预览", command=self._start_scan, bootstyle="secondary-outline")
+        self.btn_scan = ttk.Button(bf, text="扫描预览", command=self._start_scan)
         self.btn_scan.pack(side=tk.LEFT, padx=(0, 8))
-        self.btn_quick = ttk.Button(bf, text="一键覆盖（推荐）", command=self._start_quick_overwrite, bootstyle="primary")
+        self.btn_quick = ttk.Button(bf, text="一键覆盖（推荐）", command=self._start_quick_overwrite)
         self.btn_quick.pack(side=tk.LEFT, padx=(0, 8))
-        self.btn_ow = ttk.Button(bf, text="覆盖选中", command=self._start_overwrite, state=tk.DISABLED, bootstyle="secondary-outline")
+        self.btn_ow = ttk.Button(bf, text="覆盖选中", command=self._start_overwrite, state=tk.DISABLED)
         self.btn_ow.pack(side=tk.LEFT)
-        ttk.Button(bf, text="清空结果", command=self._clear_results, bootstyle="secondary-outline").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(bf, text="清空结果", command=self._clear_results).pack(side=tk.LEFT, padx=(8, 0))
         row+=1
         ttk.Label(t2, text="文件列表（点击切换勾选）：", style="Muted.TLabel").grid(row=row, column=0, sticky=tk.W, pady=(0, 6)); row+=1
         lf = ttk.Frame(t2)
@@ -823,13 +823,13 @@ class SvnSyncTool:
         f_a = ttk.Frame(t3)
         f_a.grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(0, 10))
         ttk.Entry(f_a, textvariable=self.checkout_dir).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(f_a, text="浏览...", command=self._browse_checkout, bootstyle="secondary-outline").pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(f_a, text="浏览...", command=self._browse_checkout).pack(side=tk.RIGHT, padx=(6, 0))
         row+=1
         ttk.Label(t3, text="整理好的目录（来源取文件）：").grid(row=row, column=0, sticky=tk.W, pady=(0, 6)); row+=1
         f_b = ttk.Frame(t3)
         f_b.grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(0, 12))
         ttk.Entry(f_b, textvariable=self.source_dir).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(f_b, text="浏览...", command=self._browse_source, bootstyle="secondary-outline").pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(f_b, text="浏览...", command=self._browse_source).pack(side=tk.RIGHT, padx=(6, 0))
         row+=1
         sf3 = ttk.Frame(t3)
         sf3.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 10))
@@ -851,7 +851,7 @@ class SvnSyncTool:
         self.auto_msg.grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(0, 12))
         self.auto_msg.insert(tk.END, "自动同步代码")
         row += 1
-        self.btn_auto = ttk.Button(t3, text="一键执行：拉取 -> 覆盖 -> 提交", command=self._start_auto_pipeline, bootstyle="primary")
+        self.btn_auto = ttk.Button(t3, text="一键执行：拉取 -> 覆盖 -> 提交", command=self._start_auto_pipeline)
         self.btn_auto.grid(row=row, column=0, columnspan=3, pady=(0, 14), ipady=4)
         row += 1
         ttk.Label(t3, text="执行日志：", style="Muted.TLabel").grid(row=row, column=0, sticky=tk.W, pady=(0, 6)); row+=1
@@ -866,7 +866,7 @@ class SvnSyncTool:
         pf_row = 0
         btn_copy_frame = ttk.Frame(self.path_frame)
         btn_copy_frame.grid(row=pf_row, column=0, sticky=tk.W, pady=(2, 6))
-        self.btn_copy_paths = ttk.Button(btn_copy_frame, text="复制文件路径", command=self._copy_commit_paths, state=tk.DISABLED, bootstyle="secondary-outline")
+        self.btn_copy_paths = ttk.Button(btn_copy_frame, text="复制文件路径", command=self._copy_commit_paths, state=tk.DISABLED)
         self.btn_copy_paths.pack(side=tk.LEFT, padx=(0, 10))
         self.lbl_paths_count = ttk.Label(btn_copy_frame, text="（暂无）", style="Muted.TLabel")
         self.lbl_paths_count.pack(side=tk.LEFT)
@@ -885,8 +885,8 @@ class SvnSyncTool:
         ttk.Label(t4, text="从复制的带颜色升级清单提取，生成清单与升级 Markdown", style="Muted.TLabel").grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 10)); row += 1
         bf = ttk.Frame(t4)
         bf.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 10))
-        ttk.Button(bf, text="从剪贴板提取", command=self._rt_extract, bootstyle="secondary-outline").pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(bf, text="清空", command=self._rt_clear, bootstyle="secondary-outline").pack(side=tk.LEFT)
+        ttk.Button(bf, text="从剪贴板提取", command=self._rt_extract).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(bf, text="清空", command=self._rt_clear).pack(side=tk.LEFT)
         row += 1
         ttk.Label(t4, text="提取清单（可编辑，按 QC 分组，[red]/[black] + SVN URL）：", style="Muted.TLabel").grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 6)); row += 1
         self.rt_list = scrolledtext.ScrolledText(t4, height=12, wrap=tk.NONE)
@@ -894,15 +894,15 @@ class SvnSyncTool:
         self.rt_list.grid(row=row, column=0, columnspan=3, sticky=tk.NSEW); row += 1
         gen_f = ttk.Frame(t4)
         gen_f.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(10, 10))
-        ttk.Button(gen_f, text="复制清单", command=self._rt_copy_list, bootstyle="secondary-outline").pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(gen_f, text="生成升级 Markdown", command=self._rt_gen_human, bootstyle="secondary-outline").pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(gen_f, text="生成 AI Markdown", command=self._rt_gen_ai, bootstyle="primary").pack(side=tk.LEFT)
+        ttk.Button(gen_f, text="复制清单", command=self._rt_copy_list).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(gen_f, text="生成升级 Markdown", command=self._rt_gen_human).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(gen_f, text="生成 AI Markdown", command=self._rt_gen_ai).pack(side=tk.LEFT)
         row += 1
         res_f = ttk.Frame(t4)
         res_f.grid(row=row, column=0, columnspan=3, sticky=tk.EW)
         ttk.Label(res_f, text="生成结果：", style="Muted.TLabel").pack(side=tk.LEFT)
-        ttk.Button(res_f, text="另存为...", command=self._rt_save_result, bootstyle="secondary-outline").pack(side=tk.RIGHT)
-        ttk.Button(res_f, text="复制结果", command=self._rt_copy_result, bootstyle="secondary-outline").pack(side=tk.RIGHT, padx=(0, 8))
+        ttk.Button(res_f, text="另存为...", command=self._rt_save_result).pack(side=tk.RIGHT)
+        ttk.Button(res_f, text="复制结果", command=self._rt_copy_result).pack(side=tk.RIGHT, padx=(0, 8))
         row += 1
         self.rt_result = scrolledtext.ScrolledText(t4, height=10, wrap=tk.NONE)
         self._style_text(self.rt_result, kind="path")
@@ -1760,17 +1760,24 @@ class SvnSyncTool:
         elif ok:
             messagebox.showinfo("完成", "全自动流程执行完成！")
 
-    def _build_tab5(self, t5):
-        from svn_path_generator import SvnPathGeneratorTab
-        self._tab5 = SvnPathGeneratorTab(t5)
-        self._tab5.build()
-
     def sync_checkout_to_target(self, *args):
         self.target_dir.set(self.checkout_dir.get())
 
 
+    def _build_tab5(self, t5):
+        """版本号路径生成 Tab"""
+        self._path_gen = svn_path_generator.SvnPathGeneratorTab(t5)
+        # 共享主程序的 SVN 凭据变量
+        self._path_gen.svn_url = self.svn_url
+        self._path_gen.svn_user = self.svn_user
+        self._path_gen.svn_pass = self.svn_pass
+        self._path_gen.build()
+        t5.columnconfigure(1, weight=1)
+
 if __name__ == "__main__":
-    root = ttk.Window(themename="flatly")
+    import tkinter as tk
+    root = tk.Tk()
+    style = Style(theme="flatly")
     app = SvnSyncTool(root)
     if hasattr(app.checkout_dir, "trace_add"):
         app.checkout_dir.trace_add("write", app.sync_checkout_to_target)
