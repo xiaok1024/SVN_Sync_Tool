@@ -11,8 +11,14 @@
 
 import os, sys, subprocess, threading, re, locale
 import xml.etree.ElementTree as ET
-import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
+# GUI 依赖允许缺失：终端版只复用 parse_revision_spec / run_svn_command 等纯逻辑函数
+try:
+    import tkinter as tk
+    from tkinter import ttk, scrolledtext, messagebox
+    GUI_AVAILABLE = True
+except ImportError:
+    tk = None
+    GUI_AVAILABLE = False
 
 # ── 复用主程序的环境变量 ──────────────────────────────────
 _SYS_ENC = locale.getpreferredencoding()
@@ -190,7 +196,11 @@ class SvnPathGeneratorTab:
         sort_tips = {"按路径排序": "按文件路径排序", "按版本排序": "按版本号排序", "按文件名排序": "按文件名排序"}
         def _on_sort_change(*args):
             self.sort_combo_tip = sort_tips.get(self.sort_mode.get(), "")
-        self.sort_mode.trace("w", _on_sort_change)
+        # Python 3.13/Tcl 9 移除了旧式 trace("w")，优先用 trace_add
+        if hasattr(self.sort_mode, "trace_add"):
+            self.sort_mode.trace_add("write", _on_sort_change)
+        else:
+            self.sort_mode.trace("w", _on_sort_change)
         
         ttk.Label(op_frame, text="  |  ", font=("Microsoft YaHei", 9)).pack(side=tk.LEFT)
         
@@ -446,6 +456,9 @@ class SvnPathGeneratorTab:
 
 # ── 独立运行测试 ──
 if __name__ == "__main__":
+    if not GUI_AVAILABLE:
+        sys.stderr.write("缺少 GUI 依赖（tkinter），无法启动图形界面\n")
+        sys.exit(1)
     root = tk.Tk()
     root.title("SVN 版本号路径生成工具")
     root.geometry("800x700")

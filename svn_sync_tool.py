@@ -6,10 +6,16 @@ import urllib.parse, unicodedata, re
 import xml.etree.ElementTree as ET
 from collections import Counter, OrderedDict, defaultdict
 from html.parser import HTMLParser
-import tkinter as tk
-from tkinter import filedialog, scrolledtext, messagebox, font as tkfont
-from ttkbootstrap import Style
-from tkinter import ttk
+# GUI 依赖允许缺失：终端版（svn_sync_cli.py）只复用本模块的业务逻辑，不需要 tkinter/ttkbootstrap
+try:
+    import tkinter as tk
+    from tkinter import filedialog, scrolledtext, messagebox, font as tkfont
+    from ttkbootstrap import Style
+    from tkinter import ttk
+    GUI_AVAILABLE = True
+except ImportError:
+    tk = None
+    GUI_AVAILABLE = False
 from pathlib import Path
 import svn_path_generator
 try: import queue
@@ -1849,7 +1855,9 @@ class SvnSyncTool:
         t5.columnconfigure(1, weight=1)
 
 if __name__ == "__main__":
-    import tkinter as tk
+    if not GUI_AVAILABLE:
+        sys.stderr.write("缺少 GUI 依赖（tkinter/ttkbootstrap），无法启动图形界面；终端模式请运行 svn_sync_cli.py\n")
+        sys.exit(1)
     root = tk.Tk()
     style = Style(theme="flatly")
     app = SvnSyncTool(root)

@@ -1,6 +1,11 @@
 # SVN 代码同步工具 / SVN Code Sync Tool
 
-一个跨平台（Windows / macOS）图形化工具，用于从 SVN 拉取代码、用整理好的本地目录（或网络共享）覆盖交叉文件、并自动提交变更。三步流程一键完成，提交完成后可一键复制 SVN 提交记录。
+一个跨平台（Windows / macOS）工具，用于从 SVN 拉取代码、用整理好的本地目录（或网络共享）覆盖交叉文件、并自动提交变更。三步流程一键完成，提交完成后可一键复制 SVN 提交记录。
+
+提供两种使用方式：
+
+- **图形界面**（`svn_sync_tool.py`）：Windows 主要使用方式，打包为 exe 分发。
+- **终端版**（`svn_sync_cli.py`）：macOS 推荐使用方式，功能与 GUI 的 5 个标签页一一对应，支持交互式菜单和命令行参数两种用法，详见下方「终端版」章节。macOS 不再更新 `.app` 打包产物。
 
 A cross-platform (Windows / macOS) GUI tool for checking out code from SVN, overwriting cross-referenced files from a local organized directory (or network share), and automatically committing changes. Complete the three-step workflow with one click.
 
@@ -41,11 +46,54 @@ Grab the pre-built artifact for your platform from the outputs/ directory:
 | 平台 | 产物 |
 |------|------|
 | **Windows** | `outputs/SVN_Sync_Tool.exe` |
-| **macOS (Apple Silicon)** | `outputs/SVN_Sync_Tool-macos-arm64.zip`（解压得到 `SVN_Sync_Tool.app`） |
+| **macOS** | 推荐直接运行终端版源码 `python3 svn_sync_cli.py`（历史 `outputs/SVN_Sync_Tool-macos-arm64.zip` 不再更新） |
 
-双击运行，无需安装 Python 或任何依赖（但系统需已安装 SVN 命令行工具）。
+Windows exe 双击运行，无需安装 Python 或任何依赖（但系统需已安装 SVN 命令行工具）。macOS 终端版只依赖系统 Python 3 和 SVN 命令行工具，无需安装第三方包。
 
-Double-click to run. No Python or dependencies required (the SVN command-line client must be installed on the system).
+The Windows exe runs by double-click with no Python required. On macOS, run the terminal version (`python3 svn_sync_cli.py`) — it only needs Python 3 and the SVN CLI, no third-party packages.
+
+---
+
+## 终端版 / CLI（macOS 推荐）
+
+`svn_sync_cli.py` 与 GUI 共用同一套业务逻辑，功能与 5 个标签页一一对应，两种用法：
+
+### 交互模式
+
+```bash
+python3 svn_sync_cli.py
+```
+
+进入主菜单选择功能（1-5 对应 GUI 的 5 个标签页），随后按提示逐项输入参数：
+
+- 常用值（SVN 地址、目录、用户名等，**不含密码**）会记住在 `~/.config/svn_sync_tool/cli.json`，下次回车即可复用；
+- 密码输入不回显；来源为 `smb://` 共享时才会询问 SMB 账号；
+- 交叉覆盖会先列出文件清单，回车全部覆盖，或输入序号（如 `1,3-5`）只覆盖部分，确认后才执行；
+- 全自动流程执行前会显示参数摘要并要求确认；`checkout` 模式删除已有目录前会单独确认；
+- 生成的提交路径 / 升级 Markdown / 版本号路径可直接复制到剪贴板或保存为文件。
+
+### 参数模式（可脚本化）
+
+```bash
+# 1. SVN 拉取
+python3 svn_sync_cli.py checkout --url https://svn.example.com/svn/cust/ecology --dir ~/work/ecology
+
+# 2. 交叉覆盖（--dry-run 仅预览；非交互执行覆盖必须 --yes）
+python3 svn_sync_cli.py overwrite --target ~/work/ecology --source 'smb://192.168.7.215/share/ecology' --dry-run
+python3 svn_sync_cli.py overwrite --target ~/work/ecology --source ~/organized --yes
+
+# 3. 全自动流程：拉取 → 覆盖 → 提交（非交互必须 --yes；--copy 完成后复制提交路径）
+python3 svn_sync_cli.py auto --url ... --dir ~/work/ecology --source ~/organized -m "自动同步代码" --mode update --yes --copy
+
+# 4. 升级清单提取（默认读剪贴板富文本；也可 --input 页面.html 或 --list 清单.txt）
+python3 svn_sync_cli.py extract --format md -o upgrade-file-list.md
+python3 svn_sync_cli.py extract --format ai-md -o upgrade-file-list-ai.md
+
+# 5. 版本号路径生成
+python3 svn_sync_cli.py paths --url https://svn.example.com/svn/cust/ecology -r "123,456-789" --sort rev --copy
+```
+
+在终端里漏填的必填参数会自动转为交互提问补全；非终端环境（如 CI）漏填则直接报错退出。各子命令详细参数见 `python3 svn_sync_cli.py <子命令> --help`。
 
 ---
 
@@ -153,19 +201,13 @@ REM 产物在 dist\ 下，复制到 outputs\
 copy dist\SVN_Sync_Tool.exe outputs\
 ```
 
-**macOS**（`.app` 应用包）：
+**macOS**：不再打包 `.app`，直接运行终端版即可：
 
 ```bash
-pip install -r requirements.txt
-
-# 使用项目内 SVN_Sync_Tool.spec 打包（产出 .app，并收集 ttkbootstrap 资源）
-pyinstaller SVN_Sync_Tool.spec
-# 或直接从脚本打包：
-# pyinstaller --windowed --name "SVN_Sync_Tool" --collect-all ttkbootstrap svn_sync_tool.py
-
-# 产物 SVN_Sync_Tool.app 在 dist/ 下，压缩到 outputs/
-cd dist && zip -r ../outputs/SVN_Sync_Tool-macos-arm64.zip SVN_Sync_Tool.app
+python3 svn_sync_cli.py
 ```
+
+> 如确需在 macOS 上运行图形界面（与 Windows 同一套代码），安装 `ttkbootstrap` 后运行 `python3 svn_sync_tool.py`。
 
 > `build/`、`dist/` 均已在 `.gitignore` 中忽略；`SVN_Sync_Tool.spec` 纳入版本库，用于稳定收集 `ttkbootstrap` 打包资源。仓库只保留 `outputs/` 下的成品。
 
@@ -197,11 +239,13 @@ cd dist && zip -r ../outputs/SVN_Sync_Tool-macos-arm64.zip SVN_Sync_Tool.app
 .
 ├── .gitignore                          # Git 排除规则
 ├── requirements.txt                    # 打包依赖
-├── svn_sync_tool.py                    # 单文件源码（GUI + SVN/共享地址处理）
-├── SVN_Sync_Tool.spec                  # PyInstaller 打包配置
+├── svn_sync_tool.py                    # GUI 入口 + 业务逻辑（SVN/共享地址/清单解析）
+├── svn_sync_cli.py                     # 终端版入口（复用 svn_sync_tool 业务逻辑）
+├── svn_path_generator.py               # 版本号路径生成（Tab 5 / paths 子命令）
+├── SVN_Sync_Tool.spec                  # PyInstaller 打包配置（Windows）
 ├── outputs/                            # 预编译成品（纳入版本库）
 │   ├── SVN_Sync_Tool.exe               #   Windows 可执行文件
-│   └── SVN_Sync_Tool-macos-arm64.zip   #   macOS (Apple Silicon) 应用包压缩
+│   └── SVN_Sync_Tool-macos-arm64.zip   #   macOS 历史应用包（不再更新）
 ├── README.assets/                      # README 截图
 └── README.md                           # 本文档
 ```
