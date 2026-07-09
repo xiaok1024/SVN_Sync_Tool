@@ -1175,24 +1175,94 @@ class SvnSyncTool:
         proc.wait()
         return proc.returncode, "".join(out_lines)
 
-    def _run_svn_bytes(self, *args, force_utf8=False):
+    def _run_svn_bytes(self, *args, force_utf8=False, cwd=None):
         """运行 svn 命令，返回原始字节解码后的文本。
         force_utf8=True 用于 --xml 输出（svn 的 XML 始终是 UTF-8，与系统/界面 locale 无关）。"""
         cmd = self._build_svn_cmd(*args)
         proc = subprocess.Popen(cmd,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env=self._svn_env(),
+            cwd=cwd,
             creationflags=CREATE_NO_WINDOW)
         out, err = proc.communicate(timeout=30)
         if force_utf8:
             text = out.decode('utf-8', errors='replace')
+            err_text = err.decode('utf-8', errors='replace')
         else:
             # 优先系统编码（中文 Windows 为 GBK），失败则 UTF-8
             try:
                 text = out.decode(_SVN_ENC)
             except (UnicodeDecodeError, LookupError):
                 text = out.decode('utf-8', errors='replace')
+            try:
+                err_text = err.decode(_SVN_ENC)
+            except (UnicodeDecodeError, LookupError):
+                err_text = err.decode('utf-8', errors='replace')
+        if err_text:
+            text += err_text
         return proc.returncode, text
+
+    def _find_locked_svn_paths(self, checkout_dir):
+        """返回工作副本中带仓库锁信息的文件路径。"""
+        rc, out = self._run_svn_bytes("status", "-u", "--xml", ".", force_utf8=True, cwd=checkout_dir)
+        if rc != 0:
+            raise RuntimeError(out.strip() or "svn status -u --xml 执行失败")
+
+        root = ET.fromstring(out)
+        locked = []
+        seen = set()
+        for entry in root.findall(".//entry"):
+            path = (entry.get("path") or "").strip()
+            if not path or path == ".":
+                continue
+
+            wc_status = entry.find("wc-status")
+            repos_status = entry.find("repos-status")
+            has_lock = (
+                (wc_status is not None and wc_status.find("lock") is not None) or
+                (repos_status is not None and repos_status.find("lock") is not None)
+            )
+            if not has_lock:
+                continue
+
+            target = os.path.abspath(os.path.join(checkout_dir, path))
+            if target not in seen:
+                locked.append(target)
+                seen.add(target)
+        return locked
+
+    def _unlock_svn_locks_before_commit(self, log_widget, checkout_dir):
+        self._log(log_widget, "检查 SVN 锁状态...\n")
+        try:
+            locked_paths = self._find_locked_svn_paths(checkout_dir)
+        except Exception as e:
+            self._log(log_widget, "检查 SVN 锁状态失败: " + str(e) + "\n")
+            return False
+
+        if not locked_paths:
+            self._log(log_widget, "未发现 SVN 上锁文件\n")
+            return True
+
+        self._log(log_widget, "发现 " + str(len(locked_paths)) + " 个 SVN 上锁文件，正在解锁...\n")
+        targets_file = None
+        try:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", delete=False) as f:
+                targets_file = f.name
+                for path in locked_paths:
+                    f.write(path + "\n")
+                    self._log(log_widget, "  [解锁] " + os.path.relpath(path, checkout_dir) + "\n")
+            rc, _ = self._run_svn(log_widget, "unlock", "--force", "--targets", targets_file)
+            if rc != 0:
+                self._log(log_widget, "SVN 解锁失败，终止提交\n")
+                return False
+            self._log(log_widget, "SVN 解锁完成\n")
+            return True
+        finally:
+            if targets_file:
+                try:
+                    os.remove(targets_file)
+                except OSError:
+                    pass
 
     def _start_checkout(self):
         url = self.svn_url.get().strip()
@@ -1613,6 +1683,10 @@ class SvnSyncTool:
                 # Step 3
                 self._log(log, "【步骤 3/3】SVN 提交\n")
                 self._log(log, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+                if not self._unlock_svn_locks_before_commit(log, dst):
+                    self._log(log, "\n--- 提交前解锁失败，终止流程 ---\n")
+                    overall_ok = False
+                    return
                 self._log(log, "检查变更状态...\n")
                 _, status_out = self._run_svn(log, "status", dst)
                 changed = [l for l in status_out.split("\n") if l.strip() and ".svn" not in l]
