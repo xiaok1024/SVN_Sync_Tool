@@ -4,14 +4,17 @@
 
 ## 项目定位
 
-这是一个跨平台 GUI 小工具，用于版本升级场景中的 SVN 拉取、交叉文件覆盖、自动提交、升级清单提取与 Markdown 生成。
+这是一个跨平台小工具，用于版本升级场景中的 SVN 拉取、交叉文件覆盖、自动提交、升级清单提取与 Markdown 生成。有两个入口：
+
+- GUI（`svn_sync_tool.py`）：Windows 主要使用方式，打包为 exe；
+- 终端版（`svn_sync_cli.py`）：macOS 主要使用方式，交互菜单 + 子命令参数两种用法，复用 `svn_sync_tool.py` 的业务逻辑（通过 `CliEngine` 继承 `SvnSyncTool`，不构建界面）。
 
 当前主要技术栈：
 
-- Python 单文件应用：`svn_sync_tool.py`
-- GUI：`tkinter` / `ttkbootstrap`（基于 `ttk`）
+- Python：`svn_sync_tool.py`（GUI + 业务逻辑）、`svn_sync_cli.py`（终端入口）、`svn_path_generator.py`（Tab 5 / paths）
+- GUI：`tkinter` / `ttkbootstrap`（基于 `ttk`）；两个模块的 GUI 依赖导入均已做缺失降级（`GUI_AVAILABLE`），终端版不依赖第三方包
 - SVN 操作：通过系统 `svn` CLI 调用
-- macOS / Windows 打包：PyInstaller
+- Windows 打包：PyInstaller（macOS 不再打包 `.app`，直接运行终端版）
 - 发布产物：`outputs/`
 
 ## 工作原则
@@ -36,27 +39,24 @@
 常用检查：
 
 ```bash
-python3 -m py_compile svn_sync_tool.py
+python3 -m py_compile svn_sync_tool.py svn_path_generator.py svn_sync_cli.py
+python3 svn_sync_cli.py --help
 ```
 
-macOS 打包优先使用项目已有虚拟环境：
+macOS 上验证（不再打包 `.app`）：
 
 ```bash
-.venv-macos/bin/python -m PyInstaller --noconfirm SVN_Sync_Tool.spec
-rm -f outputs/SVN_Sync_Tool-macos-arm64.zip
-cd dist && zip -r ../outputs/SVN_Sync_Tool-macos-arm64.zip SVN_Sync_Tool.app
-```
+# 终端版（主要使用方式，系统 python3 即可）
+python3 svn_sync_cli.py
 
-启动 macOS app：
-
-```bash
-open outputs/SVN_Sync_Tool.app
+# 如需验证 GUI（与 Windows 同一套代码），用项目虚拟环境启动
+.venv-macos/bin/python svn_sync_tool.py
 ```
 
 注意：
 
 - `dist/`、`build/`、`.venv-macos/`、`outputs/*.app/` 属于本地构建内容，不应作为主要提交对象。
-- macOS 发布包通常更新 `outputs/SVN_Sync_Tool-macos-arm64.zip`。
+- macOS 不再更新 `outputs/SVN_Sync_Tool-macos-arm64.zip`（历史产物保留，不删除）。
 - Windows exe 只在用户明确要求 Windows 打包时更新。
 - 涉及 SVN 真实仓库写入、`svn commit`、生产共享目录写入时，不要在验证阶段擅自执行。
 
