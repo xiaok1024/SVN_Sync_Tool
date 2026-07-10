@@ -1,4 +1,4 @@
-# SVN 代码同步工具 / SVN Code Sync Tool
+﻿# SVN 代码同步工具 / SVN Code Sync Tool
 
 一个跨平台（Windows / macOS）图形化工具，用于从 SVN 拉取代码、用整理好的本地目录（或网络共享）覆盖交叉文件、并自动提交变更。三步流程一键完成，提交完成后可一键复制 SVN 提交记录。
 
@@ -14,6 +14,7 @@ A cross-platform (Windows / macOS) GUI tool for checking out code from SVN, over
 | **交叉覆盖** | 遍历 SVN 检出目录下的每个文件，到整理好的目录中查找同名同路径文件，有则覆盖，没有则跳过 |
 | **全自动流程** | 一键执行：SVN 拉取 → 交叉覆盖 → SVN 提交，实时日志输出，无需手动操作 |
 | **升级清单提取** | 从复制的带颜色升级清单（QC 分组 + 红/黑标记的 SVN 文件 URL）提取文件清单，并生成人读升级 Markdown 与 AI 专用 Markdown |
+| **版本号路径生成** | 快速完成这件事而设计的——不用打开 SVN log 界面一行行翻，提供一个版本号，工具直接查询出所有变更文件，并自动按 `(Vxxx)` 格式拼接好完整 URL |
 
 | Feature | Description |
 |---------|-------------|
@@ -104,8 +105,26 @@ Double-click to run. No Python or dependencies required (the SVN command-line cl
 >
 > 剪贴板颜色读取分平台：macOS 用 `pbpaste -Prefer html` / NSPasteboard；Windows 读 `CF_HTML` 剪贴板格式。若剪贴板只有纯文本，会因缺少颜色而无法区分红/黑。
 
----
 
+### 标签页 6: 标准文件获取 / Tab 6: Standard File Acquisition
+
+用于在版本升级或二开任务中，补全客户 SVN 中缺失的源码文件。
+
+1. 填写**任务标题**，选择任务类型：**升级任务**（upgrade）或 **二开任务**（secondev）
+   - 升级任务：先查 KB 文件路径，未找到再查历史文件路径
+   - 二开任务：仅查历史文件路径，KB 文件路径行自动隐藏
+2. 填写**客户 SVN 地址**、**目标 SVN 目录**（已检出的客户 SVN 工作副本）
+3. 填写 **KB 文件路径**（升级任务必填）和**历史文件路径**
+4. 在**文件清单**中粘贴源码路径列表（每行一个，如 `src/com/api/.../DocAccService.java`），也可从剪贴板粘贴
+5. 工具自动去 KB/历史文件路径的 `ecology/` 子目录下按相对路径查找
+6. 点击 **扫描预览** 查看文件命中情况（可覆盖/已存在跳过/未找到来源）
+7. 点击 **确认覆盖** 将文件复制到目标 SVN 目录
+8. 覆盖完成后可点击 **提交 SVN** 提交变更；提交成功后自动导出变更文件 URL 到日志，并可通过 **复制提交文件路径** 按钮一键复制
+9. 支持 SMB 共享路径、UNC 路径作为来源目录（需填写 SMB 凭据）
+
+> 来源查找优先级：`{KB路径}/ecology/{rel_path}` → `{KB路径}/{rel_path}` → `{历史路径}/ecology/{rel_path}` → `{历史路径}/{rel_path}`。目录条目（非文件）自动过滤。
+
+---
 ## 共享目录地址 / Network Share
 
 「整理好的目录（来源）」除了本地路径，也可以直接填**网络共享地址**。工具会按操作系统自动处理，**两个平台都无需手动改写路径**：
@@ -218,3 +237,4 @@ cd dist && zip -r ../outputs/SVN_Sync_Tool-macos-arm64.zip SVN_Sync_Tool.app
 - 全自动流程提交成功后会列出本次提交文件的可访问 URL，可一键复制；提交解析使用 `svn info/log --xml`，不受中文（GBK/本地化）输出影响
 - 若本次运行无变更（不产生新提交），会回退导出工作副本当前版本的文件路径，方便随时复制
 - 源码打包环境要求 Python 3.10+（`ttkbootstrap` 依赖要求）；普通用户运行预编译产物无需安装 Python
+

@@ -12,6 +12,7 @@ from ttkbootstrap import Style
 from tkinter import ttk
 from pathlib import Path
 import svn_path_generator
+import svn_standard_file_tab
 try: import queue
 except: import Queue as queue
 
@@ -724,6 +725,9 @@ class SvnSyncTool:
         t5 = ttk.Frame(nb, padding=18, style="Panel.TFrame")
         nb.add(t5, text="  5. 版本号路径生成  ")
         self._build_tab5(t5)
+        t6 = ttk.Frame(nb, padding=18, style="Panel.TFrame")
+        nb.add(t6, text="  6. 标准文件生成  ")
+        self._build_tab6(t6)
     def _build_tab1(self, t1):
         row = 0
         ttk.Label(t1, text="SVN 仓库地址：").grid(row=row, column=0, sticky=tk.W, pady=(0, 6)); row+=1
@@ -1773,6 +1777,14 @@ class SvnSyncTool:
         self._path_gen.svn_pass = self.svn_pass
         self._path_gen.build()
         t5.columnconfigure(1, weight=1)
+
+    def _build_tab6(self, t6):
+        """标准文件生成 Tab"""
+        self._std_file = svn_standard_file_tab.SvnStandardFileTab(t6)
+        # 共享主程序的 SVN 凭据变量
+        self._std_file.svn_user = self.svn_user
+        self._std_file.svn_pass = self.svn_pass
+        self._std_file.build()
 
 if __name__ == "__main__":
     import tkinter as tk
