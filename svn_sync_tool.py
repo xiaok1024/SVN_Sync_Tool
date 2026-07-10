@@ -735,7 +735,7 @@ class SvnSyncTool(SyncEngine):
         nb.add(t5, text="  5. 版本号路径生成  ")
         self._build_tab5(t5)
         t6 = ttk.Frame(nb, padding=18, style="Panel.TFrame")
-        nb.add(t6, text="  6. 标准文件生成  ")
+        nb.add(t6, text="  6. 标准文件获取  ")
         self._build_tab6(t6)
     def _build_tab1(self, t1):
         row = 0
@@ -1862,7 +1862,7 @@ class SvnSyncTool(SyncEngine):
         t5.columnconfigure(1, weight=1)
 
     def _build_tab6(self, t6):
-        """标准文件生成 Tab"""
+        """标准文件获取 Tab"""
         self._std_file = svn_standard_file_tab.SvnStandardFileTab(t6, engine=self)
         # 共享主程序的 SVN 凭据变量
         self._std_file.svn_user = self.svn_user

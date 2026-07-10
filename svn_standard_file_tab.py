@@ -2,7 +2,6 @@
 """标准文件获取工具 - 独立 Tab 页面
 功能：
 - 支持升级任务 / 二开任务两种模式
-- 从配置文件(customer-deploy.json / docs/customer-env-info.md)加载默认值
 - 解析 SVN URL 列表，按相对 ecology 路径到标准/历史文件目录中查找
 - Dry-run 扫描预览 -> 确认覆盖 -> SVN add -> SVN commit 完整流程
 - 来源路径支持本地路径、UNC、SMB

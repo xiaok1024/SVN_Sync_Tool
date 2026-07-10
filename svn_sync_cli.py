@@ -25,9 +25,11 @@ import atexit
 import getpass
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from urllib.parse import unquote_to_bytes
@@ -44,7 +46,7 @@ SORT_KEYS = [("rev", "按版本排序"), ("path", "按路径排序"), ("name", "
 SORT_LABELS = dict(SORT_KEYS)
 
 
-# ═══════════════ 无界面引擎：复用 GUI 类的业务逻辑 ═══════════════
+# ═══════════════ 无界面引擎：复用共享核心，不构建 GUI ═══════════════
 
 class _Var:
     """tk.StringVar 的无界面替身，让 GUI 类的方法在终端下可用。"""
@@ -132,15 +134,48 @@ def load_defaults():
         return {}
 
 
+def sanitize_text(value):
+    """移除终端输入中的非法 UTF-8 代理字符，避免子进程参数和配置写入失败。"""
+    if not isinstance(value, str):
+        return value
+    try:
+        value.encode("utf-8")
+        return value
+    except UnicodeEncodeError:
+        raw = value.encode("utf-8", errors="surrogateescape")
+        return raw.decode("utf-8", errors="replace")
+
+
+def normalize_revision_input(value):
+    """版本表达式只允许数字、逗号、连字符和空白，过滤粘贴/终端混入的隐藏字节。"""
+    return re.sub(r"[^0-9,\-\s]", "", sanitize_text(value or "")).strip()
+
+
 def save_defaults(defaults, **updates):
     for key, value in updates.items():
         if value:
-            defaults[key] = value
+            defaults[key] = sanitize_text(value)
+    safe_defaults = {
+        sanitize_text(key): sanitize_text(value) if isinstance(value, str) else value
+        for key, value in defaults.items()
+    }
+    temp_path = None
     try:
         os.makedirs(CONFIG_DIR, exist_ok=True)
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(defaults, f, ensure_ascii=False, indent=2)
-    except OSError:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=CONFIG_DIR,
+                                         prefix="cli.", suffix=".tmp", delete=False) as f:
+            temp_path = f.name
+            json.dump(safe_defaults, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(temp_path, CONFIG_PATH)
+        defaults.clear()
+        defaults.update(safe_defaults)
+    except (OSError, UnicodeError, TypeError, ValueError):
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
         pass
     return defaults
 
@@ -155,7 +190,7 @@ def ask(label, default="", required=False):
     hint = "（回车=%s）" % default if default else ""
     while True:
         try:
-            value = input("%s%s: " % (label, hint)).strip()
+            value = sanitize_text(input("%s%s: " % (label, hint))).strip()
         except EOFError:
             value = ""
         if not value:
@@ -520,7 +555,7 @@ def query_revision_paths(url, spec, svn_user="", svn_pass=""):
     """按版本号查询变更文件，返回 ([(path, rev)], [错误信息])。"""
     revisions = pathgen.parse_revision_spec(spec)
     if not revisions:
-        raise RuntimeError("无法解析版本号，请检查格式（示例: 123 / 123,456 / 123-456）")
+        raise RuntimeError("无法解析版本号，请检查格式（示例: 123 / 123,456 / 123 456 / 123-456）")
     print("正在查询版本 %d ~ %d（共 %d 个版本）..." % (revisions[0], revisions[-1], len(revisions)))
     results, errors = [], []
     for rev in revisions:
@@ -771,7 +806,7 @@ def cmd_extract(args):
 def cmd_paths(args):
     defaults = load_defaults()
     url = fill_or_die(args.url, "SVN 仓库地址", "svn_url", defaults)
-    spec = fill_or_die(args.revisions, "版本号（如 123 / 123,456 / 123-456 / 123,456-789）",
+    spec = fill_or_die(args.revisions, "版本号（如 123 / 123,456 / 123 456 / 123-456）",
                        "revisions", defaults)
     user = args.username or ""
     password = resolve_password(user, args.password)
@@ -905,8 +940,8 @@ def menu_extract(engine, _defaults):
 def menu_paths(_engine, defaults):
     url = ask("SVN 仓库地址", defaults.get("svn_url", ""), required=True)
     user, password = prompt_svn_auth(defaults)
-    print("版本号格式：单版本 123 | 多个版本 123,456,789 | 连续版本 123-456 | 联合查询 123,456-789,1000")
-    spec = ask("SVN 版本号", defaults.get("revisions", ""), required=True)
+    print("版本号格式：单版本 123 | 多个版本 123,456 或 123 456 | 连续版本 123-456 | 联合查询 123,456-789 1000")
+    spec = normalize_revision_input(ask("SVN 版本号", defaults.get("revisions", ""), required=True))
     sort_key = ask_choice("排序方式", SORT_KEYS, default_key=defaults.get("sort", "rev"))
     save_defaults(defaults, svn_url=url, svn_user=user, sort=sort_key, revisions=spec)
     try:
@@ -1023,7 +1058,7 @@ def build_parser():
 
     p = sub.add_parser("paths", help="版本号路径生成（对应 GUI 标签页 5）")
     p.add_argument("--url", help="SVN 仓库地址")
-    p.add_argument("-r", "--revisions", help="版本号，如 123 / 123,456 / 123-456 / 123,456-789")
+    p.add_argument("-r", "--revisions", help="版本号，如 123 / 123,456 / 123 456 / 123-456")
     p.add_argument("--sort", choices=["rev", "path", "name"],
                    help="排序方式：rev=按版本（默认），path=按路径，name=按文件名")
     p.add_argument("--username", help="SVN 用户名")
