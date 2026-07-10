@@ -5,7 +5,7 @@
 提供两种使用方式：
 
 - **图形界面**（`svn_sync_tool.py`）：Windows 主要使用方式，打包为 exe 分发。
-- **终端版**（`svn_sync_cli.py`）：macOS 推荐使用方式，功能与 GUI 的 5 个标签页一一对应，支持交互式菜单和命令行参数两种用法，详见下方「终端版」章节。macOS 不再更新 `.app` 打包产物。
+- **终端版**（`svn_sync_cli.py`）：macOS 推荐使用方式，功能与 GUI 的 6 个标签页一一对应，支持交互式菜单和命令行参数两种用法，详见下方「终端版」章节。macOS 不再更新 `.app` 打包产物。
 
 A cross-platform (Windows / macOS) GUI tool for checking out code from SVN, overwriting cross-referenced files from a local organized directory (or network share), and automatically committing changes. Complete the three-step workflow with one click.
 
@@ -20,6 +20,7 @@ A cross-platform (Windows / macOS) GUI tool for checking out code from SVN, over
 | **全自动流程** | 一键执行：SVN 拉取 → 交叉覆盖 → SVN 提交，实时日志输出，无需手动操作 |
 | **升级清单提取** | 从复制的带颜色升级清单（QC 分组 + 红/黑标记的 SVN 文件 URL）提取文件清单，并生成人读升级 Markdown 与 AI 专用 Markdown |
 | **版本号路径生成** | 快速完成这件事而设计的——不用打开 SVN log 界面一行行翻，提供一个版本号，工具直接查询出所有变更文件，并自动按 `(Vxxx)` 格式拼接好完整 URL |
+| **标准文件获取** | 按源码清单从 KB/历史目录补全客户工作副本，提交前预览整个目标目录的 SVN 状态 |
 
 | Feature | Description |
 |---------|-------------|
@@ -57,7 +58,7 @@ The Windows exe runs by double-click with no Python required. On macOS, run the 
 
 ## 终端版 / CLI（macOS 推荐）
 
-`svn_sync_cli.py` 与 GUI 共用同一套业务逻辑，功能与 5 个标签页一一对应，两种用法：
+`svn_sync_cli.py` 与 GUI 共用同一套业务逻辑，功能与 6 个标签页一一对应，两种用法：
 
 ### 交互模式
 
@@ -65,7 +66,7 @@ The Windows exe runs by double-click with no Python required. On macOS, run the 
 python3 svn_sync_cli.py
 ```
 
-进入主菜单选择功能（1-5 对应 GUI 的 5 个标签页），随后按提示逐项输入参数：
+进入主菜单选择功能（1-6 对应 GUI 的 6 个标签页），随后按提示逐项输入参数：
 
 - 常用值（SVN 地址、目录、用户名等，**不含密码**）会记住在 `~/.config/svn_sync_tool/cli.json`，下次回车即可复用；
 - 密码输入不回显；来源为 `smb://` 共享时才会询问 SMB 账号；
@@ -92,6 +93,14 @@ python3 svn_sync_cli.py extract --format ai-md -o upgrade-file-list-ai.md
 
 # 5. 版本号路径生成
 python3 svn_sync_cli.py paths --url https://svn.example.com/svn/cust/ecology -r "123,456-789" --sort rev --copy
+
+# 6. 标准文件获取（先预览；确认覆盖后显示整个目标目录的待提交状态）
+python3 svn_sync_cli.py standard --url https://svn.example.com/svn/cust/ecology \
+  --target ~/work/ecology --mode upgrade --title QC123 \
+  --standard /path/to/kb --historical /path/to/history --list files.txt --dry-run
+python3 svn_sync_cli.py standard --url https://svn.example.com/svn/cust/ecology \
+  --target ~/work/ecology --mode upgrade --title QC123 \
+  --standard /path/to/kb --historical /path/to/history --list files.txt --yes --commit --copy
 ```
 
 在终端里漏填的必填参数会自动转为交互提问补全；非终端环境（如 CI）漏填则直接报错退出。各子命令详细参数见 `python3 svn_sync_cli.py <子命令> --help`。
@@ -171,6 +180,8 @@ python3 svn_sync_cli.py paths --url https://svn.example.com/svn/cust/ecology -r 
 9. 支持 SMB 共享路径、UNC 路径作为来源目录（需填写 SMB 凭据）
 
 > 来源查找优先级：`{KB路径}/ecology/{rel_path}` → `{KB路径}/{rel_path}` → `{历史路径}/ecology/{rel_path}` → `{历史路径}/{rel_path}`。目录条目（非文件）自动过滤。
+>
+> SVN 提交采用 Windows 兼容模式：只对本次覆盖文件执行 `svn add --parents`，随后展示整个目标 SVN 目录的 `svn status` 并二次确认。未版本控制（`?`）文件不会自动加入，但目录中其他已修改、已登记新增或删除的文件会一并提交。
 
 ---
 ## 共享目录地址 / Network Share
@@ -281,4 +292,3 @@ python3 svn_sync_cli.py
 - 全自动流程提交成功后会列出本次提交文件的可访问 URL，可一键复制；提交解析使用 `svn info/log --xml`，不受中文（GBK/本地化）输出影响
 - 若本次运行无变更（不产生新提交），会回退导出工作副本当前版本的文件路径，方便随时复制
 - 源码打包环境要求 Python 3.10+（`ttkbootstrap` 依赖要求）；普通用户运行预编译产物无需安装 Python
-

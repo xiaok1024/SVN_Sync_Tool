@@ -11,6 +11,8 @@
 import os, sys, subprocess, threading, re, locale, json, shutil
 import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog, messagebox
+from svn_sync_core import SyncEngine
+from svn_standard_file_core import StandardFileItem, StandardFileService, extract_relative_path
 
 _SYS_ENC = locale.getpreferredencoding()
 _SVN_ENC = "gbk" if _SYS_ENC.lower() in ("cp936", "gbk", "gb2312", "gb18030") else "utf-8"
@@ -20,23 +22,7 @@ SVN_EXECUTABLE = shutil.which("svn") or "svn"
 
 def _extract_rel_path(url_or_path, svn_root):
     """从 SVN URL 或路径中提取相对 ecology 路径"""
-    text = url_or_path.strip()
-    if not text:
-        return None
-    text = re.sub(r"^\[(red|black)\]\s*", "", text).strip()
-    text = re.sub(r"\(V\d+\)", "", text).strip()
-    rel = None
-    if svn_root:
-        root = svn_root.strip().rstrip("/")
-        if text.startswith(root):
-            rel = text[len(root):].lstrip("/")
-    if not rel:
-        m = re.search(r"/svn/[^/]+/(.*)", text)
-        if m:
-            rel = m.group(1)
-    if not rel:
-        rel = text.lstrip("/")
-    return rel.strip("/") if rel else None
+    return extract_relative_path(url_or_path, svn_root)
 
 
 def _run_svn_cmd(args, svn_user="", svn_pass="", timeout=60, workdir=None):
@@ -116,18 +102,27 @@ def _load_customer_env_info(filepath):
 class SvnStandardFileTab:
     """标准文件获取 Tab"""
 
-    def __init__(self, parent):
+    def __init__(self, parent, engine=None):
         self.parent = parent
-        self.svn_user = tk.StringVar()
-        self.svn_pass = tk.StringVar()
+        self.host_engine = engine
+        self.engine = SyncEngine()
+        self.svn_user = engine.svn_user if engine else tk.StringVar()
+        self.svn_pass = engine.svn_pass if engine else tk.StringVar()
         self.task_title = tk.StringVar()
         self.task_mode = tk.StringVar(value="upgrade")
         self.svn_root = tk.StringVar()
         self.target_dir = tk.StringVar()
         self.standard_path = tk.StringVar()
         self.historical_path = tk.StringVar()
-        self.smb_user = tk.StringVar()
-        self.smb_pass = tk.StringVar()
+        self.smb_user = engine.smb_user if engine else tk.StringVar()
+        self.smb_pass = engine.smb_pass if engine else tk.StringVar()
+        self.engine.svn_user = self.svn_user
+        self.engine.svn_pass = self.svn_pass
+        self.engine.smb_user = self.smb_user
+        self.engine.smb_pass = self.smb_pass
+        if engine is not None:
+            self.engine._temp_mounts = engine._temp_mounts
+        self.service = StandardFileService(self.engine)
         self.allow_existing = tk.BooleanVar(value=True)
         self.auto_commit = tk.BooleanVar(value=True)
         self.txt_file_list = None
@@ -142,6 +137,7 @@ class SvnStandardFileTab:
         self._scan_result = []
         self._cover_done = False
         self._scan_logs = []
+        self._covered_items = []
 
     def _log(self, msg):
         self.txt_log.config(state=tk.NORMAL)
@@ -207,70 +203,18 @@ class SvnStandardFileTab:
             errors.append("文件清单为空")
         return errors
 
-    def _run_scan(self):
+    def _run_scan(self, params=None):
         """执行扫描（后台线程）"""
-        lines = self._get_file_lines()
-        svn_root = self.svn_root.get().strip()
-        target_dir = self.target_dir.get().strip()
-        task_mode = self.task_mode.get()
-        standard_path = self.standard_path.get().strip()
-        historical_path = self.historical_path.get().strip()
-        allow_existing = self.allow_existing.get()
-        # 来源候选列表
-        if task_mode == "upgrade":
-            source_candidates = []
-            if standard_path:
-                source_candidates.append((standard_path, "标准文件"))
-            if historical_path:
-                source_candidates.append((historical_path, "历史文件"))
-        else:  # secondev
-            source_candidates = []
-            if historical_path:
-                source_candidates.append((historical_path, "历史文件"))
-        results = []
-        parsed_count = 0
-        for line in lines:
-            if not line or line.startswith("#") or line.startswith("//"):
-                continue
-            if re.match(r"^\s*\[black\]", line):
-                continue
-            rel_path = _extract_rel_path(line, svn_root)
-            if not rel_path:
-                continue
-            parsed_count += 1
-            target_abs = os.path.join(target_dir, rel_path)
-            dest_exists = os.path.exists(target_abs)
-            # 查找来源文件（优先 ecology/ 子目录）
-            found_src = None
-            found_label = ""
-            for src_path, label in source_candidates:
-                # 先试 ecology/{rel_path}
-                src_file = os.path.join(src_path, "ecology", rel_path)
-                if os.path.isfile(src_file):
-                    found_src = src_file
-                    found_label = label
-                    self._scan_logs.append("  [%s] ecology/: %s" % (label, src_file))
-                    break
-                # 再试直接 {rel_path}（兼容旧用法）
-                src_file2 = os.path.join(src_path, rel_path)
-                if os.path.isfile(src_file2):
-                    found_src = src_file2
-                    found_label = label
-                    self._scan_logs.append("  [%s] direct(fallback): %s" % (label, src_file2))
-                    break
-            if not found_src:
-                self._scan_logs.append("  [MISS] %s not found in any source" % rel_path)
-            if found_src:
-                if dest_exists and not allow_existing:
-                    status = "跳过(目标已存在)"
-                    detail = "需勾选允许覆盖"
-                else:
-                    status = "待覆盖"
-                    detail = "<- %s" % found_label
-            else:
-                status = "未找到来源"
-                detail = "来源目录中不存在"
-            results.append((rel_path, found_src, found_label, target_abs, dest_exists, status, detail))
+        if params is None:
+            params = (self._get_file_lines(), self.svn_root.get().strip(), self.target_dir.get().strip(),
+                      self.task_mode.get(), self.standard_path.get().strip(),
+                      self.historical_path.get().strip(), self.allow_existing.get())
+        lines, svn_root, target_dir, task_mode, standard_path, historical_path, allow_existing = params
+        items, parsed_count, details = self.service.scan(
+            lines, svn_root, target_dir, task_mode, standard_path, historical_path, allow_existing)
+        self._scan_logs = details
+        results = [(i.rel_path, i.source_file, i.source_label, i.target_file,
+                    i.target_exists, i.status, i.detail) for i in items]
         return results, parsed_count
 
     def _start_scan(self):
@@ -287,10 +231,13 @@ class SvnStandardFileTab:
         self._scan_result = []
         self._cover_done = False
         self._scan_logs = []
+        params = (self._get_file_lines(), self.svn_root.get().strip(), self.target_dir.get().strip(),
+                  self.task_mode.get(), self.standard_path.get().strip(),
+                  self.historical_path.get().strip(), self.allow_existing.get())
 
         def run():
             try:
-                results, parsed_count = self._run_scan()
+                results, parsed_count = self._run_scan(params)
                 self.parent.after(0, lambda: self._display_scan(results, parsed_count))
             except Exception as e:
                 self.parent.after(0, lambda: self._log("扫描异常: %s" % e))
@@ -345,23 +292,13 @@ class SvnStandardFileTab:
         threading.Thread(target=run, daemon=True).start()
 
     def _run_cover(self, ready_items):
-        covered = []
-        errors = []
-        for rel_path, src_file, src_label, target_abs, dest_exists, status, detail in ready_items:
-            if not src_file or not os.path.isfile(src_file):
-                errors.append("来源文件不存在: %s" % src_file)
-                continue
-            try:
-                os.makedirs(os.path.dirname(target_abs), exist_ok=True)
-                shutil.copy2(src_file, target_abs)
-                covered.append((rel_path, src_label, target_abs))
-            except Exception as e:
-                errors.append("%s: %s" % (rel_path, e))
-        return covered, errors
+        items = [StandardFileItem(r[0], r[1], r[2], r[3], r[4], r[5], r[6]) for r in ready_items]
+        return self.service.cover(items)
 
     def _display_cover_result(self, covered, errors):
-        for rel_path, src_label, _ in covered:
-            self._log("ok %s <- %s" % (rel_path, src_label))
+        self._covered_items = covered
+        for item in covered:
+            self._log("ok %s <- %s" % (item.rel_path, item.source_label))
         if errors:
             for e in errors:
                 self._log("fail %s" % e)
@@ -369,7 +306,7 @@ class SvnStandardFileTab:
         new_results = []
         for r in self._scan_result:
             rel_path, src_file, src_label2, tgt, de, status, detail = r
-            if status.startswith("待覆盖") and any(c[0] == rel_path for c in covered):
+            if status.startswith("待覆盖") and any(c.rel_path == rel_path for c in covered):
                 new_results.append((rel_path, src_file, src_label2, tgt, True, "已覆盖", "<- %s" % src_label2))
             else:
                 new_results.append(r)
@@ -393,10 +330,7 @@ class SvnStandardFileTab:
         svn_user = self.svn_user.get().strip()
         svn_pass = self.svn_pass.get().strip()
         title = self.task_title.get().strip()
-        source_types = set()
-        for r in self._scan_result:
-            if r[5] == "已覆盖" and r[1]:
-                source_types.add(r[2])
+        source_types = {item.source_label for item in self._covered_items}
         if "标准文件" in source_types and "历史文件" in source_types:
             source_label = "标准文件/历史文件"
         elif "历史文件" in source_types:
@@ -405,50 +339,69 @@ class SvnStandardFileTab:
             source_label = "标准文件"
         commit_msg = ("%s %s" % (title, source_label)) if title else source_label
         self._log("提交信息: %s" % commit_msg)
+        self._set_ui_busy(True)
 
         def run():
             try:
-                self.parent.after(0, lambda: self._log("执行 svn add --parents ..."))
-                rc, out = _run_svn_cmd(["add", "--parents", target_dir, "--force"], svn_user, svn_pass, timeout=120, workdir=target_dir)
-                self.parent.after(0, lambda: self._log(out[:500]))
-                self.parent.after(0, lambda: self._log("执行 svn commit ..."))
-                rc, out = _run_svn_cmd(["commit", "-m", commit_msg, target_dir], svn_user, svn_pass, timeout=120, workdir=target_dir)
-                if rc == 0:
-                    self.parent.after(0, lambda: self._log("提交成功"))
-                    self.parent.after(0, lambda: self._log(out[:500]))
-                    self.parent.after(0, lambda: self.lbl_status.config(text="SVN 提交成功", foreground="#338833"))
-                    # 解析版本号，同步查询提交文件路径
-                    rev = self._parse_revision_from_out(out)
-                    svn_root = self.svn_root.get().strip()
-                    if rev:
-                        rc2, out2 = _run_svn_cmd(
-                            ["log", "--xml", "-v", "-r", str(rev), target_dir],
-                            svn_user, svn_pass, timeout=60, workdir=target_dir
-                        )
-                        if rc2 == 0:
-                            try:
-                                import xml.etree.ElementTree as ET
-                                root2 = ET.fromstring(out2)
-                                file_elements = [p for p in root2.findall(".//paths/path") if p.text and p.get("kind") == "file"]
-                                paths = [p.text.strip() for p in file_elements]
-                                rel_paths = [p.lstrip("/") for p in paths]
-                                urls = []
-                                for p in paths:
-                                    if not p.startswith("/"):
-                                        p = "/" + p
-                                    urls.append(svn_root + p + "(V" + str(rev) + ")")
-                                if urls:
-                                    self.parent.after(0, lambda u=urls, rp=rel_paths, r=rev: self._display_commit_paths(u, rp, r))
-                            except Exception:
-                                pass
-                else:
-                    self.parent.after(0, lambda: self._log("提交失败 (rc=%d): %s" % (rc, out[:300])))
-                    self.parent.after(0, lambda: self.lbl_status.config(text="SVN 提交失败", foreground="#cc4444"))
+                ok, out, status = self.service.prepare_commit(target_dir, self._covered_items)
+                self.parent.after(0, lambda o=ok, a=out, s=status:
+                                  self._confirm_working_copy_commit(o, a, s, target_dir, commit_msg))
             except Exception as e:
-                self.parent.after(0, lambda: self._log("SVN 异常: %s" % e))
-            finally:
+                self.parent.after(0, lambda err=e: self._log("SVN 异常: %s" % err))
                 self.parent.after(0, lambda: self._set_ui_busy(False))
         threading.Thread(target=run, daemon=True).start()
+
+    def _confirm_working_copy_commit(self, ok, output, status, target_dir, commit_msg):
+        if not ok:
+            if output == "目标目录没有可提交的 SVN 变更":
+                self._log("无需提交：覆盖后 SVN 未检测到内容变化（来源文件可能与目标完全相同）")
+                self.lbl_status.config(text="无需提交：没有 SVN 内容变化", foreground="#338833")
+            else:
+                self._log("提交准备失败: %s" % output[:1000])
+                self.lbl_status.config(text="SVN 提交准备失败", foreground="#cc4444")
+            self._set_ui_busy(False)
+            return
+        if output.strip():
+            self._log("svn add 结果：")
+            self._log(output.rstrip())
+        self._log("-" * 60)
+        self._log("即将提交整个目标 SVN 目录，待提交状态：")
+        self._log(status.rstrip())
+        self._log("-" * 60)
+        confirmed = messagebox.askyesno(
+            "确认 SVN 提交",
+            "为兼容新增目录，本次将提交整个目标 SVN 目录。\n\n"
+            "未版本控制（?）文件不会自动加入，但其他已修改/已登记文件会一并提交。\n"
+            "完整 svn status 已输出到执行日志。\n\n确认继续提交？",
+            parent=self.parent.winfo_toplevel())
+        if not confirmed:
+            self._log("用户取消提交；文件覆盖及 svn add 状态已保留")
+            self.lbl_status.config(text="已取消 SVN 提交", foreground="#cc6600")
+            self._set_ui_busy(False)
+            return
+        self._log("用户已确认，正在提交整个目标 SVN 目录...")
+
+        def run():
+            try:
+                ok2, out, rev, urls, rel_paths = self.service.commit_working_copy(target_dir, commit_msg)
+                self.parent.after(0, lambda o=ok2, text=out, r=rev, u=urls, rp=rel_paths:
+                                  self._display_commit_result(o, text, r, u, rp))
+            except Exception as e:
+                self.parent.after(0, lambda err=e: self._display_commit_result(
+                    False, "SVN 异常: %s" % err, None, [], []))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _display_commit_result(self, ok, output, rev, urls, rel_paths):
+        if ok:
+            self._log("提交成功")
+            self._log(output[:1000])
+            self.lbl_status.config(text="SVN 提交成功", foreground="#338833")
+            if rev and urls:
+                self._display_commit_paths(urls, rel_paths, rev)
+        else:
+            self._log("提交失败: %s" % output[:1000])
+            self.lbl_status.config(text="SVN 提交失败", foreground="#cc4444")
+        self._set_ui_busy(False)
 
     def _parse_revision_from_out(self, out):
         m = re.search(r"Committed revision (\d+)", out)
@@ -626,7 +579,10 @@ class SvnStandardFileTab:
                 self._std_frame.grid_remove()
             else:
                 self._std_frame.grid()
-        self.task_mode.trace("w", _on_task_mode_change)
+        if hasattr(self.task_mode, "trace_add"):
+            self.task_mode.trace_add("write", _on_task_mode_change)
+        else:
+            self.task_mode.trace("w", _on_task_mode_change)
         self.parent.after_idle(_on_task_mode_change)
 
 

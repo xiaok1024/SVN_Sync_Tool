@@ -18,7 +18,9 @@ except ImportError:
     GUI_AVAILABLE = False
 from pathlib import Path
 import svn_path_generator
-import svn_standard_file_tab
+from svn_sync_core import SyncEngine
+if GUI_AVAILABLE:
+    import svn_standard_file_tab
 try: import queue
 except: import Queue as queue
 
@@ -607,8 +609,9 @@ def rt_build_ai_md(entries, customer_name, raw_counter):
     return "\n".join(lines) + "\n"
 
 
-class SvnSyncTool:
+class SvnSyncTool(SyncEngine):
     def __init__(self, root):
+        super().__init__()
         self.root = root
         self.root.title("SVN 代码同步工具")
         self.root.geometry("920x820")
@@ -1860,7 +1863,7 @@ class SvnSyncTool:
 
     def _build_tab6(self, t6):
         """标准文件生成 Tab"""
-        self._std_file = svn_standard_file_tab.SvnStandardFileTab(t6)
+        self._std_file = svn_standard_file_tab.SvnStandardFileTab(t6, engine=self)
         # 共享主程序的 SVN 凭据变量
         self._std_file.svn_user = self.svn_user
         self._std_file.svn_pass = self.svn_pass
