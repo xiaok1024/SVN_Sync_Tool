@@ -7,95 +7,12 @@
 - 来源路径支持本地路径、UNC、SMB
 """
 
-import os, sys, subprocess, threading, re, locale, json, shutil
+import os
+import threading
 import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog, messagebox
 from svn_sync_core import SyncEngine
-from svn_standard_file_core import StandardFileItem, StandardFileService, extract_relative_path
-
-_SYS_ENC = locale.getpreferredencoding()
-_SVN_ENC = "gbk" if _SYS_ENC.lower() in ("cp936", "gbk", "gb2312", "gb18030") else "utf-8"
-IS_WINDOWS = (os.name == "nt")
-CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WINDOWS else 0
-SVN_EXECUTABLE = shutil.which("svn") or "svn"
-
-def _extract_rel_path(url_or_path, svn_root):
-    """从 SVN URL 或路径中提取相对 ecology 路径"""
-    return extract_relative_path(url_or_path, svn_root)
-
-
-def _run_svn_cmd(args, svn_user="", svn_pass="", timeout=60, workdir=None):
-    """运行 svn 命令，返回 (returncode, stdout_text)"""
-    cmd = [SVN_EXECUTABLE, "--non-interactive",
-           "--trust-server-cert-failures=unknown-ca,cn-mismatch,expired,not-yet-valid,other"]
-    if svn_user:
-        cmd.extend(["--username", svn_user])
-        if svn_pass:
-            cmd.extend(["--password", svn_pass])
-        else:
-            cmd.append("--no-auth-cache")
-    cmd.extend(args)
-    env = os.environ.copy()
-    if not IS_WINDOWS:
-        env["LANG"] = "zh_CN.UTF-8"
-        env["LC_ALL"] = "zh_CN.UTF-8"
-    try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                env=env, creationflags=CREATE_NO_WINDOW, cwd=workdir)
-        out, err = proc.communicate(timeout=timeout)
-        try:
-            text = out.decode(_SVN_ENC, errors="replace")
-        except (UnicodeDecodeError, LookupError):
-            text = out.decode("utf-8", errors="replace")
-        err_text = err.decode(_SVN_ENC, errors="replace") if err else ""
-        if err_text:
-            text += "\n" + err_text
-        return proc.returncode, text
-    except subprocess.TimeoutExpired:
-        return -1, "超时"
-    except Exception as e:
-        return -1, str(e)
-
-
-def _load_customer_deploy_json(filepath):
-    """从 customer-deploy.json 提取 svnRoot 等信息"""
-    result = {}
-    if not os.path.isfile(filepath):
-        return result
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        svn_root = data.get("svnRoot") or data.get("svn_root") or data.get("svnroot")
-        if svn_root:
-            result["svn_root"] = svn_root.strip()
-    except Exception:
-        pass
-    return result
-
-def _load_customer_env_info(filepath):
-    """从 docs/customer-env-info.md 提取配置信息"""
-    result = {}
-    if not os.path.isfile(filepath):
-        return result
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            content = f.read()
-        patterns = [
-            (r"(?im)SVN\s+commit\s+title\s*[:：]\s*(.+)", "commit_title"),
-            (r"(?im)Historical\s+file\s+path\s*[:：]\s*(.+)", "historical_path"),
-            (r"(?im)Standard\s+file\s+path\s*[:：]\s*(.+)", "standard_path"),
-            (r"(?im)历史文件路径\s*[:：]\s*(.+)", "historical_path"),
-            (r"(?im)标准文件路径\s*[:：]\s*(.+)", "standard_path"),
-        ]
-        for pattern, key in patterns:
-            m = re.search(pattern, content)
-            if m:
-                val = m.group(1).strip().strip("\"").strip("'\u201d")
-                val = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", val)
-                result[key] = val
-    except Exception:
-        pass
-    return result
+from svn_standard_file_core import StandardFileItem, StandardFileService
 
 
 class SvnStandardFileTab:
@@ -103,8 +20,7 @@ class SvnStandardFileTab:
 
     def __init__(self, parent, engine=None):
         self.parent = parent
-        self.host_engine = engine
-        self.engine = SyncEngine()
+        self.engine = engine or SyncEngine()
         self.svn_user = engine.svn_user if engine else tk.StringVar()
         self.svn_pass = engine.svn_pass if engine else tk.StringVar()
         self.task_title = tk.StringVar()
@@ -119,8 +35,6 @@ class SvnStandardFileTab:
         self.engine.svn_pass = self.svn_pass
         self.engine.smb_user = self.smb_user
         self.engine.smb_pass = self.smb_pass
-        if engine is not None:
-            self.engine._temp_mounts = engine._temp_mounts
         self.service = StandardFileService(self.engine)
         self.allow_existing = tk.BooleanVar(value=True)
         self.auto_commit = tk.BooleanVar(value=True)
@@ -326,8 +240,6 @@ class SvnStandardFileTab:
             messagebox.showwarning("提示", "目标 SVN 目录无效")
             self._set_ui_busy(False)
             return
-        svn_user = self.svn_user.get().strip()
-        svn_pass = self.svn_pass.get().strip()
         title = self.task_title.get().strip()
         source_types = {item.source_label for item in self._covered_items}
         if "标准文件" in source_types and "历史文件" in source_types:
@@ -401,16 +313,6 @@ class SvnStandardFileTab:
             self._log("提交失败: %s" % output[:1000])
             self.lbl_status.config(text="SVN 提交失败", foreground="#cc4444")
         self._set_ui_busy(False)
-
-    def _parse_revision_from_out(self, out):
-        m = re.search(r"Committed revision (\d+)", out)
-        if m:
-            return int(m.group(1))
-        m = re.search(r"已提交的版本 (\d+)", out)
-        if m:
-            return int(m.group(1))
-        return None
-
 
     def _display_commit_paths(self, urls, rel_paths, rev):
         """显示提交文件路径，并写入执行日志"""

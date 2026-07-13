@@ -30,9 +30,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import xml.etree.ElementTree as ET
-from pathlib import Path
-from urllib.parse import unquote_to_bytes
 
 import svn_sync_tool as core
 from svn_sync_core import SyncEngine
@@ -84,11 +81,11 @@ class CliEngine(SyncEngine):
     def _read_clipboard_content(self):
         """终端版剪贴板读取：HTML 优先，纯文本兜底（不依赖 tk）。"""
         if core.IS_WINDOWS:
-            html = self._read_clipboard_html_windows()
+            html = core.read_clipboard_html_windows()
             if html and html.strip():
                 return html, "html"
         elif core.IS_MACOS:
-            html = self._read_clipboard_html_macos()
+            html = core.read_clipboard_html_macos()
             if html and html.strip():
                 return html, "html"
         return self._read_clipboard_text(), "text"
@@ -324,22 +321,16 @@ def print_scan_result(entries):
         print("  [%*d] %s" % (width, index, rel))
 
 
-def copy_cross_files(entries):
-    ok = fail = 0
-    for rel, src, tgt in entries:
-        try:
-            Path(tgt).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, tgt)
-            print("  [覆盖] " + rel)
-            ok += 1
-        except Exception as e:
-            print("  [失败] %s - %s" % (rel, e))
-            fail += 1
-    message = "覆盖完成! 成功 %d 个" % ok
-    if fail:
-        message += ", 失败 %d 个" % fail
+def copy_cross_files(engine, entries):
+    def report(relative, success, error):
+        print("  [覆盖] " + relative if success else "  [失败] %s - %s" % (relative, error))
+
+    copied, errors = engine._copy_cross_files(entries, on_result=report)
+    message = "覆盖完成! 成功 %d 个" % len(copied)
+    if errors:
+        message += ", 失败 %d 个" % len(errors)
     print(message)
-    return fail == 0
+    return not errors
 
 
 def select_entries_interactive(entries):
@@ -385,24 +376,13 @@ def run_overwrite(engine, target, source, dry_run=False, assume_yes=False):
     else:
         print("非交互环境执行覆盖必须加 --yes（或先用 --dry-run 预览）", file=sys.stderr)
         return False
-    return copy_cross_files(selected)
+    return copy_cross_files(engine, selected)
 
 
 # ═══════════════ 功能 3：全自动流程 ═══════════════
 
-def build_commit_urls(engine, checkout_dir, revision):
-    base_url = engine._get_repo_root_http_url(checkout_dir)
-    if not base_url:
-        return []
-    urls = []
-    for path in engine._get_changed_paths(checkout_dir, revision):
-        decoded = unquote_to_bytes(path).decode("utf-8")
-        urls.append(base_url.rstrip("/") + decoded + "(V%d)" % revision)
-    return urls
-
-
 def show_commit_urls(engine, checkout_dir, revision, do_copy):
-    urls = build_commit_urls(engine, checkout_dir, revision)
+    urls, _relative_paths = engine._get_revision_urls(checkout_dir, revision)
     if not urls:
         return
     print("\n提交文件路径（共 %d 个）：" % len(urls))
@@ -443,8 +423,9 @@ def run_auto(engine, url, dst, source, mode, message, assume_yes=False, do_copy=
     if not entries:
         print("未找到交叉文件，跳过覆盖")
     else:
-        if not copy_cross_files(entries):
-            print("警告: 部分文件覆盖失败，请检查上方日志")
+        if not copy_cross_files(engine, entries):
+            print("部分文件覆盖失败，为避免提交不完整变更，终止流程")
+            return False
         print("\n--- 步骤 2 完成 ---")
 
     banner("【步骤 3/3】SVN 提交")
@@ -551,58 +532,13 @@ def run_extract(engine, html=None, list_text=None, fmt="list", out=None, do_copy
 
 # ═══════════════ 功能 5：版本号路径生成 ═══════════════
 
-def query_revision_paths(url, spec, svn_user="", svn_pass=""):
-    """按版本号查询变更文件，返回 ([(path, rev)], [错误信息])。"""
-    revisions = pathgen.parse_revision_spec(spec)
-    if not revisions:
-        raise RuntimeError("无法解析版本号，请检查格式（示例: 123 / 123,456 / 123 456 / 123-456）")
-    print("正在查询版本 %d ~ %d（共 %d 个版本）..." % (revisions[0], revisions[-1], len(revisions)))
-    results, errors = [], []
-    for rev in revisions:
-        rc, out = pathgen.run_svn_command(["log", "--xml", "-v", "-r", str(rev), url], svn_user, svn_pass)
-        if rc != 0:
-            errors.append("版本 %d: 查询失败 - %s" % (rev, out[:200].strip()))
-            continue
-        try:
-            logentry = ET.fromstring(out).find(".//logentry")
-            if logentry is None:
-                errors.append("版本 %d: 未找到日志条目" % rev)
-                continue
-            paths = logentry.findall("paths/path")
-            if not paths:
-                errors.append("版本 %d: 无变更文件" % rev)
-                continue
-            for p in paths:
-                if p.get("kind", "") != "file":
-                    continue  # 只保留文件，过滤掉目录
-                path_text = p.text.strip() if p.text else ""
-                if path_text:
-                    results.append((path_text, rev))
-        except ET.ParseError as e:
-            errors.append("版本 %d: XML 解析错误 - %s" % (rev, e))
-    return results, errors
-
-
-def sort_revision_urls(results, base_url, sort_key):
-    base_url = base_url.rstrip("/")
-    rows = []
-    for path_text, rev in results:
-        if not path_text.startswith("/"):
-            path_text = "/" + path_text
-        rows.append((base_url + path_text + "(V%d)" % rev, rev, path_text))
-    if sort_key == "path":
-        rows.sort(key=lambda x: x[0].lower())
-    elif sort_key == "name":
-        rows.sort(key=lambda x: (os.path.basename(x[2]).lower(), x[0].lower()))
-    else:
-        rows.sort(key=lambda x: (x[1], x[0].lower()))
-    return [row[0] for row in rows]
-
 
 def run_paths(url, spec, sort_key="rev", svn_user="", svn_pass="", out=None, do_copy=False):
     banner("版本号路径生成")
-    results, errors = query_revision_paths(url, spec, svn_user, svn_pass)
-    urls = sort_revision_urls(results, url, sort_key)
+    print("正在查询 SVN 版本路径...")
+    results, errors = pathgen.query_revision_paths(url, spec, svn_user, svn_pass)
+    rows = pathgen.build_revision_url_rows(results, url, sort_key)
+    urls = [row[0] for row in rows]
     if urls:
         text = "\n".join(urls)
         if out:

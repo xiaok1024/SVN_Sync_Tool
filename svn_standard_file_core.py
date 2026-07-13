@@ -7,7 +7,6 @@ import posixpath
 import re
 import shutil
 from dataclasses import dataclass
-from urllib.parse import unquote
 
 
 @dataclass
@@ -156,12 +155,8 @@ class StandardFileService:
         revision = self.engine._parse_revision(commit_out)
         if not revision:
             return True, commit_out, None, [], []
-        repo_root = self.engine._get_repo_root_http_url(target_dir)
-        changed = self.engine._get_changed_paths(target_dir, revision)
-        decoded_paths = [unquote(path, encoding="utf-8", errors="replace") for path in changed]
-        urls = [(repo_root.rstrip("/") + (path if path.startswith("/") else "/" + path) + "(V%d)" % revision)
-                for path in decoded_paths] if repo_root else []
-        return True, commit_out, revision, urls, [path.lstrip("/") for path in decoded_paths]
+        urls, relative_paths = self.engine._get_revision_urls(target_dir, revision)
+        return True, commit_out, revision, urls, relative_paths
 
     def commit(self, target_dir, covered_items, message):
         """非交互兼容入口；GUI/CLI 应优先分别调用 prepare_commit 和 commit_working_copy。"""

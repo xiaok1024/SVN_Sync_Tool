@@ -9,8 +9,11 @@
 - 一键复制路径列表
 """
 
-import os, sys, subprocess, threading, re, locale
+import os, sys, threading, re
 import xml.etree.ElementTree as ET
+from urllib.parse import unquote
+
+from svn_sync_core import parse_svn_log_file_paths, run_svn_command
 # GUI 依赖允许缺失：终端版只复用 parse_revision_spec / run_svn_command 等纯逻辑函数
 try:
     import tkinter as tk
@@ -19,22 +22,6 @@ try:
 except ImportError:
     tk = None
     GUI_AVAILABLE = False
-
-# ── 复用主程序的环境变量 ──────────────────────────────────
-_SYS_ENC = locale.getpreferredencoding()
-_SVN_ENC = 'gbk' if _SYS_ENC.lower() in ('cp936', 'gbk', 'gb2312', 'gb18030') else 'utf-8'
-IS_WINDOWS = (os.name == 'nt')
-
-CREATE_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0) if os.name == 'nt' else 0
-import shutil as _shutil
-SVN_EXECUTABLE = _shutil.which("svn")
-if not SVN_EXECUTABLE:
-    for _svn_path in ("/opt/homebrew/bin/svn", "/usr/local/bin/svn", "/usr/bin/svn"):
-        if os.path.isfile(_svn_path) and os.access(_svn_path, os.X_OK):
-            SVN_EXECUTABLE = _svn_path
-            break
-SVN_EXECUTABLE = SVN_EXECUTABLE or "svn"
-
 
 def parse_revision_spec(spec):
     """解析版本号字符串，返回排序后的版本号列表。
@@ -74,47 +61,51 @@ def parse_revision_spec(spec):
     return sorted(revisions)
 
 
-def run_svn_command(args, svn_user='', svn_pass='', timeout=60):
-    """运行 svn 命令并返回 (returncode, stdout_text)。
-    自动处理中文编码。
-    """
-    cmd = [SVN_EXECUTABLE, "--non-interactive",
-           "--trust-server-cert-failures=unknown-ca,cn-mismatch,expired,not-yet-valid,other"]
-    if svn_user:
-        cmd.extend(["--username", svn_user])
-        if svn_pass:
-            cmd.extend(["--password", svn_pass])
-        else:
-            cmd.append("--no-auth-cache")
-    cmd.extend(args)
-
-    env = os.environ.copy()
-    if os.name != 'nt':
-        env["LANG"] = "zh_CN.UTF-8"
-        env["LC_ALL"] = "zh_CN.UTF-8"
-        env["LC_CTYPE"] = "zh_CN.UTF-8"
-
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            creationflags=CREATE_NO_WINDOW
-        )
-        out, err = proc.communicate(timeout=timeout)
+def query_revision_paths(url, spec, svn_user="", svn_pass=""):
+    """按版本号查询变更文件，返回 ``([(path, rev)], [错误信息])``。"""
+    revisions = parse_revision_spec(spec)
+    if not revisions:
+        raise RuntimeError("无法解析版本号，请检查格式（示例: 123 / 123,456 / 123 456 / 123-456）")
+    results, errors = [], []
+    for revision in revisions:
+        rc, output = run_svn_command(
+            ["log", "--xml", "-v", "-r", str(revision), url], svn_user, svn_pass)
+        if rc != 0:
+            errors.append("版本 %d: 查询失败 - %s" % (revision, output[:200].strip()))
+            continue
         try:
-            text = out.decode(_SVN_ENC, errors='replace')
-        except (UnicodeDecodeError, LookupError):
-            text = out.decode('utf-8', errors='replace')
-        err_text = err.decode(_SVN_ENC, errors='replace') if err else ''
-        if err_text:
-            text += '\n' + err_text
-        return proc.returncode, text
-    except subprocess.TimeoutExpired:
-        return -1, "超时"
-    except Exception as e:
-        return -1, str(e)
+            paths = parse_svn_log_file_paths(output)
+        except ET.ParseError as exc:
+            errors.append("版本 %d: XML 解析错误 - %s" % (revision, exc))
+            continue
+        if not paths:
+            errors.append("版本 %d: 无变更文件" % revision)
+            continue
+        results.extend((path, revision) for path in paths)
+    return results, errors
+
+
+def build_revision_url_rows(results, base_url, sort_key="rev"):
+    """生成并排序 ``(完整 URL, 版本号, 仓库路径)``。"""
+    sort_key = {
+        "按版本排序": "rev",
+        "按路径排序": "path",
+        "按文件名排序": "name",
+    }.get(sort_key, sort_key)
+    base_url = base_url.rstrip("/")
+    rows = []
+    for path_text, revision in results:
+        decoded_path = unquote(path_text, encoding="utf-8", errors="replace")
+        if not decoded_path.startswith("/"):
+            decoded_path = "/" + decoded_path
+        rows.append(("%s%s(V%d)" % (base_url, decoded_path, revision), revision, decoded_path))
+    if sort_key == "path":
+        rows.sort(key=lambda row: row[0].lower())
+    elif sort_key == "name":
+        rows.sort(key=lambda row: (row[2].rsplit("/", 1)[-1].lower(), row[0].lower()))
+    else:
+        rows.sort(key=lambda row: (row[1], row[0].lower()))
+    return rows
 
 
 class SvnPathGeneratorTab:
@@ -314,45 +305,12 @@ class SvnPathGeneratorTab:
         self._set_ui_busy(True)
         self._clear_results()
         self.lbl_status.config(text="正在查询版本 %d ~ %d..." % (revisions[0], revisions[-1]))
+        svn_user = self.svn_user.get().strip()
+        svn_pass = self.svn_pass.get().strip()
         
         def run():
             try:
-                results = []
-                errors = []
-                
-                for rev in revisions:
-                    rc, out = run_svn_command(
-                        ["log", "--xml", "-v", "-r", str(rev), url],
-                        self.svn_user.get().strip(),
-                        self.svn_pass.get().strip()
-                    )
-                    if rc != 0:
-                        errors.append("版本 %d: 查询失败 - %s" % (rev, out[:200]))
-                        continue
-                    
-                    # 解析 XML
-                    try:
-                        root = ET.fromstring(out)
-                        logentry = root.find(".//logentry")
-                        if logentry is None:
-                            errors.append("版本 %d: 未找到日志条目" % rev)
-                            continue
-                        paths = logentry.findall("paths/path")
-                        if not paths:
-                            errors.append("版本 %d: 无变更文件" % rev)
-                            continue
-                        
-                        for p in paths:
-                            # 只保留文件，过滤掉目录
-                            kind = p.get("kind", "")
-                            if kind != "file":
-                                continue
-                            path_text = p.text.strip() if p.text else ""
-                            if path_text:
-                                results.append((path_text, rev))
-                    except ET.ParseError as e:
-                        errors.append("版本 %d: XML 解析错误 - %s" % (rev, str(e)))
-                
+                results, errors = query_revision_paths(url, spec, svn_user, svn_pass)
                 self.root.after(0, lambda: self._display_results(results, errors))
             except Exception as e:
                 self.root.after(0, lambda: self._display_error(str(e)))
@@ -368,26 +326,9 @@ class SvnPathGeneratorTab:
             self._set_ui_busy(False)
             return
         
-        # 排序
         sort_mode = self.sort_mode.get()
         base_url = self.svn_url.get().strip().rstrip("/")
-        
-        # 生成完整 URL
-        urls_with_rev = []
-        for path_text, rev in results:
-            # 确保路径以 / 开头
-            if not path_text.startswith("/"):
-                path_text = "/" + path_text
-            full_url = base_url + path_text + "(V" + str(rev) + ")"
-            urls_with_rev.append((full_url, rev, path_text))
-        
-        # 排序
-        if sort_mode == "按路径排序":
-            urls_with_rev.sort(key=lambda x: x[0].lower())
-        elif sort_mode == "按版本排序":
-            urls_with_rev.sort(key=lambda x: (x[1], x[0].lower()))
-        elif sort_mode == "按文件名排序":
-            urls_with_rev.sort(key=lambda x: (os.path.basename(x[2]).lower(), x[0].lower()))
+        urls_with_rev = build_revision_url_rows(results, base_url, sort_mode)
         
         self._generated_results = urls_with_rev
         self._generated_urls = [u[0] for u in urls_with_rev]

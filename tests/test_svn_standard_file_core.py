@@ -39,12 +39,9 @@ class FakeEngine:
         return 123
 
     @staticmethod
-    def _get_repo_root_http_url(_target):
-        return "https://svn.example.com/svn/customer"
-
-    @staticmethod
-    def _get_changed_paths(_target, _revision):
-        return ["/T%E5%A4%A9%E9%80%B8%E9%87%91%E8%9E%8D%E6%9C%8D%E5%8A%A1/src/A.java"]
+    def _get_revision_urls(_target, revision):
+        path = "T天逸金融服务/src/A.java"
+        return ["https://svn.example.com/svn/customer/%s(V%d)" % (path, revision)], [path]
 
 
 class StandardFileCoreTest(unittest.TestCase):

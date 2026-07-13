@@ -74,6 +74,7 @@ python3 svn_sync_cli.py
 - 密码输入不回显；来源为 `smb://` 共享时才会询问 SMB 账号；
 - 交叉覆盖会先列出文件清单，回车全部覆盖，或输入序号（如 `1,3-5`）只覆盖部分，确认后才执行；
 - 全自动流程执行前会显示参数摘要并要求确认；`checkout` 模式删除已有目录前会单独确认；
+- 全自动流程中任一文件覆盖失败都会立即终止，不会继续执行 `svn add` 或 `svn commit`；
 - 提交文件路径可复制到剪贴板；升级 Markdown 和版本号路径还可保存为文件。
 
 ### 参数模式（可脚本化）
@@ -129,7 +130,7 @@ python3 svn_sync_cli.py standard --url https://svn.example.com/svn/cust/ecology 
 4. 点击列表中的文件可切换勾选/取消
 5. 点击 **覆盖选中** 执行覆盖
 
-也可直接点击 **一键覆盖（推荐）**，扫描 + 覆盖一步完成。
+也可直接点击 **一键覆盖（推荐）**：工具先扫描并展示全部匹配文件，确认后再统一覆盖。
 
 ---
 
@@ -141,11 +142,12 @@ python3 svn_sync_cli.py standard --url https://svn.example.com/svn/cust/ecology 
 4. 选择 **整理好的目录（来源）**——也可直接填**网络共享地址**（见下方「共享目录地址」）
 5. 选择拉取模式：checkout（首次）或 update（已有）
 6. 输入 **SVN 提交信息**
-7. 点击 **▶ 一键执行**，工具将自动完成：
+7. 点击 **▶ 一键执行**，核对地址、目录、模式和提交信息后确认；checkout 模式检测到已有工作副本时，还会单独确认是否删除重拉
+8. 工具将自动完成：
    ```
    SVN 拉取 → 交叉文件覆盖 → SVN 提交
    ```
-8. 日志区域实时显示每一步的输出和结果
+9. 日志区域实时显示每一步的输出和结果
 
 ---
 
@@ -271,7 +273,7 @@ python3 svn_sync_cli.py
 - **语言**: Python 3.10+
 - **GUI**: tkinter / ttkbootstrap（基于 ttk）
 - **SVN**: 通过 subprocess 调用系统 svn CLI
-- **共享核心**: `svn_sync_core.py`（SVN、SMB/UNC、文件扫描等无界面能力）
+- **共享核心**: `svn_sync_core.py`（SVN、凭据脱敏、SMB/UNC、交叉文件扫描/复制、提交路径等无界面能力的唯一实现）
 - **打包**: PyInstaller（仅 Windows 持续更新 exe；macOS 直接运行 CLI）
 
 > Windows exe 会内嵌 Python GUI 依赖（包括 `ttkbootstrap`），普通用户无需安装 Python、PyInstaller 或 pip 依赖；运行 SVN 功能仍需系统已安装 SVN 命令行工具。macOS 推荐直接使用系统 Python 运行 CLI。
@@ -293,7 +295,11 @@ python3 svn_sync_cli.py
 ├── svn_standard_file_tab.py            # 标准文件获取 GUI（Tab 6）
 ├── SVN_Sync_Tool.spec                  # PyInstaller 打包配置（Windows）
 ├── tests/
-│   └── test_svn_standard_file_core.py  # 标准文件核心与真实临时 SVN 仓库测试
+│   ├── test_svn_sync_core.py           # 共享核心、脱敏、安全门与职责边界测试
+│   ├── test_svn_sync_cli.py            # CLI 配置、剪贴板与自动流程安全测试
+│   ├── test_svn_path_generator.py      # 版本解析、查询与 URL 排序测试
+│   ├── test_svn_standard_file_core.py  # 标准文件核心与真实临时 SVN 仓库测试
+│   └── test_upgrade_list_parser.py     # 富文本颜色与升级 Markdown 测试
 ├── outputs/                            # 预编译成品（纳入版本库）
 │   ├── SVN_Sync_Tool.exe               #   Windows 可执行文件
 │   └── SVN_Sync_Tool-macos-arm64.zip   #   macOS 历史应用包（不再更新）
@@ -312,5 +318,5 @@ python3 svn_sync_cli.py
 - macOS 上由工具临时挂载的共享会在关闭窗口时自动卸载；访达手动连接的挂载不会被卸载
 - 全自动流程提交成功后会列出本次提交文件的可访问 URL，可一键复制；提交解析使用 `svn info/log --xml`，不受中文（GBK/本地化）输出影响
 - 若本次运行无变更（不产生新提交），会回退导出工作副本当前版本的文件路径，方便随时复制
-- 部分 SVN 服务返回的中文仓库路径可能保留百分号编码（如 `%E5%A4%A9...`），不影响 URL 访问
+- 提交与版本路径会统一解码 SVN XML 中的百分号编码（如 `%E5%A4%A9...`），以可读中文 URL 展示
 - 源码打包环境要求 Python 3.10+（`ttkbootstrap` 依赖要求）；普通用户运行预编译产物无需安装 Python

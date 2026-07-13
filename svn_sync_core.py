@@ -42,6 +42,35 @@ def decode_svn_output(data, force_utf8=False):
     return data.decode(SVN_ENCODING, errors="replace")
 
 
+def redact_svn_command(cmd):
+    """返回适合写入日志的 SVN 命令副本，隐藏凭据。"""
+    return ["******" if index and cmd[index - 1] == "--password" else part
+            for index, part in enumerate(cmd)]
+
+
+def redact_sensitive_text(text, secrets=()):
+    """隐藏文本中的显式密码和 SMB URL 用户信息。"""
+    value = str(text or "")
+    value = re.sub(r"(?i)((?:smb:)?//)[^/@\s]+@", r"\1******@", value)
+    candidates = set()
+    for secret in secrets:
+        if secret:
+            candidates.add(str(secret))
+            candidates.add(urllib.parse.quote(str(secret), safe=""))
+    for candidate in sorted(candidates, key=len, reverse=True):
+        value = value.replace(candidate, "******")
+    return value
+
+
+def parse_svn_log_file_paths(xml_text):
+    """从 ``svn log --xml -v`` 输出中提取文件路径，过滤目录条目。"""
+    return [
+        node.text.strip()
+        for node in ET.fromstring(xml_text).findall(".//paths/path")
+        if node.text and node.get("kind") == "file"
+    ]
+
+
 def _value(value):
     return value.get() if hasattr(value, "get") else value
 
@@ -83,14 +112,14 @@ class SyncEngine:
 
     def _run_svn(self, log_widget, *args):
         cmd = self._build_svn_cmd(*args)
-        safe_cmd = ["******" if i and cmd[i - 1] == "--password" else part for i, part in enumerate(cmd)]
-        self._log(log_widget, ">> " + " ".join(safe_cmd) + "\n")
+        self._log(log_widget, ">> " + " ".join(redact_svn_command(cmd)) + "\n")
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 env=self._svn_env(), creationflags=CREATE_NO_WINDOW)
         lines = []
+        secrets = (str(_value(self.svn_pass) or ""),)
         try:
             for raw_line in proc.stdout:
-                line = decode_svn_output(raw_line)
+                line = redact_sensitive_text(decode_svn_output(raw_line), secrets)
                 self._log(log_widget, line)
                 lines.append(line)
         finally:
@@ -102,8 +131,15 @@ class SyncEngine:
     def _run_svn_bytes(self, *args, force_utf8=False, cwd=None, timeout=30):
         proc = subprocess.Popen(self._build_svn_cmd(*args), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 env=self._svn_env(), cwd=cwd, creationflags=CREATE_NO_WINDOW)
-        out, err = proc.communicate(timeout=timeout)
-        return proc.returncode, decode_svn_output(out + err, force_utf8=force_utf8)
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise TimeoutError("SVN 命令执行超时（%s 秒）" % timeout) from None
+        secrets = (str(_value(self.svn_pass) or ""), str(_value(self.smb_pass) or ""))
+        return proc.returncode, redact_sensitive_text(
+            decode_svn_output(out + err, force_utf8=force_utf8), secrets)
 
     def _find_locked_svn_paths(self, checkout_dir):
         rc, out = self._run_svn_bytes("status", "-u", "--xml", ".", force_utf8=True, cwd=checkout_dir)
@@ -133,14 +169,20 @@ class SyncEngine:
         if not locked:
             self._log(log_widget, "未发现 SVN 上锁文件\n")
             return True
+        self._log(log_widget, "发现 %d 个 SVN 上锁文件，正在解锁...\n" % len(locked))
         targets_file = None
         try:
             with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", delete=False) as handle:
                 targets_file = handle.name
                 for path in locked:
                     handle.write(path + "\n")
+                    self._log(log_widget, "  [解锁] %s\n" % os.path.relpath(path, checkout_dir))
             rc, _ = self._run_svn(log_widget, "unlock", "--force", "--targets", targets_file)
-            return rc == 0
+            if rc != 0:
+                self._log(log_widget, "SVN 解锁失败，终止提交\n")
+                return False
+            self._log(log_widget, "SVN 解锁完成\n")
+            return True
         finally:
             if targets_file:
                 try:
@@ -227,7 +269,7 @@ class SyncEngine:
         smb_url = self._share_to_smb_url(address)
         raw = smb_url[6:]
         if "/" not in raw:
-            raise ValueError("SMB 地址需包含 server/share：" + address)
+            raise ValueError("SMB 地址需包含 server/share：" + redact_sensitive_text(address))
         server, rel = raw.split("/", 1)
         server = server.split("@")[-1]
         share, _, sub = rel.partition("/")
@@ -249,9 +291,15 @@ class SyncEngine:
         except subprocess.TimeoutExpired:
             self._safe_rmdir(mount_point)
             raise RuntimeError("挂载超时，请检查网络与共享地址")
+        except Exception as exc:
+            self._safe_rmdir(mount_point)
+            safe_error = redact_sensitive_text(str(exc), (password,))
+            raise RuntimeError("挂载失败：%s" % safe_error) from None
         if result.returncode != 0:
             self._safe_rmdir(mount_point)
-            raise RuntimeError("挂载失败（%s）：%s" % (smb_url, (result.stderr or "").strip()))
+            safe_url = redact_sensitive_text(smb_url, (password,))
+            safe_error = redact_sensitive_text((result.stderr or "").strip(), (password,))
+            raise RuntimeError("挂载失败（%s）：%s" % (safe_url, safe_error))
         self._temp_mounts.append(mount_point)
         full = os.path.join(mount_point, *sub.split("/")) if sub else mount_point
         if not os.path.isdir(full):
@@ -285,27 +333,87 @@ class SyncEngine:
         return results
 
     @staticmethod
+    def _copy_cross_files(entries, on_result=None):
+        """复制扫描得到的交叉文件，返回 ``(成功条目, 失败信息)``。"""
+        copied, errors = [], []
+        for relative, source_file, target_file in entries:
+            try:
+                Path(target_file).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source_file, target_file)
+                copied.append((relative, source_file, target_file))
+                if on_result:
+                    on_result(relative, True, "")
+            except Exception as exc:
+                errors.append((relative, str(exc)))
+                if on_result:
+                    on_result(relative, False, str(exc))
+        return copied, errors
+
+    @staticmethod
     def _parse_revision(output):
         match = re.search(r"(?:Committed revision|提交后的版本为?|已提交的版本|版本)\s*(\d+)", output)
         return int(match.group(1)) if match else None
 
     def _get_wc_last_revision(self, checkout_dir):
-        rc, output = self._run_svn_bytes("info", "--show-item", "revision", checkout_dir)
-        if rc == 0 and output.strip().isdigit():
-            return int(output.strip())
-        return None
+        try:
+            rc, output = self._run_svn_bytes("info", "--xml", checkout_dir, force_utf8=True)
+            if rc != 0:
+                return None
+            entry = ET.fromstring(output).find(".//entry")
+            commit = entry.find("commit") if entry is not None else None
+            revision = commit.get("revision") if commit is not None else (
+                entry.get("revision") if entry is not None else None)
+            return int(revision) if revision else None
+        except (ET.ParseError, TypeError, ValueError):
+            return None
 
     def _get_repo_root_http_url(self, checkout_dir):
-        rc, output = self._run_svn_bytes("info", "--xml", checkout_dir, force_utf8=True)
-        if rc != 0:
+        try:
+            rc, output = self._run_svn_bytes("info", "--xml", checkout_dir, force_utf8=True)
+            if rc != 0:
+                return None
+            root = ET.fromstring(output).findtext(".//repository/root")
+            if not root:
+                return None
+            root = root.strip()
+            if root.startswith("svn://"):
+                root = "https://" + root[6:]
+            return urllib.parse.unquote(root, encoding="utf-8", errors="replace").rstrip("/")
+        except (ET.ParseError, TypeError, ValueError):
             return None
-        root = ET.fromstring(output).findtext(".//repository/root")
-        return root.rstrip("/") if root else None
 
     def _get_changed_paths(self, checkout_dir, revision):
         rc, output = self._run_svn_bytes("log", "--xml", "-v", "-r", str(revision), checkout_dir,
                                          force_utf8=True)
         if rc != 0:
             return []
-        return [node.text.strip() for node in ET.fromstring(output).findall(".//paths/path")
-                if node.text and node.get("kind") == "file"]
+        try:
+            return parse_svn_log_file_paths(output)
+        except ET.ParseError:
+            return []
+
+    def _get_revision_urls(self, checkout_dir, revision):
+        """返回指定版本的 ``(完整文件 URL, 相对路径)``。"""
+        repo_root = self._get_repo_root_http_url(checkout_dir)
+        if not repo_root:
+            return [], []
+        urls, relative_paths = [], []
+        for path in self._get_changed_paths(checkout_dir, revision):
+            decoded = urllib.parse.unquote(path, encoding="utf-8", errors="replace")
+            normalized = decoded if decoded.startswith("/") else "/" + decoded
+            urls.append("%s%s(V%d)" % (repo_root.rstrip("/"), normalized, revision))
+            relative_paths.append(normalized.lstrip("/"))
+        return urls, relative_paths
+
+
+def run_svn_command(args, svn_user="", svn_pass="", timeout=60):
+    """无界面执行 SVN 命令，供独立功能模块复用。"""
+    engine = SyncEngine()
+    engine.svn_user = svn_user
+    engine.svn_pass = svn_pass
+    try:
+        return engine._run_svn_bytes(*args, timeout=timeout)
+    except TimeoutError:
+        return -1, "超时"
+    except Exception as exc:
+        return -1, redact_sensitive_text(str(exc), (svn_pass,))

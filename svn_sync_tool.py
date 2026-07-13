@@ -1,9 +1,8 @@
 ﻿# -*- coding: utf-8 -*-
 """SVN 代码拉取 + 交叉文件覆盖 + 全自动提交 + 文件路径导出"""
 
-import os, sys, subprocess, threading, shutil, locale, tempfile, atexit
-import urllib.parse, unicodedata, re
-import xml.etree.ElementTree as ET
+import os, sys, subprocess, threading, shutil, atexit
+import re
 from collections import Counter, OrderedDict, defaultdict
 from html.parser import HTMLParser
 # GUI 依赖允许缺失：终端版（svn_sync_cli.py）只复用本模块的业务逻辑，不需要 tkinter/ttkbootstrap
@@ -16,33 +15,12 @@ try:
 except ImportError:
     tk = None
     GUI_AVAILABLE = False
-from pathlib import Path
 import svn_path_generator
-from svn_sync_core import SyncEngine
+from svn_sync_core import IS_MACOS, IS_WINDOWS, SyncEngine
 if GUI_AVAILABLE:
     import svn_standard_file_tab
 try: import queue
 except: import Queue as queue
-
-CREATE_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0) if os.name == 'nt' else 0
-SVN_EXECUTABLE = shutil.which("svn")
-if not SVN_EXECUTABLE:
-    for _svn_path in ("/opt/homebrew/bin/svn", "/usr/local/bin/svn", "/usr/bin/svn"):
-        if os.path.isfile(_svn_path) and os.access(_svn_path, os.X_OK):
-            SVN_EXECUTABLE = _svn_path
-            break
-SVN_EXECUTABLE = SVN_EXECUTABLE or "svn"
-
-# 自动检测系统编码：中文 Windows 用 GBK，否则 UTF-8
-_SYS_ENC = locale.getpreferredencoding()
-_SVN_ENC = 'gbk' if _SYS_ENC.lower() in ('cp936', 'gbk', 'gb2312', 'gb18030') else 'utf-8'
-
-# 平台判断：用于来源目录的共享地址处理
-# Windows 可直接把 \\server\share 当本地路径访问，无需挂载；
-# macOS 必须先把 smb:// 挂载到本地挂载点才能用 POSIX 文件接口访问。
-IS_WINDOWS = (os.name == 'nt')
-IS_MACOS = (sys.platform == 'darwin')
-
 
 # ═══════════════ 升级清单提取逻辑（对标 Alfred redtext 链路） ═══════════════
 # 移植自 script 仓库的 clipboard_extract_red_text.py / generate_upgrade_md.py
@@ -609,6 +587,76 @@ def rt_build_ai_md(entries, customer_name, raw_counter):
     return "\n".join(lines) + "\n"
 
 
+def read_clipboard_html_macos():
+    """读取 macOS 剪贴板中的 HTML 富文本。"""
+    script = (
+        'ObjC.import("AppKit");'
+        '(function(){var pb=$.NSPasteboard.generalPasteboard;'
+        'var types=["public.html","Apple HTML pasteboard type","HTML Format"];'
+        'for(var i=0;i<types.length;i++){var v=pb.stringForType(types[i]);'
+        'if(v){return ObjC.unwrap(v);}}return "";})()'
+    )
+    try:
+        result = subprocess.run(["osascript", "-l", "JavaScript", "-e", script],
+                                capture_output=True, text=True, errors="ignore")
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout
+    except Exception:
+        pass
+    try:
+        result = subprocess.run(["pbpaste", "-Prefer", "html"],
+                                capture_output=True, text=True, errors="ignore")
+        if result.returncode == 0:
+            return result.stdout
+    except Exception:
+        pass
+    return ""
+
+
+def read_clipboard_html_windows():
+    """读取 Windows 剪贴板中的 CF_HTML 富文本。"""
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        user32.RegisterClipboardFormatW.restype = ctypes.c_uint
+        user32.RegisterClipboardFormatW.argtypes = [ctypes.c_wchar_p]
+        user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+        user32.GetClipboardData.restype = ctypes.c_void_p
+        user32.GetClipboardData.argtypes = [ctypes.c_uint]
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+        kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalSize.restype = ctypes.c_size_t
+        kernel32.GlobalSize.argtypes = [ctypes.c_void_p]
+
+        cf_html = user32.RegisterClipboardFormatW("HTML Format")
+        if not cf_html or not user32.OpenClipboard(None):
+            return ""
+        try:
+            handle = user32.GetClipboardData(cf_html)
+            if not handle:
+                return ""
+            pointer = kernel32.GlobalLock(handle)
+            if not pointer:
+                return ""
+            try:
+                data = ctypes.string_at(pointer, kernel32.GlobalSize(handle))
+            finally:
+                kernel32.GlobalUnlock(handle)
+        finally:
+            user32.CloseClipboard()
+        match = re.search(rb"StartHTML:(\d+)", data)
+        if match:
+            start = int(match.group(1))
+            if 0 <= start < len(data):
+                return data[start:].decode("utf-8", errors="replace")
+        index = data.find(b"<")
+        return data[index:].decode("utf-8", errors="replace") if index >= 0 else data.decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
 class SvnSyncTool(SyncEngine):
     def __init__(self, root):
         super().__init__()
@@ -931,11 +979,11 @@ class SvnSyncTool(SyncEngine):
     def _read_clipboard_content(self):
         """读取剪贴板内容，返回 (text, kind)。kind 为 'html' 或 'text'（纯文本兜底）。"""
         if IS_WINDOWS:
-            html = self._read_clipboard_html_windows()
+            html = read_clipboard_html_windows()
             if html and html.strip():
                 return html, "html"
         elif IS_MACOS:
-            html = self._read_clipboard_html_macos()
+            html = read_clipboard_html_macos()
             if html and html.strip():
                 return html, "html"
         # 兜底：纯文本（无颜色信息，红/黑会全部判为黑）
@@ -944,76 +992,6 @@ class SvnSyncTool(SyncEngine):
         except Exception:
             text = ""
         return text, "text"
-
-    def _read_clipboard_html_macos(self):
-        script = (
-            'ObjC.import("AppKit");'
-            '(function(){var pb=$.NSPasteboard.generalPasteboard;'
-            'var types=["public.html","Apple HTML pasteboard type","HTML Format"];'
-            'for(var i=0;i<types.length;i++){var v=pb.stringForType(types[i]);'
-            'if(v){return ObjC.unwrap(v);}}return "";})()'
-        )
-        try:
-            r = subprocess.run(["osascript", "-l", "JavaScript", "-e", script],
-                               capture_output=True, text=True, errors="ignore")
-            if r.returncode == 0 and r.stdout.strip():
-                return r.stdout
-        except Exception:
-            pass
-        try:
-            r = subprocess.run(["pbpaste", "-Prefer", "html"], capture_output=True, text=True, errors="ignore")
-            if r.returncode == 0:
-                return r.stdout
-        except Exception:
-            pass
-        return ""
-
-    def _read_clipboard_html_windows(self):
-        try:
-            import ctypes
-            user32 = ctypes.windll.user32
-            kernel32 = ctypes.windll.kernel32
-            # 关键：显式声明返回值/参数类型，否则 64 位 Windows 上句柄/指针会被截断为 32 位
-            user32.RegisterClipboardFormatW.restype = ctypes.c_uint
-            user32.RegisterClipboardFormatW.argtypes = [ctypes.c_wchar_p]
-            user32.OpenClipboard.argtypes = [ctypes.c_void_p]
-            user32.GetClipboardData.restype = ctypes.c_void_p
-            user32.GetClipboardData.argtypes = [ctypes.c_uint]
-            kernel32.GlobalLock.restype = ctypes.c_void_p
-            kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
-            kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
-            kernel32.GlobalSize.restype = ctypes.c_size_t
-            kernel32.GlobalSize.argtypes = [ctypes.c_void_p]
-
-            cf_html = user32.RegisterClipboardFormatW("HTML Format")
-            if not cf_html:
-                return ""
-            if not user32.OpenClipboard(None):
-                return ""
-            try:
-                handle = user32.GetClipboardData(cf_html)
-                if not handle:
-                    return ""  # 剪贴板里没有 HTML 格式（多为纯文本来源）
-                ptr = kernel32.GlobalLock(handle)
-                if not ptr:
-                    return ""
-                try:
-                    size = kernel32.GlobalSize(handle)
-                    data = ctypes.string_at(ptr, size)
-                finally:
-                    kernel32.GlobalUnlock(handle)
-            finally:
-                user32.CloseClipboard()
-            # CF_HTML 头部为 ASCII，StartHTML 给出 HTML 片段的字节偏移
-            m = re.search(rb"StartHTML:(\d+)", data)
-            if m:
-                start = int(m.group(1))
-                if 0 <= start < len(data):
-                    return data[start:].decode("utf-8", errors="replace")
-            idx = data.find(b"<")
-            return data[idx:].decode("utf-8", errors="replace") if idx >= 0 else data.decode("utf-8", errors="replace")
-        except Exception:
-            return ""
 
     # ---- tab4 动作 ----
     def _rt_set_list(self, text):
@@ -1137,6 +1115,8 @@ class SvnSyncTool(SyncEngine):
         if d: self.target_dir.set(d)
 
     def _log(self, w, m):
+        if w is None:
+            return
         self.log_queue.put((w, m))
 
     def _poll_log_queue(self):
@@ -1147,135 +1127,6 @@ class SvnSyncTool(SyncEngine):
         except queue.Empty:
             pass
         self.root.after(100, self._poll_log_queue)
-
-    def _build_svn_cmd(self, *args):
-        cmd = [SVN_EXECUTABLE, "--non-interactive",
-               "--trust-server-cert-failures=unknown-ca,cn-mismatch,expired,not-yet-valid,other"]
-        u = self.svn_user.get().strip()
-        p = self.svn_pass.get().strip()
-        if u:
-            cmd.extend(["--username", u])
-            if p:
-                cmd.extend(["--password", p])
-            else:
-                cmd.append("--no-auth-cache")
-        cmd.extend(args)
-        return cmd
-
-    def _svn_env(self):
-        env = os.environ.copy()
-        if os.name != 'nt':
-            env["LANG"] = "zh_CN.UTF-8"
-            env["LC_ALL"] = "zh_CN.UTF-8"
-            env["LC_CTYPE"] = "zh_CN.UTF-8"
-            extra_path = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-            env["PATH"] = extra_path + (":" + env["PATH"] if env.get("PATH") else "")
-        return env
-
-    def _run_svn(self, log_widget, *args):
-        """运行 svn 命令，用系统编码解码输出"""
-        cmd = self._build_svn_cmd(*args)
-        self._log(log_widget, ">> " + " ".join(cmd) + "\n")
-        proc = subprocess.Popen(cmd,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            universal_newlines=True, encoding=_SVN_ENC, errors="replace",
-            env=self._svn_env(),
-            creationflags=CREATE_NO_WINDOW)
-        out_lines = []
-        for line in proc.stdout:
-            self._log(log_widget, line)
-            out_lines.append(line)
-        proc.wait()
-        return proc.returncode, "".join(out_lines)
-
-    def _run_svn_bytes(self, *args, force_utf8=False, cwd=None):
-        """运行 svn 命令，返回原始字节解码后的文本。
-        force_utf8=True 用于 --xml 输出（svn 的 XML 始终是 UTF-8，与系统/界面 locale 无关）。"""
-        cmd = self._build_svn_cmd(*args)
-        proc = subprocess.Popen(cmd,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            env=self._svn_env(),
-            cwd=cwd,
-            creationflags=CREATE_NO_WINDOW)
-        out, err = proc.communicate(timeout=30)
-        if force_utf8:
-            text = out.decode('utf-8', errors='replace')
-            err_text = err.decode('utf-8', errors='replace')
-        else:
-            # 优先系统编码（中文 Windows 为 GBK），失败则 UTF-8
-            try:
-                text = out.decode(_SVN_ENC)
-            except (UnicodeDecodeError, LookupError):
-                text = out.decode('utf-8', errors='replace')
-            try:
-                err_text = err.decode(_SVN_ENC)
-            except (UnicodeDecodeError, LookupError):
-                err_text = err.decode('utf-8', errors='replace')
-        if err_text:
-            text += err_text
-        return proc.returncode, text
-
-    def _find_locked_svn_paths(self, checkout_dir):
-        """返回工作副本中带仓库锁信息的文件路径。"""
-        rc, out = self._run_svn_bytes("status", "-u", "--xml", ".", force_utf8=True, cwd=checkout_dir)
-        if rc != 0:
-            raise RuntimeError(out.strip() or "svn status -u --xml 执行失败")
-
-        root = ET.fromstring(out)
-        locked = []
-        seen = set()
-        for entry in root.findall(".//entry"):
-            path = (entry.get("path") or "").strip()
-            if not path or path == ".":
-                continue
-
-            wc_status = entry.find("wc-status")
-            repos_status = entry.find("repos-status")
-            has_lock = (
-                (wc_status is not None and wc_status.find("lock") is not None) or
-                (repos_status is not None and repos_status.find("lock") is not None)
-            )
-            if not has_lock:
-                continue
-
-            target = os.path.abspath(os.path.join(checkout_dir, path))
-            if target not in seen:
-                locked.append(target)
-                seen.add(target)
-        return locked
-
-    def _unlock_svn_locks_before_commit(self, log_widget, checkout_dir):
-        self._log(log_widget, "检查 SVN 锁状态...\n")
-        try:
-            locked_paths = self._find_locked_svn_paths(checkout_dir)
-        except Exception as e:
-            self._log(log_widget, "检查 SVN 锁状态失败: " + str(e) + "\n")
-            return False
-
-        if not locked_paths:
-            self._log(log_widget, "未发现 SVN 上锁文件\n")
-            return True
-
-        self._log(log_widget, "发现 " + str(len(locked_paths)) + " 个 SVN 上锁文件，正在解锁...\n")
-        targets_file = None
-        try:
-            with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", delete=False) as f:
-                targets_file = f.name
-                for path in locked_paths:
-                    f.write(path + "\n")
-                    self._log(log_widget, "  [解锁] " + os.path.relpath(path, checkout_dir) + "\n")
-            rc, _ = self._run_svn(log_widget, "unlock", "--force", "--targets", targets_file)
-            if rc != 0:
-                self._log(log_widget, "SVN 解锁失败，终止提交\n")
-                return False
-            self._log(log_widget, "SVN 解锁完成\n")
-            return True
-        finally:
-            if targets_file:
-                try:
-                    os.remove(targets_file)
-                except OSError:
-                    pass
 
     def _start_checkout(self):
         url = self.svn_url.get().strip()
@@ -1290,7 +1141,7 @@ class SvnSyncTool(SyncEngine):
                 rc, _ = self._run_svn(self.log_co, "checkout", url, dst)
                 if rc == 0:
                     self._log(self.log_co, "\n--- 拉取完成 ---\n")
-                    self.target_dir.set(dst)
+                    self.root.after(0, lambda: self.target_dir.set(dst))
                 else:
                     self._log(self.log_co, "\n--- 拉取失败，返回码: " + str(rc) + " ---\n")
             except Exception as e:
@@ -1299,204 +1150,9 @@ class SvnSyncTool(SyncEngine):
                 self.root.after(0, lambda: self.btn_co.config(state=tk.NORMAL, text="拉取代码"))
         threading.Thread(target=run, daemon=True).start()
 
-    # ═══════════════ 来源目录共享地址处理（分平台） ═══════════════
-    def _clean_share_text(self, path):
-        """剥除常见的提示语包装（如「标准文件请到…下面提取」），返回纯地址。
-        让用户可以直接粘贴原文，无需手动删前后缀。"""
-        p = (path or "").strip()
-        # 去掉前缀提示语
-        for pre in ("标准文件请到", "标准文件在", "请到", "文件请到"):
-            if p.startswith(pre):
-                p = p[len(pre):].strip()
-                break
-        # 去掉后缀提示语
-        for suf in ("下面提取", "里提取", "中提取", "提取", "下载"):
-            if p.endswith(suf):
-                p = p[:-len(suf)].strip()
-                break
-        return p
-
-    def _is_share_address(self, path):
-        """判断来源是否为网络共享地址（smb:// 或 \\\\server\\share 或 //server/share）。
-        会先剥除提示语包装再判断。"""
-        p = self._clean_share_text(path)
-        low = p.lower()
-        return (low.startswith("smb://") or low.startswith("smb:")
-                or p.startswith("\\\\") or p.startswith("//"))
-
-    def _share_to_smb_url(self, path):
-        """把任意写法的共享地址归一化为 smb://server/share/sub。"""
-        p = path.strip()
-        low = p.lower()
-        if low.startswith("smb://"):
-            return p
-        if low.startswith("smb:"):
-            return "smb://" + p[4:].lstrip("/")
-        # \\server\share 或 //server/share
-        p = p.replace("\\", "/").lstrip("/")
-        return "smb://" + p
-
-    def _share_to_unc(self, path):
-        """把任意写法的共享地址归一化为 Windows UNC：\\\\server\\share。"""
-        p = path.strip()
-        low = p.lower()
-        if low.startswith("smb://"):
-            p = p[6:]
-        elif low.startswith("smb:"):
-            p = p[4:].lstrip("/")
-        p = p.replace("/", "\\")
-        if not p.startswith("\\\\"):
-            p = "\\\\" + p.lstrip("\\")
-        return p
-
-    def _precheck_source(self, src):
-        """主线程快速校验来源；共享地址的可达性延后到 worker 线程解析时再判断。
-        返回错误消息字符串；无错误返回 None。"""
-        if not src:
-            return "请先选择/填写来源目录"
-        if not self._is_share_address(src) and not os.path.isdir(src):
-            return "来源目录不存在: " + src
-        return None
-
-    def _resolve_source_path(self, addr, log=None):
-        """把来源地址解析为可直接用于文件遍历/复制的本地路径。
-        - 普通本地路径：原样返回。
-        - Windows + 共享地址：转成 UNC，系统可直接访问，无需挂载。
-        - macOS + 共享地址：复用已有挂载或临时挂载，返回真实路径。
-        失败时抛出异常。"""
-        raw = (addr or "").strip()
-        if not self._is_share_address(raw):
-            return raw  # 普通本地路径，原样返回
-        addr = self._clean_share_text(raw)  # 共享地址：剥除提示语包装
-        if IS_WINDOWS:
-            return self._share_to_unc(addr)
-        if IS_MACOS:
-            return self._mount_smb_macos(addr, log)
-        # 其它平台：按已挂载的本地路径处理
-        return addr
-
-    def _find_existing_smb_mount(self, server, rel_path):
-        """在已有 smbfs 挂载中查找能覆盖 server + rel_path 的挂载，返回对应真实本地路径。
-        支持挂载点位于共享根，也支持挂载点已是任意深层子目录（macOS 允许挂载深层路径）。
-        rel_path 形如 'ECOLOGY_customer/H/H河南思维/QC4911408/ecology'（//server/ 之后的部分）。
-        """
-        def norm(parts):
-            # 统一 Unicode 规范化，规避 NFC/NFD 中文路径不匹配
-            return [unicodedata.normalize("NFC", p) for p in parts if p]
-        target = norm(rel_path.split("/"))
-        try:
-            out = subprocess.run(["mount"], capture_output=True, text=True).stdout
-        except Exception:
-            return None
-        for line in (out or "").splitlines():
-            if "smbfs" not in line or " on " not in line:
-                continue
-            source, rest = line.split(" on ", 1)
-            mount_path = rest.split(" (", 1)[0].strip()
-            source = source.strip()
-            if not source.startswith("//"):
-                continue
-            body = source[2:]            # user@server/share/sub...
-            slash = body.find("/")
-            if slash < 0:
-                continue
-            m_server = body[:slash].split("@")[-1]
-            if m_server.lower() != server.lower():
-                continue
-            # 挂载源路径可能被百分号编码（如中文 %E6%B2%B3...），先解码再比对
-            m_parts = norm(urllib.parse.unquote(body[slash + 1:]).split("/"))
-            if not m_parts:
-                continue
-            # 挂载路径必须是目标路径的前缀，剩余部分追加到挂载点
-            if target[:len(m_parts)] != m_parts:
-                continue
-            remaining = target[len(m_parts):]
-            return os.path.join(mount_path, *remaining) if remaining else mount_path
-        return None
-
-    def _mount_smb_macos(self, addr, log=None):
-        """macOS：把共享地址挂载到本地并返回真实路径。优先复用已有挂载。"""
-        smb_url = self._share_to_smb_url(addr)
-        raw = smb_url[6:]  # 去掉 smb://，得到 server/share/sub...
-        if "/" not in raw:
-            raise ValueError("SMB 地址需包含 server/share：" + addr)
-        server, rel = raw.split("/", 1)   # server, "share/sub..."
-        server = server.split("@")[-1]
-        rel_parts = rel.split("/", 1)
-        share = rel_parts[0]
-        sub = rel_parts[1] if len(rel_parts) > 1 else ""
-
-        # 1) 优先复用已有挂载（Finder 在 /Volumes 的连接、本工具之前的临时挂载）
-        #    挂载点可能是共享根，也可能已是深层子目录（如直接挂到 .../ecology）
-        existing = self._find_existing_smb_mount(server, rel)
-        if existing:
-            if os.path.isdir(existing):
-                if log: self._log(log, "复用已挂载共享: " + existing + "\n")
-                return existing
-            raise RuntimeError("已挂载 %s，但目标目录不存在: %s" % (server, rel))
-
-        # 2) 临时挂载
-        mount_point = tempfile.mkdtemp(prefix="svn_sync_smb_")
-        smb_u = self.smb_user.get().strip()
-        smb_p = self.smb_pass.get().strip()
-        if smb_u:
-            # 用填写的 SMB 账号密码挂载：//user:pass@server/share（对账号密码做 URL 转义）
-            auth = urllib.parse.quote(smb_u, safe="")
-            if smb_p:
-                auth += ":" + urllib.parse.quote(smb_p, safe="")
-            mount_source = "//%s@%s/%s" % (auth, server, share)
-        else:
-            # 未填账号：免密挂载，依赖钥匙串/Guest（-N 不弹密码框）
-            mount_source = "//%s/%s" % (server, share)
-        # 注意：日志只打印不含密码的地址，避免泄露凭据
-        if log: self._log(log, "正在挂载 SMB: //%s/%s -> %s\n" % (server, share, mount_point))
-        try:
-            cmd = ["mount_smbfs", mount_source, mount_point] if smb_u \
-                else ["mount_smbfs", "-N", mount_source, mount_point]
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        except subprocess.TimeoutExpired:
-            self._safe_rmdir(mount_point)
-            raise RuntimeError("挂载超时（>60s），请检查网络与共享地址: //%s/%s" % (server, share))
-        if res.returncode != 0:
-            self._safe_rmdir(mount_point)
-            hint = "请检查 SMB 账号密码是否正确" if smb_u else "请填写 SMB 账号密码，或先在访达中用 Cmd+K 连接一次"
-            raise RuntimeError("挂载失败（%s）：%s\n%s"
-                               % (smb_url, hint, (res.stderr or "").strip()))
-        self._temp_mounts.append(mount_point)
-        full = os.path.join(mount_point, *sub.split("/")) if sub else mount_point
-        if not os.path.isdir(full):
-            raise RuntimeError("挂载成功但子目录不存在: " + sub)
-        return full
-
-    def _safe_rmdir(self, p):
-        try:
-            os.rmdir(p)
-        except OSError:
-            pass
-
-    def _cleanup_temp_mounts(self):
-        """卸载本工具创建的临时挂载点（不会动 Finder/用户手动挂载的共享）。"""
-        for mp in list(self._temp_mounts):
-            subprocess.run(["umount", mp], capture_output=True, check=False)
-            self._safe_rmdir(mp)
-        self._temp_mounts = []
-
     def _on_close(self):
         self._cleanup_temp_mounts()
         self.root.destroy()
-
-    def _scan_cross_files(self, tgt, src):
-        results = []
-        tp = Path(tgt)
-        sp = Path(src)
-        for f in sorted(tp.rglob("*")):
-            if not f.is_file(): continue
-            if ".svn" in f.parts or ".git" in f.parts: continue
-            rel = f.relative_to(tp)
-            src_file = sp / rel
-            if src_file.exists() and src_file.is_file():
-                results.append((str(rel), str(src_file), str(f)))
-        return results
 
     def _start_scan(self):
         src = self.source_dir.get().strip()
@@ -1555,8 +1211,8 @@ class SvnSyncTool(SyncEngine):
         if err: messagebox.showerror("错误", err); return
         if not os.path.isdir(tgt): messagebox.showerror("错误", "目标目录不存在: " + tgt); return
         self._clear_results()
-        self.btn_quick.config(state=tk.DISABLED, text="正在覆盖...")
-        self.lbl_st.config(text="正在扫描并覆盖...")
+        self.btn_quick.config(state=tk.DISABLED, text="正在扫描...")
+        self.lbl_st.config(text="正在扫描待覆盖文件...")
 
         def run():
             try:
@@ -1568,15 +1224,25 @@ class SvnSyncTool(SyncEngine):
                 if not res:
                     self.root.after(0, lambda: self._quick_done(0, 0, "未找到匹配的交叉文件"))
                     return
-                ok = 0; fail = 0
-                for rel, sa, ta in res:
-                    try:
-                        Path(ta).parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(sa, ta); ok += 1
-                    except: fail += 1
-                self.root.after(0, lambda: self._quick_done(ok, fail, ""))
+                self.root.after(0, lambda: self._confirm_quick_overwrite(res))
             except Exception as e:
                 self.root.after(0, lambda: self._quick_done(0, 0, "错误: " + str(e)))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _confirm_quick_overwrite(self, entries):
+        self._show_scan(entries)
+        if not messagebox.askyesno(
+                "确认一键覆盖",
+                "扫描到 %d 个交叉文件，确定全部覆盖？\n此操作会修改目标工作副本。" % len(entries)):
+            self.lbl_st.config(text="已取消一键覆盖；扫描结果已保留")
+            self.btn_quick.config(state=tk.NORMAL, text="一键覆盖（推荐）")
+            return
+        self.btn_quick.config(state=tk.DISABLED, text="正在覆盖...")
+        self.lbl_st.config(text="正在覆盖全部扫描文件...")
+
+        def run():
+            copied, errors = self._copy_cross_files(entries)
+            self.root.after(0, lambda: self._quick_done(len(copied), len(errors), ""))
         threading.Thread(target=run, daemon=True).start()
 
     def _quick_done(self, ok, fail, err):
@@ -1595,14 +1261,10 @@ class SvnSyncTool(SyncEngine):
         self.lbl_st.config(text="正在覆盖...")
 
         def run():
-            ok = 0; fail = 0
-            for i, (r, sa, ta) in enumerate(self._xf):
-                if ("i" + str(i)) not in self._ck: continue
-                try:
-                    Path(ta).parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(sa, ta); ok += 1
-                except: fail += 1
-            self.root.after(0, lambda: self._done(ok, fail))
+            entries = [entry for index, entry in enumerate(self._xf)
+                       if ("i" + str(index)) in self._ck]
+            copied, errors = self._copy_cross_files(entries)
+            self.root.after(0, lambda: self._done(len(copied), len(errors)))
         threading.Thread(target=run, daemon=True).start()
 
     def _done(self, ok, fail):
@@ -1634,6 +1296,19 @@ class SvnSyncTool(SyncEngine):
         msg = self.auto_msg.get(1.0, tk.END).strip()
         if not msg: messagebox.showwarning("提示", "请输入提交信息"); return
 
+        summary = (
+            "即将执行：SVN %s → 交叉覆盖 → SVN 提交\n\n"
+            "SVN 地址：%s\n拉取目录：%s\n来源目录：%s\n提交信息：%s\n\n"
+            "确认执行完整流程？" % (mode, url, dst, src, msg)
+        )
+        if not messagebox.askyesno("确认全自动流程", summary):
+            return
+        dst_exists = os.path.isdir(dst) and os.path.isdir(os.path.join(dst, ".svn"))
+        if dst_exists and mode == "checkout" and not messagebox.askyesno(
+                "确认删除已有工作副本",
+                "checkout 模式将先删除已有工作副本，再重新拉取：\n%s\n\n确定继续？" % dst):
+            return
+
         self.btn_auto.config(state=tk.DISABLED, text="正在执行...")
         self.log_auto.delete(1.0, tk.END)
         self._clear_paths_display()
@@ -1641,12 +1316,10 @@ class SvnSyncTool(SyncEngine):
         def run():
             log = self.log_auto
             overall_ok = True
-            rev = None
             try:
                 # Step 1
                 self._log(log, "【步骤 1/3】SVN 拉取\n")
                 self._log(log, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
-                dst_exists = os.path.isdir(dst) and os.path.isdir(os.path.join(dst, ".svn"))
                 if dst_exists and mode == "update":
                     self._log(log, "目录已存在，执行 svn update...\n")
                     rc, _ = self._run_svn(log, "update", dst)
@@ -1657,9 +1330,9 @@ class SvnSyncTool(SyncEngine):
                     rc, _ = self._run_svn(log, "checkout", url, dst)
                 if rc != 0:
                     self._log(log, "\n--- 步骤 1 失败，终止流程 ---\n")
-                    self.root.after(0, lambda: self._auto_done(False))
+                    overall_ok = False
                     return
-                self.target_dir.set(dst)
+                self.root.after(0, lambda: self.target_dir.set(dst))
                 self._log(log, "\n--- 步骤 1 完成 ---\n\n")
 
                 # Step 2
@@ -1669,29 +1342,28 @@ class SvnSyncTool(SyncEngine):
                     rsrc = self._resolve_source_path(src, log)
                 except Exception as e:
                     self._log(log, "来源共享挂载失败: " + str(e) + "\n--- 步骤 2 失败，终止流程 ---\n")
-                    self.root.after(0, lambda: self._auto_done(False))
+                    overall_ok = False
                     return
                 if not os.path.isdir(rsrc):
                     self._log(log, "来源目录不存在: " + rsrc + "\n--- 步骤 2 失败，终止流程 ---\n")
-                    self.root.after(0, lambda: self._auto_done(False))
+                    overall_ok = False
                     return
                 res = self._scan_cross_files(dst, rsrc)
                 if not res:
                     self._log(log, "未找到交叉文件，跳过覆盖\n\n")
                 else:
-                    ok = 0; fail = 0
-                    for rel, sa, ta in res:
-                        try:
-                            Path(ta).parent.mkdir(parents=True, exist_ok=True)
-                            shutil.copy2(sa, ta)
-                            self._log(log, "  [覆盖] " + rel + "\n")
-                            ok += 1
-                        except Exception as e:
-                            self._log(log, "  [失败] " + rel + " - " + str(e) + "\n")
-                            fail += 1
-                    self._log(log, "覆盖结果: 成功 " + str(ok) + " 个")
-                    if fail: self._log(log, ", 失败 " + str(fail) + " 个")
+                    def report(relative, success, error):
+                        message = "  [覆盖] " + relative if success else "  [失败] %s - %s" % (relative, error)
+                        self._log(log, message + "\n")
+
+                    copied, errors = self._copy_cross_files(res, on_result=report)
+                    self._log(log, "覆盖结果: 成功 " + str(len(copied)) + " 个")
+                    if errors: self._log(log, ", 失败 " + str(len(errors)) + " 个")
                     self._log(log, "\n\n--- 步骤 2 完成 ---\n\n")
+                    if errors:
+                        self._log(log, "检测到覆盖失败，为避免提交不完整变更，终止流程。\n")
+                        overall_ok = False
+                        return
 
                 # Step 3
                 self._log(log, "【步骤 3/3】SVN 提交\n")
@@ -1735,14 +1407,6 @@ class SvnSyncTool(SyncEngine):
 
         threading.Thread(target=run, daemon=True).start()
 
-    def _parse_revision(self, commit_output):
-        import re
-        # 兼容英文「Committed revision N」与中文「提交后的版本为 N」等本地化输出
-        m = re.search(r'(?:Committed revision|提交后的版本为?|版本)\s*(\d+)', commit_output)
-        if m:
-            return int(m.group(1))
-        return None
-
     def _load_and_show_commit_paths(self, rev):
         dst = self.checkout_dir.get().strip()
         if not dst or not os.path.isdir(dst):
@@ -1750,69 +1414,13 @@ class SvnSyncTool(SyncEngine):
 
         def run():
             try:
-                base_url = self._get_repo_root_http_url(dst)
-                if not base_url:
-                    return
-                changed_paths = self._get_changed_paths(dst, rev)
-                if not changed_paths:
-                    return
-                urls = []
-                for p in changed_paths:
-                    decoded_path = p
-                    # URL decode (unquote_to_bytes -> UTF-8, compatible Python 3.6)
-                    from urllib.parse import unquote_to_bytes
-                    raw = unquote_to_bytes(p)
-                    decoded_path = raw.decode("utf-8")
-                    full_url = base_url.rstrip("/") + decoded_path + "(V" + str(rev) + ")"
-                    urls.append(full_url)
-                self.root.after(0, lambda: self._display_commit_paths(urls))
+                urls, _relative_paths = self._get_revision_urls(dst, rev)
+                if urls:
+                    self.root.after(0, lambda: self._display_commit_paths(urls))
             except Exception as e:
                 self._log(self.log_auto, "\n[路径导出] 获取提交文件路径失败: " + str(e) + "\n")
 
         threading.Thread(target=run, daemon=True).start()
-
-    def _get_wc_last_revision(self, checkout_dir):
-        """获取工作副本最后变更版本号（用 `svn info --xml` 的 commit/@revision）。"""
-        try:
-            rc, out = self._run_svn_bytes("info", "--xml", checkout_dir, force_utf8=True)
-            if rc != 0:
-                return None
-            entry = ET.fromstring(out).find(".//entry")
-            commit = entry.find("commit") if entry is not None else None
-            rev = commit.get("revision") if commit is not None else (entry.get("revision") if entry is not None else None)
-            return int(rev) if rev else None
-        except Exception:
-            return None
-
-    def _get_repo_root_http_url(self, checkout_dir):
-        """获取仓库根 URL。用 `svn info --xml` 解析，避免依赖被本地化的文本字段。"""
-        try:
-            rc, out = self._run_svn_bytes("info", "--xml", checkout_dir, force_utf8=True)
-            if rc != 0:
-                return None
-            node = ET.fromstring(out).find(".//repository/root")
-            if node is None or not node.text:
-                return None
-            root = node.text.strip()
-            # svn:// 无法在浏览器直接访问，转 https；http/https 原样保留
-            if root.startswith("svn://"):
-                root = "https://" + root[6:]
-            # XML 中的 URL 可能对中文做了百分号编码，解码为可读形式
-            from urllib.parse import unquote_to_bytes
-            return unquote_to_bytes(root).decode("utf-8")
-        except Exception:
-            return None
-
-    def _get_changed_paths(self, checkout_dir, rev):
-        """获取某次提交变更的文件路径。用 `svn log --xml -v` 解析，locale 无关。"""
-        try:
-            rc, out = self._run_svn_bytes("log", "--xml", "-v", "-r", str(rev), checkout_dir, force_utf8=True)
-            if rc != 0:
-                return []
-            # <logentry><paths><path action="M">/xxx</path>...</paths></logentry>
-            return [p.text.strip() for p in ET.fromstring(out).findall(".//logentry/paths/path") if p.text]
-        except Exception:
-            return []
 
     def _display_commit_paths(self, urls):
         self._commit_urls = urls
