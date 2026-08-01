@@ -5,7 +5,7 @@
 与图形界面（svn_sync_tool.py）共用同一套业务逻辑，提供两种用法：
 
 1. 交互模式：直接运行 `python3 svn_sync_cli.py`，在主菜单选择功能后按提示逐项输入参数
-   （对应 GUI 的 5 个标签页；常用值会记住，回车即可复用上次输入）。
+   （对应 GUI 的 6 个标签页；常用值会记住，回车即可复用上次输入）。
 2. 参数模式：`python3 svn_sync_cli.py <子命令> [参数...]`，适合脚本化调用；
    在终端里漏填的必填参数会自动转为交互式提问补全，非终端环境则直接报错退出。
 
@@ -15,6 +15,7 @@
     auto       3. 全自动流程（拉取 → 覆盖 → 提交）
     extract    4. 升级清单提取
     paths      5. 版本号路径生成
+    standard   6. 标准文件获取
 
 常用值（SVN 地址、目录、用户名等，不含密码）保存在 ~/.config/svn_sync_tool/cli.json。
 """
@@ -24,14 +25,15 @@ import atexit
 import getpass
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
-import xml.etree.ElementTree as ET
-from pathlib import Path
-from urllib.parse import unquote_to_bytes
+import tempfile
 
 import svn_sync_tool as core
+from svn_sync_core import SyncEngine
+from svn_standard_file_core import StandardFileService
 import svn_path_generator as pathgen
 
 CONFIG_DIR = os.path.expanduser("~/.config/svn_sync_tool")
@@ -41,7 +43,7 @@ SORT_KEYS = [("rev", "按版本排序"), ("path", "按路径排序"), ("name", "
 SORT_LABELS = dict(SORT_KEYS)
 
 
-# ═══════════════ 无界面引擎：复用 GUI 类的业务逻辑 ═══════════════
+# ═══════════════ 无界面引擎：复用共享核心，不构建 GUI ═══════════════
 
 class _Var:
     """tk.StringVar 的无界面替身，让 GUI 类的方法在终端下可用。"""
@@ -56,11 +58,11 @@ class _Var:
         self._value = value
 
 
-class CliEngine(core.SvnSyncTool):
-    """继承 GUI 类以复用 SVN/共享地址/扫描逻辑，但不构建任何界面。"""
+class CliEngine(SyncEngine):
+    """组合共享核心，不加载或继承 GUI。"""
 
     def __init__(self):
-        # 故意不调用父类 __init__（父类会构建 GUI 窗口）
+        super().__init__()
         self.svn_url = _Var()
         self.svn_user = _Var()
         self.svn_pass = _Var()
@@ -79,11 +81,11 @@ class CliEngine(core.SvnSyncTool):
     def _read_clipboard_content(self):
         """终端版剪贴板读取：HTML 优先，纯文本兜底（不依赖 tk）。"""
         if core.IS_WINDOWS:
-            html = self._read_clipboard_html_windows()
+            html = core.read_clipboard_html_windows()
             if html and html.strip():
                 return html, "html"
         elif core.IS_MACOS:
-            html = self._read_clipboard_html_macos()
+            html = core.read_clipboard_html_macos()
             if html and html.strip():
                 return html, "html"
         return self._read_clipboard_text(), "text"
@@ -129,15 +131,48 @@ def load_defaults():
         return {}
 
 
+def sanitize_text(value):
+    """移除终端输入中的非法 UTF-8 代理字符，避免子进程参数和配置写入失败。"""
+    if not isinstance(value, str):
+        return value
+    try:
+        value.encode("utf-8")
+        return value
+    except UnicodeEncodeError:
+        raw = value.encode("utf-8", errors="surrogateescape")
+        return raw.decode("utf-8", errors="replace")
+
+
+def normalize_revision_input(value):
+    """版本表达式只允许数字、逗号、连字符和空白，过滤粘贴/终端混入的隐藏字节。"""
+    return re.sub(r"[^0-9,\-\s]", "", sanitize_text(value or "")).strip()
+
+
 def save_defaults(defaults, **updates):
     for key, value in updates.items():
         if value:
-            defaults[key] = value
+            defaults[key] = sanitize_text(value)
+    safe_defaults = {
+        sanitize_text(key): sanitize_text(value) if isinstance(value, str) else value
+        for key, value in defaults.items()
+    }
+    temp_path = None
     try:
         os.makedirs(CONFIG_DIR, exist_ok=True)
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(defaults, f, ensure_ascii=False, indent=2)
-    except OSError:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=CONFIG_DIR,
+                                         prefix="cli.", suffix=".tmp", delete=False) as f:
+            temp_path = f.name
+            json.dump(safe_defaults, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(temp_path, CONFIG_PATH)
+        defaults.clear()
+        defaults.update(safe_defaults)
+    except (OSError, UnicodeError, TypeError, ValueError):
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
         pass
     return defaults
 
@@ -152,7 +187,7 @@ def ask(label, default="", required=False):
     hint = "（回车=%s）" % default if default else ""
     while True:
         try:
-            value = input("%s%s: " % (label, hint)).strip()
+            value = sanitize_text(input("%s%s: " % (label, hint))).strip()
         except EOFError:
             value = ""
         if not value:
@@ -286,22 +321,16 @@ def print_scan_result(entries):
         print("  [%*d] %s" % (width, index, rel))
 
 
-def copy_cross_files(entries):
-    ok = fail = 0
-    for rel, src, tgt in entries:
-        try:
-            Path(tgt).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, tgt)
-            print("  [覆盖] " + rel)
-            ok += 1
-        except Exception as e:
-            print("  [失败] %s - %s" % (rel, e))
-            fail += 1
-    message = "覆盖完成! 成功 %d 个" % ok
-    if fail:
-        message += ", 失败 %d 个" % fail
+def copy_cross_files(engine, entries):
+    def report(relative, success, error):
+        print("  [覆盖] " + relative if success else "  [失败] %s - %s" % (relative, error))
+
+    copied, errors = engine._copy_cross_files(entries, on_result=report)
+    message = "覆盖完成! 成功 %d 个" % len(copied)
+    if errors:
+        message += ", 失败 %d 个" % len(errors)
     print(message)
-    return fail == 0
+    return not errors
 
 
 def select_entries_interactive(entries):
@@ -347,24 +376,13 @@ def run_overwrite(engine, target, source, dry_run=False, assume_yes=False):
     else:
         print("非交互环境执行覆盖必须加 --yes（或先用 --dry-run 预览）", file=sys.stderr)
         return False
-    return copy_cross_files(selected)
+    return copy_cross_files(engine, selected)
 
 
 # ═══════════════ 功能 3：全自动流程 ═══════════════
 
-def build_commit_urls(engine, checkout_dir, revision):
-    base_url = engine._get_repo_root_http_url(checkout_dir)
-    if not base_url:
-        return []
-    urls = []
-    for path in engine._get_changed_paths(checkout_dir, revision):
-        decoded = unquote_to_bytes(path).decode("utf-8")
-        urls.append(base_url.rstrip("/") + decoded + "(V%d)" % revision)
-    return urls
-
-
 def show_commit_urls(engine, checkout_dir, revision, do_copy):
-    urls = build_commit_urls(engine, checkout_dir, revision)
+    urls, _relative_paths = engine._get_revision_urls(checkout_dir, revision)
     if not urls:
         return
     print("\n提交文件路径（共 %d 个）：" % len(urls))
@@ -405,8 +423,9 @@ def run_auto(engine, url, dst, source, mode, message, assume_yes=False, do_copy=
     if not entries:
         print("未找到交叉文件，跳过覆盖")
     else:
-        if not copy_cross_files(entries):
-            print("警告: 部分文件覆盖失败，请检查上方日志")
+        if not copy_cross_files(engine, entries):
+            print("部分文件覆盖失败，为避免提交不完整变更，终止流程")
+            return False
         print("\n--- 步骤 2 完成 ---")
 
     banner("【步骤 3/3】SVN 提交")
@@ -513,58 +532,13 @@ def run_extract(engine, html=None, list_text=None, fmt="list", out=None, do_copy
 
 # ═══════════════ 功能 5：版本号路径生成 ═══════════════
 
-def query_revision_paths(url, spec, svn_user="", svn_pass=""):
-    """按版本号查询变更文件，返回 ([(path, rev)], [错误信息])。"""
-    revisions = pathgen.parse_revision_spec(spec)
-    if not revisions:
-        raise RuntimeError("无法解析版本号，请检查格式（示例: 123 / 123,456 / 123-456）")
-    print("正在查询版本 %d ~ %d（共 %d 个版本）..." % (revisions[0], revisions[-1], len(revisions)))
-    results, errors = [], []
-    for rev in revisions:
-        rc, out = pathgen.run_svn_command(["log", "--xml", "-v", "-r", str(rev), url], svn_user, svn_pass)
-        if rc != 0:
-            errors.append("版本 %d: 查询失败 - %s" % (rev, out[:200].strip()))
-            continue
-        try:
-            logentry = ET.fromstring(out).find(".//logentry")
-            if logentry is None:
-                errors.append("版本 %d: 未找到日志条目" % rev)
-                continue
-            paths = logentry.findall("paths/path")
-            if not paths:
-                errors.append("版本 %d: 无变更文件" % rev)
-                continue
-            for p in paths:
-                if p.get("kind", "") != "file":
-                    continue  # 只保留文件，过滤掉目录
-                path_text = p.text.strip() if p.text else ""
-                if path_text:
-                    results.append((path_text, rev))
-        except ET.ParseError as e:
-            errors.append("版本 %d: XML 解析错误 - %s" % (rev, e))
-    return results, errors
-
-
-def sort_revision_urls(results, base_url, sort_key):
-    base_url = base_url.rstrip("/")
-    rows = []
-    for path_text, rev in results:
-        if not path_text.startswith("/"):
-            path_text = "/" + path_text
-        rows.append((base_url + path_text + "(V%d)" % rev, rev, path_text))
-    if sort_key == "path":
-        rows.sort(key=lambda x: x[0].lower())
-    elif sort_key == "name":
-        rows.sort(key=lambda x: (os.path.basename(x[2]).lower(), x[0].lower()))
-    else:
-        rows.sort(key=lambda x: (x[1], x[0].lower()))
-    return [row[0] for row in rows]
-
 
 def run_paths(url, spec, sort_key="rev", svn_user="", svn_pass="", out=None, do_copy=False):
     banner("版本号路径生成")
-    results, errors = query_revision_paths(url, spec, svn_user, svn_pass)
-    urls = sort_revision_urls(results, url, sort_key)
+    print("正在查询 SVN 版本路径...")
+    results, errors = pathgen.query_revision_paths(url, spec, svn_user, svn_pass)
+    rows = pathgen.build_revision_url_rows(results, url, sort_key)
+    urls = [row[0] for row in rows]
     if urls:
         text = "\n".join(urls)
         if out:
@@ -585,6 +559,60 @@ def run_paths(url, spec, sort_key="rev", svn_user="", svn_pass="", out=None, do_
         if len(errors) > 10:
             print("... 还有 %d 个错误" % (len(errors) - 10))
     return bool(urls)
+
+
+# ═══════════════ 功能 6：标准文件获取 ═══════════════
+
+def run_standard(engine, lines, svn_url, target, mode, title, standard_path, historical_path,
+                 allow_existing=True, dry_run=False, assume_yes=False, do_commit=False, do_copy=False):
+    banner("标准文件获取")
+    service = StandardFileService(engine)
+    items, parsed, _details = service.scan(lines, svn_url, target, mode, standard_path,
+                                           historical_path, allow_existing, log="cli")
+    ready = [item for item in items if item.status == "待覆盖"]
+    print("解析 %d 个路径，可覆盖 %d 个" % (parsed, len(ready)))
+    for item in items:
+        print("[%s] %s %s" % (item.status, item.rel_path, item.detail))
+    if dry_run or not ready:
+        return bool(items)
+    if not assume_yes:
+        if not is_tty() or not ask_yes_no("确认覆盖 %d 个文件？" % len(ready), default=False):
+            print("已取消")
+            return is_tty()
+    covered, errors = service.cover(ready)
+    print("覆盖完成: %d 成功, %d 失败" % (len(covered), len(errors)))
+    for error in errors:
+        print("[失败] " + error)
+    if not covered or not do_commit:
+        return bool(covered) and not errors
+    labels = {item.source_label for item in covered}
+    source_label = "标准文件/历史文件" if len(labels) > 1 else next(iter(labels))
+    ok, output, status = service.prepare_commit(target, covered)
+    if not ok:
+        if output == "目标目录没有可提交的 SVN 变更":
+            print("无需提交：覆盖后 SVN 未检测到内容变化（来源文件可能与目标完全相同）")
+            return True
+        print(output[:1000])
+        return False
+    print("\n即将提交整个目标 SVN 目录，当前 svn status：")
+    print(status.rstrip())
+    print("\n提示：未版本控制（?）文件不会自动加入，其他已修改/已登记文件会一并提交。")
+    if not assume_yes:
+        if not is_tty() or not ask_yes_no("确认提交以上变更？", default=False):
+            print("已取消提交；文件覆盖及 svn add 状态已保留")
+            return is_tty()
+    ok, output, revision, urls, _rel_paths = service.commit_working_copy(
+        target, "%s %s" % (title, source_label))
+    print(output[:1000])
+    if not ok:
+        return False
+    if revision:
+        print("提交版本: r%d" % revision)
+    if urls:
+        print("\n".join(urls))
+        if do_copy:
+            print("已复制到剪贴板" if copy_to_clipboard("\n".join(urls)) else "复制到剪贴板失败")
+    return True
 
 
 # ═══════════════ 子命令处理（参数补全 + 执行） ═══════════════
@@ -714,7 +742,7 @@ def cmd_extract(args):
 def cmd_paths(args):
     defaults = load_defaults()
     url = fill_or_die(args.url, "SVN 仓库地址", "svn_url", defaults)
-    spec = fill_or_die(args.revisions, "版本号（如 123 / 123,456 / 123-456 / 123,456-789）",
+    spec = fill_or_die(args.revisions, "版本号（如 123 / 123,456 / 123 456 / 123-456）",
                        "revisions", defaults)
     user = args.username or ""
     password = resolve_password(user, args.password)
@@ -726,6 +754,35 @@ def cmd_paths(args):
     except RuntimeError as e:
         print("错误: %s" % e, file=sys.stderr)
         return False
+
+
+def cmd_standard(args):
+    defaults = load_defaults()
+    engine = CliEngine()
+    svn_url = fill_or_die(args.url, "客户 SVN 地址", "svn_url", defaults)
+    target = fill_or_die(args.target, "目标 SVN 目录", "target_dir", defaults,
+                         is_dir=True, must_exist=True)
+    historical = fill_or_die(args.historical, "历史文件路径", "historical_path", defaults)
+    standard = args.standard or ""
+    if args.mode == "upgrade" and not standard:
+        standard = fill_or_die(None, "KB 文件路径", "standard_path", defaults)
+    title = fill_or_die(args.title, "任务标题", "task_title", defaults)
+    user = args.username or ""
+    engine.svn_user.set(user)
+    engine.svn_pass.set(resolve_password(user, args.password))
+    smb_user, smb_pass = args.smb_user or "", args.smb_pass or ""
+    share_source = next((path for path in (standard, historical) if engine._is_share_address(path)), "")
+    if share_source and not smb_user and is_tty():
+        smb_user, smb_pass = prompt_smb_auth(engine, share_source, defaults)
+    engine.smb_user.set(smb_user)
+    engine.smb_pass.set(smb_pass)
+    with open(os.path.expanduser(args.list), "r", encoding="utf-8") as handle:
+        lines = [line.strip() for line in handle if line.strip()]
+    save_defaults(defaults, svn_url=svn_url, target_dir=target, historical_path=historical,
+                  standard_path=standard, task_title=title)
+    return run_standard(engine, lines, svn_url, target, args.mode, title, standard, historical,
+                        allow_existing=not args.skip_existing, dry_run=args.dry_run,
+                        assume_yes=args.yes, do_commit=args.commit, do_copy=args.copy)
 
 
 # ═══════════════ 交互主菜单 ═══════════════
@@ -819,8 +876,8 @@ def menu_extract(engine, _defaults):
 def menu_paths(_engine, defaults):
     url = ask("SVN 仓库地址", defaults.get("svn_url", ""), required=True)
     user, password = prompt_svn_auth(defaults)
-    print("版本号格式：单版本 123 | 多个版本 123,456,789 | 连续版本 123-456 | 联合查询 123,456-789,1000")
-    spec = ask("SVN 版本号", defaults.get("revisions", ""), required=True)
+    print("版本号格式：单版本 123 | 多个版本 123,456 或 123 456 | 连续版本 123-456 | 联合查询 123,456-789 1000")
+    spec = normalize_revision_input(ask("SVN 版本号", defaults.get("revisions", ""), required=True))
     sort_key = ask_choice("排序方式", SORT_KEYS, default_key=defaults.get("sort", "rev"))
     save_defaults(defaults, svn_url=url, svn_user=user, sort=sort_key, revisions=spec)
     try:
@@ -829,12 +886,34 @@ def menu_paths(_engine, defaults):
         print("错误: %s" % e)
 
 
+def menu_standard(engine, defaults):
+    mode = ask_choice("任务类型", [("upgrade", "升级任务"), ("secondev", "二开任务")], "upgrade")
+    title = ask("任务标题", defaults.get("task_title", ""), required=True)
+    svn_url = ask("客户 SVN 地址", defaults.get("svn_url", ""), required=True)
+    target = ask_dir("目标 SVN 目录", defaults.get("target_dir", ""), required=True, must_exist=True)
+    standard = ask("KB 文件路径", defaults.get("standard_path", ""), required=True) if mode == "upgrade" else ""
+    historical = ask("历史文件路径", defaults.get("historical_path", ""), required=True)
+    list_file = ask("文件清单文本文件", defaults.get("standard_list", ""), required=True)
+    with open(os.path.expanduser(list_file), "r", encoding="utf-8") as handle:
+        lines = [line.strip() for line in handle if line.strip()]
+    share_source = next((path for path in (standard, historical) if engine._is_share_address(path)), "")
+    smb_user, smb_pass = prompt_smb_auth(engine, share_source, defaults) if share_source else ("", "")
+    user, password = prompt_svn_auth(defaults)
+    engine.smb_user.set(smb_user); engine.smb_pass.set(smb_pass)
+    engine.svn_user.set(user); engine.svn_pass.set(password)
+    save_defaults(defaults, task_title=title, svn_url=svn_url, target_dir=target,
+                  standard_path=standard, historical_path=historical, standard_list=list_file)
+    run_standard(engine, lines, svn_url, target, mode, title, standard, historical,
+                 do_commit=ask_yes_no("覆盖后提交 SVN？", default=False))
+
+
 MENU_ITEMS = [
     ("1", "SVN 拉取", menu_checkout),
     ("2", "交叉覆盖", menu_overwrite),
     ("3", "全自动流程（拉取 → 覆盖 → 提交）", menu_auto),
     ("4", "升级清单提取", menu_extract),
     ("5", "版本号路径生成", menu_paths),
+    ("6", "标准文件获取", menu_standard),
 ]
 
 
@@ -850,14 +929,14 @@ def interactive_menu():
             print(" %s. %s" % (key, title))
         print(" 0. 退出")
         try:
-            choice = input("\n请选择功能 [1-5，0 退出]: ").strip().lower()
+            choice = input("\n请选择功能 [1-6，0 退出]: ").strip().lower()
         except EOFError:
             break
         if choice in ("0", "q", "quit", "exit"):
             break
         matched = [fn for key, _t, fn in MENU_ITEMS if key == choice]
         if not matched:
-            print("无效选择，请输入 0-5。")
+            print("无效选择，请输入 0-6。")
             continue
         try:
             matched[0](engine, defaults)
@@ -915,13 +994,31 @@ def build_parser():
 
     p = sub.add_parser("paths", help="版本号路径生成（对应 GUI 标签页 5）")
     p.add_argument("--url", help="SVN 仓库地址")
-    p.add_argument("-r", "--revisions", help="版本号，如 123 / 123,456 / 123-456 / 123,456-789")
+    p.add_argument("-r", "--revisions", help="版本号，如 123 / 123,456 / 123 456 / 123-456")
     p.add_argument("--sort", choices=["rev", "path", "name"],
                    help="排序方式：rev=按版本（默认），path=按路径，name=按文件名")
     p.add_argument("--username", help="SVN 用户名")
     p.add_argument("--password", help="SVN 密码")
     p.add_argument("-o", "--output", help="结果保存到文件（默认打印到终端）")
     p.add_argument("--copy", action="store_true", help="结果复制到剪贴板")
+
+    p = sub.add_parser("standard", help="标准文件获取（对应 GUI 标签页 6）")
+    p.add_argument("--url", help="客户 SVN 地址")
+    p.add_argument("--target", help="目标 SVN 工作副本")
+    p.add_argument("--mode", choices=["upgrade", "secondev"], default="upgrade", help="任务类型")
+    p.add_argument("--title", help="任务标题")
+    p.add_argument("--standard", help="KB 文件路径（升级任务必填）")
+    p.add_argument("--historical", help="历史文件路径")
+    p.add_argument("--list", required=True, help="文件清单文本文件，每行一个路径")
+    p.add_argument("--username", help="SVN 用户名")
+    p.add_argument("--password", help="SVN 密码")
+    p.add_argument("--smb-user", help="SMB 用户名")
+    p.add_argument("--smb-pass", help="SMB 密码")
+    p.add_argument("--skip-existing", action="store_true", help="跳过目标中已存在的文件")
+    p.add_argument("--dry-run", action="store_true", help="仅扫描预览")
+    p.add_argument("--yes", action="store_true", help="跳过覆盖确认")
+    p.add_argument("--commit", action="store_true", help="覆盖后预览并提交整个目标 SVN 目录")
+    p.add_argument("--copy", action="store_true", help="复制提交文件 URL")
 
     return parser
 
@@ -932,6 +1029,7 @@ COMMAND_HANDLERS = {
     "auto": cmd_auto,
     "extract": cmd_extract,
     "paths": cmd_paths,
+    "standard": cmd_standard,
 }
 
 
