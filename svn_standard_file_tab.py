@@ -19,12 +19,25 @@ CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WINDOWS else
 SVN_EXECUTABLE = shutil.which("svn") or "svn"
 
 def _extract_rel_path(url_or_path, svn_root):
-    """从 SVN URL 或路径中提取相对 ecology 路径"""
+    """从 SVN URL、源码路径或本地全路径中提取相对 ecology 路径。
+
+    返回 (rel_path, local_abs_path)：
+    - rel_path：相对 ecology 路径，如 src/com/api/.../DocAccService.java
+    - local_abs_path：本地全路径（含 ecology），如 D:\\work\\2104\\ecology\\src\\...；
+      非本地路径时为 None
+
+    本地全路径按 ecology 目录段裁切：D:\\...\\ecology\\src\\... -> src\\...
+    """
     text = url_or_path.strip()
     if not text:
-        return None
+        return None, None
     text = re.sub(r"^\[(red|black)\]\s*", "", text).strip()
     text = re.sub(r"\(V\d+\)", "", text).strip()
+    # 本地全路径：包含 ecology 目录段（Windows/Unix 分隔符均可）
+    m = re.search(r"(?i)ecology[\\/]", text)
+    if m:
+        rel = text[m.end():].replace("\\", "/").lstrip("/").strip("/")
+        return (rel or None), text
     rel = None
     if svn_root:
         root = svn_root.strip().rstrip("/")
@@ -36,7 +49,7 @@ def _extract_rel_path(url_or_path, svn_root):
             rel = m.group(1)
     if not rel:
         rel = text.lstrip("/")
-    return rel.strip("/") if rel else None
+    return (rel.strip("/") if rel else None), None
 
 
 def _run_svn_cmd(args, svn_user="", svn_pass="", timeout=60, workdir=None):
@@ -136,6 +149,7 @@ class SvnStandardFileTab:
         self.btn_scan = None
         self.btn_cover = None
         self.btn_commit = None
+        self.btn_commit_local = None
         self.btn_copy_svn_paths = None
         self._commit_urls = []
         self._commit_rel_paths = []
@@ -156,7 +170,7 @@ class SvnStandardFileTab:
 
     def _set_ui_busy(self, busy):
         state = tk.DISABLED if busy else tk.NORMAL
-        for btn in (self.btn_scan, self.btn_cover, self.btn_commit):
+        for btn in (self.btn_scan, self.btn_cover, self.btn_commit, self.btn_commit_local):
             if btn:
                 btn.config(state=state)
         if not busy:
@@ -167,6 +181,8 @@ class SvnStandardFileTab:
                 covered = sum(1 for r in self._scan_result if r[5] == "已覆盖")
                 if covered:
                     self.btn_commit.config(state=tk.NORMAL)
+                    if self.btn_commit_local:
+                        self.btn_commit_local.config(state=tk.NORMAL)
             self.btn_scan.config(state=tk.NORMAL)
         self.parent.update_idletasks()
 
@@ -234,7 +250,7 @@ class SvnStandardFileTab:
                 continue
             if re.match(r"^\s*\[black\]", line):
                 continue
-            rel_path = _extract_rel_path(line, svn_root)
+            rel_path, local_abs = _extract_rel_path(line, svn_root)
             if not rel_path:
                 continue
             parsed_count += 1
@@ -270,7 +286,7 @@ class SvnStandardFileTab:
             else:
                 status = "未找到来源"
                 detail = "来源目录中不存在"
-            results.append((rel_path, found_src, found_label, target_abs, dest_exists, status, detail))
+            results.append((rel_path, found_src, found_label, target_abs, dest_exists, status, detail, local_abs))
         return results, parsed_count
 
     def _start_scan(self):
@@ -311,7 +327,10 @@ class SvnStandardFileTab:
                 self._log(log)
             self._log("-" * 60)
         for r in results:
-            self._log("[%s] %s  %s" % (r[5], r[0], r[6]))
+            line = "[%s] %s  %s" % (r[5], r[0], r[6])
+            if r[7]:
+                line += "  -> 本地源: %s" % r[7]
+            self._log(line)
         self._log("-" * 60)
         if ready_count > 0:
             self.btn_cover.config(state=tk.NORMAL)
@@ -347,7 +366,7 @@ class SvnStandardFileTab:
     def _run_cover(self, ready_items):
         covered = []
         errors = []
-        for rel_path, src_file, src_label, target_abs, dest_exists, status, detail in ready_items:
+        for rel_path, src_file, src_label, target_abs, dest_exists, status, detail, local_abs in ready_items:
             if not src_file or not os.path.isfile(src_file):
                 errors.append("来源文件不存在: %s" % src_file)
                 continue
@@ -368,23 +387,26 @@ class SvnStandardFileTab:
         self._log("覆盖完成: %d 成功, %d 失败" % (len(covered), len(errors)))
         new_results = []
         for r in self._scan_result:
-            rel_path, src_file, src_label2, tgt, de, status, detail = r
+            rel_path, src_file, src_label2, tgt, de, status, detail, local_abs = r
             if status.startswith("待覆盖") and any(c[0] == rel_path for c in covered):
-                new_results.append((rel_path, src_file, src_label2, tgt, True, "已覆盖", "<- %s" % src_label2))
+                new_results.append((rel_path, src_file, src_label2, tgt, True, "已覆盖", "<- %s" % src_label2, local_abs))
             else:
                 new_results.append(r)
         self._scan_result = new_results
         self._cover_done = True
         if self.auto_commit.get() and covered:
-            self._log("\n-> 自动提交 SVN...")
+            self._log("\n-> 自动提交 SVN 标准文件...")
             self._start_commit()
         else:
             if covered:
                 self.btn_commit.config(state=tk.NORMAL)
-                self.lbl_status.config(text="覆盖完成：%d 个文件，点击提交 SVN" % len(covered), foreground="#338833")
+                if self.btn_commit_local:
+                    self.btn_commit_local.config(state=tk.NORMAL)
+                self.lbl_status.config(text="覆盖完成：%d 个文件，点击提交 SVN 标准文件" % len(covered), foreground="#338833")
             self._set_ui_busy(False)
 
     def _start_commit(self):
+        """提交 SVN 标准文件。"""
         target_dir = self.target_dir.get().strip()
         if not target_dir or not os.path.isdir(target_dir):
             messagebox.showwarning("提示", "目标 SVN 目录无效")
@@ -449,6 +471,52 @@ class SvnStandardFileTab:
             finally:
                 self.parent.after(0, lambda: self._set_ui_busy(False))
         threading.Thread(target=run, daemon=True).start()
+
+    def _start_local_cover(self):
+        """把文件清单中的本地 ecology 文件覆盖到目标 SVN 文件（不执行 SVN 提交）。"""
+        items = [r for r in self._scan_result if r[7] and r[5] == "已覆盖"]
+        if not items:
+            messagebox.showinfo("提示", "没有可覆盖的本地文件")
+            return
+        self._set_ui_busy(True)
+        self._log("\n开始用 %d 个本地文件覆盖目标 SVN 文件（不提交 SVN）..." % len(items))
+
+        def run():
+            try:
+                ok_cnt, errs = self._overwrite_local_files(items)
+                self.parent.after(0, lambda ok=ok_cnt, nerr=len(errs): self._log(
+                    "本地文件覆盖 SVN 完成: %d 成功, %d 失败" % (ok, nerr)))
+                for e in errs:
+                    self.parent.after(0, lambda e=e: self._log("覆盖 SVN 失败 %s" % e))
+                self.parent.after(0, lambda ok=ok_cnt, nerr=len(errs): self.lbl_status.config(
+                    text="本地文件覆盖 SVN 完成：%d 成功, %d 失败" % (ok, nerr),
+                    foreground="#338833" if not errs else "#cc8800"))
+            except Exception as e:
+                self.parent.after(0, lambda e=e: self._log("本地文件覆盖 SVN 异常: %s" % e))
+                self.parent.after(0, lambda: self.lbl_status.config(text="本地文件覆盖 SVN 异常", foreground="#cc4444"))
+            finally:
+                self.parent.after(0, lambda: self._set_ui_busy(False))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _overwrite_local_files(self, items):
+        """把文件清单中的本地 ecology 全路径复制到目标 SVN 文件（仅覆盖，不提交 SVN）。
+
+        items: 扫描结果行（8 元组，r[7] 为本地全路径）
+        返回 (成功数, [错误信息])
+        """
+        ok = 0
+        errors = []
+        for rel_path, _src_file, _src_label, target_abs, _de, _status, _detail, local_abs in items:
+            if not local_abs or not os.path.isfile(local_abs):
+                errors.append("%s: 本地文件不存在" % local_abs)
+                continue
+            try:
+                os.makedirs(os.path.dirname(target_abs), exist_ok=True)
+                shutil.copy2(local_abs, target_abs)
+                ok += 1
+            except Exception as e:
+                errors.append("%s: %s" % (local_abs, e))
+        return ok, errors
 
     def _parse_revision_from_out(self, out):
         m = re.search(r"Committed revision (\d+)", out)
@@ -578,7 +646,7 @@ class SvnStandardFileTab:
         sec5.rowconfigure(1, weight=1)
         btn_bar = ttk.Frame(sec5)
         btn_bar.grid(row=0, column=0, columnspan=2, sticky=tk.EW, pady=(0, 4))
-        ttk.Label(btn_bar, text="粘贴源码路径列表（每行一个，如 src/com/api/.../DocAccService.java）：").pack(side=tk.LEFT)
+        ttk.Label(btn_bar, text="粘贴路径列表（每行一个：源码路径 src/... 或本地全路径 D:\\...\\ecology\\src\\...；提交后用于覆盖 SVN 文件）：").pack(side=tk.LEFT)
         ttk.Button(btn_bar, text="从剪贴板粘贴", command=self._paste_from_clipboard).pack(side=tk.RIGHT, padx=(4, 0))
         ttk.Button(btn_bar, text="清空", command=self._clear_file_list).pack(side=tk.RIGHT, padx=(4, 0))
         self.txt_file_list = scrolledtext.ScrolledText(sec5, height=8, font=("Consolas", 9), wrap=tk.NONE)
@@ -601,8 +669,10 @@ class SvnStandardFileTab:
         self.btn_scan.pack(side=tk.LEFT, padx=(0, 8))
         self.btn_cover = ttk.Button(btn_row, text="确认覆盖", command=self._start_cover, width=14, state=tk.DISABLED)
         self.btn_cover.pack(side=tk.LEFT, padx=(0, 8))
-        self.btn_commit = ttk.Button(btn_row, text="提交 SVN", command=self._start_commit, width=14, state=tk.DISABLED)
+        self.btn_commit = ttk.Button(btn_row, text="提交 SVN 标准文件", command=self._start_commit, width=18, state=tk.DISABLED)
         self.btn_commit.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_commit_local = ttk.Button(btn_row, text="提交后覆盖本地", command=self._start_local_cover, width=14, state=tk.DISABLED)
+        self.btn_commit_local.pack(side=tk.LEFT, padx=(0, 8))
         self.btn_copy_svn_paths = ttk.Button(btn_row, text="复制提交文件路径", command=self._copy_commit_paths, state=tk.DISABLED)
         self.btn_copy_svn_paths.pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(btn_row, text="清空日志", command=self._clear_log).pack(side=tk.RIGHT)
