@@ -129,8 +129,9 @@ def _load_customer_env_info(filepath):
 class SvnStandardFileTab:
     """标准文件获取 Tab"""
 
-    def __init__(self, parent):
+    def __init__(self, parent, engine=None):
         self.parent = parent
+        self.engine = engine
         self.svn_user = tk.StringVar()
         self.svn_pass = tk.StringVar()
         self.task_title = tk.StringVar()
