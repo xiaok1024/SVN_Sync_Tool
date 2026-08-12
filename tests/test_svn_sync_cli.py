@@ -57,9 +57,10 @@ class CliConfigTest(unittest.TestCase):
 
     def test_cli_reuses_shared_macos_html_clipboard_reader(self):
         engine = cli.CliEngine()
-        with mock.patch.object(cli.core, "IS_WINDOWS", False), \
-                mock.patch.object(cli.core, "IS_MACOS", True), \
-                mock.patch.object(cli.core, "read_clipboard_html_macos", return_value="<b>QC</b>"):
+        with mock.patch.object(cli, "IS_WINDOWS", False), \
+                mock.patch.object(cli, "IS_MACOS", True), \
+                mock.patch.object(
+                    cli.clipboard_core, "read_clipboard_html_macos", return_value="<b>QC</b>"):
             text, kind = engine._read_clipboard_content()
         self.assertEqual((text, kind), ("<b>QC</b>", "html"))
 

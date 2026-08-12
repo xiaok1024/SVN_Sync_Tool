@@ -108,6 +108,32 @@ def build_revision_url_rows(results, base_url, sort_key="rev"):
     return rows
 
 
+def sort_existing_urls(lines, sort_key="rev"):
+    """对已有的 ``(V版本)`` URL/路径排序，返回非空原文行。"""
+    sort_key = {
+        "按版本排序": "rev",
+        "按路径排序": "path",
+        "按文件名排序": "name",
+    }.get(sort_key, sort_key)
+    parsed = []
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = re.search(r"\([Vv](\d+)\)", line)
+        revision = int(match.group(1)) if match else 0
+        path_text = line[:match.start()] + line[match.end():] if match else line
+        filename = path_text.rstrip("/\\").replace("\\", "/").rsplit("/", 1)[-1]
+        parsed.append((line, revision, filename))
+    if sort_key == "path":
+        parsed.sort(key=lambda item: item[0].lower())
+    elif sort_key == "name":
+        parsed.sort(key=lambda item: (item[2].lower(), item[0].lower()))
+    else:
+        parsed.sort(key=lambda item: (item[1], item[0].lower()))
+    return [item[0] for item in parsed]
+
+
 class SvnPathGeneratorTab:
     """SVN 版本号路径生成 Tab
     
@@ -261,31 +287,10 @@ class SvnPathGeneratorTab:
         
         sort_mode = self.sort_mode.get()
         
-        # 解析每行为 (url, revision, filename) 元组
-        parsed = []
-        for line in lines:
-            rev = 0
-            text = line
-            # 尝试提取 (Vxxx) 格式的版本号
-            m = re.search(r'\(V(\d+)\)', text)
-            if m:
-                rev = int(m.group(1))
-                text = text[:m.start()] + text[m.end():]
-            filename = os.path.basename(text.rstrip("/"))
-            parsed.append((line, rev, filename))
-        
-        # 排序
-        if sort_mode == "按路径排序":
-            parsed.sort(key=lambda x: x[0].lower())
-        elif sort_mode == "按版本排序":
-            parsed.sort(key=lambda x: (x[1], x[0].lower()))
-        elif sort_mode == "按文件名排序":
-            parsed.sort(key=lambda x: (x[2].lower(), x[0].lower()))
-        
-        sorted_lines = [p[0] for p in parsed]
+        sorted_lines = sort_existing_urls(lines, sort_mode)
         
         self._generated_urls = sorted_lines
-        self._generated_results = [(p[0], p[1]) for p in parsed]
+        self._generated_results = []
         
         self.txt_preview.config(state=tk.NORMAL)
         self.txt_preview.delete(1.0, tk.END)

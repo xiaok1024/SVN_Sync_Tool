@@ -5,9 +5,15 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from pathlib import Path
 
 from svn_sync_core import SyncEngine, decode_svn_output
-from svn_standard_file_core import StandardFileItem, StandardFileService, extract_relative_path
+from svn_standard_file_core import (
+    StandardFileItem,
+    StandardFileService,
+    extract_relative_path,
+    parse_file_input,
+)
 
 
 class FakeEngine:
@@ -57,6 +63,19 @@ class StandardFileCoreTest(unittest.TestCase):
                                   "https://svn.example.com/svn/customer/ecology"),
             "src/A.java")
 
+    def test_parse_file_input_recognizes_only_absolute_local_ecology_paths(self):
+        windows_path = r"D:\work\2104\ecology\src\com\A.java"
+        relative, local_source = parse_file_input(windows_path)
+        self.assertEqual(relative, "src/com/A.java")
+        self.assertEqual(local_source, windows_path)
+
+        svn_url = "https://svn.example.com/svn/customer/ecology/src/com/A.java(V12)"
+        relative, local_source = parse_file_input(
+            svn_url, "https://svn.example.com/svn/customer/ecology")
+        self.assertEqual(relative, "src/com/A.java")
+        self.assertIsNone(local_source)
+        self.assertEqual(parse_file_input(r"D:\work\ecology\..\outside.txt"), (None, None))
+
     def test_scan_prefers_standard_ecology_directory(self):
         engine = FakeEngine()
         service = StandardFileService(engine)
@@ -91,6 +110,37 @@ class StandardFileCoreTest(unittest.TestCase):
             items, _parsed, _details = service.scan(["src/A.java"], "", target, "upgrade", standard, "")
             self.assertEqual(items[0].status, "内容相同")
 
+    def test_local_source_is_preserved_and_can_overwrite_after_standard_cover(self):
+        engine = FakeEngine()
+        service = StandardFileService(engine)
+        with tempfile.TemporaryDirectory() as root:
+            target = os.path.join(root, "target")
+            standard = os.path.join(root, "standard")
+            local_source = os.path.join(root, "work", "ecology", "src", "A.java")
+            standard_source = os.path.join(standard, "ecology", "src", "A.java")
+            os.makedirs(target)
+            os.makedirs(os.path.dirname(local_source))
+            os.makedirs(os.path.dirname(standard_source))
+            with open(local_source, "w", encoding="utf-8") as handle:
+                handle.write("local")
+            with open(standard_source, "w", encoding="utf-8") as handle:
+                handle.write("standard")
+
+            items, parsed, _details = service.scan(
+                [local_source], "", target, "upgrade", standard, "")
+            self.assertEqual(parsed, 1)
+            self.assertEqual(items[0].local_source_file, local_source)
+            covered, errors = service.cover(items)
+            self.assertFalse(errors)
+            with open(items[0].target_file, "r", encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "standard")
+
+            copied, errors = service.overwrite_from_local_sources(target, covered)
+            self.assertFalse(errors)
+            self.assertEqual([item.rel_path for item in copied], ["src/A.java"])
+            with open(items[0].target_file, "r", encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "local")
+
     def test_prepare_adds_only_covered_files_then_commits_target_root(self):
         engine = FakeEngine()
         service = StandardFileService(engine)
@@ -117,7 +167,7 @@ class StandardFileCoreTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             repo = os.path.join(root, "repo")
             wc = os.path.join(root, "wc")
-            repo_url = "file://" + repo
+            repo_url = Path(repo).as_uri()
             subprocess.run(["svnadmin", "create", repo], check=True, capture_output=True)
             subprocess.run(["svn", "mkdir", repo_url + "/trunk", "-m", "init"], check=True,
                            capture_output=True)

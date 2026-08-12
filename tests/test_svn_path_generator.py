@@ -39,6 +39,16 @@ class RevisionSpecTest(unittest.TestCase):
             "https://svn.example.com/svn/customer/ecology/src/测试.java(V499)",
         ])
 
+    def test_sort_existing_urls_supports_all_three_modes(self):
+        lines = [
+            "https://example/svn/c/B.java(V20)",
+            "https://example/svn/c/A.java(V100)",
+            "https://example/svn/c/Z.java(V3)",
+        ]
+        self.assertEqual(path_generator.sort_existing_urls(lines, "rev")[0], lines[2])
+        self.assertEqual(path_generator.sort_existing_urls(lines, "path")[0], lines[1])
+        self.assertEqual(path_generator.sort_existing_urls(lines, "name")[0], lines[1])
+
 
 if __name__ == "__main__":
     unittest.main()
