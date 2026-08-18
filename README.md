@@ -7,7 +7,7 @@
 - **现代图形界面**（`svn_sync_qt.py`）：Windows 主要使用方式，基于 PySide6 / Qt Widgets，打包为 exe 分发。
 - **旧版图形界面**（`svn_sync_tool.py`）：保留为迁移期功能对照和回归入口，不再作为 Windows 正式打包入口。
 - **终端版**（`svn_sync_cli.py`）：macOS 推荐使用方式，功能与 GUI 的 6 个页面一一对应，支持交互式菜单和命令行参数两种用法，详见下方「终端版」章节。macOS 不再更新 `.app` 打包产物。
-- **本地 Web 预览**（`svn_sync_web.py`）：第一阶段提供“升级清单提取”，浏览器完成富文本粘贴、校对、生成、复制与下载；当前固定监听 `127.0.0.1`，尚未开放局域网访问。
+- **本地 Web 预览**（`svn_sync_web.py`）：提供“升级清单提取”和“SVN 标准文件提交”；标准文件任务使用隔离的临时稀疏工作副本与用户自己的 SVN 凭据。当前固定监听 `127.0.0.1`，尚未开放局域网访问。
 
 A Windows Qt GUI and macOS CLI tool for checking out code from SVN, overwriting cross-referenced files from a local organized directory (or network share), and automatically committing changes.
 
@@ -114,7 +114,12 @@ python3 svn_sync_cli.py standard --url https://svn.example.com/svn/cust/ecology 
 
 ## 本地 Web 预览
 
-第一阶段 Web 版只提供无状态、只读的“升级清单提取”，直接复用 `upgrade_list_core.py`，服务端不会读取主机剪贴板、写入文件或执行 SVN。用户粘贴的 HTML、校对清单和生成结果只保留在当前浏览器页面与本次请求内；主动点击下载时，浏览器才会把生成的 Markdown 保存到用户选择的位置。
+Web 版当前包含两个相互隔离的工作区：
+
+- **升级清单提取**：直接复用 `upgrade_list_core.py`。服务端不读取主机剪贴板、不保存输入和生成结果；主动点击下载时，浏览器才会保存 Markdown。
+- **SVN 标准文件提交**：每个任务先读取客户 SVN 检出根的最新 HEAD，并将其固定为数字 revision；随后创建独立稀疏工作副本、匹配客户标准目录、覆盖并生成 `svn status` 预览。用户二次确认后才精确提交本次路径，成功后立即删除工作副本和独立 SVN 配置。失败、取消或 15 分钟未确认的任务也会清理，后台每 15 秒检查一次到期状态。
+
+第二个工作区只允许用户填写固定共享根 `\\192.168.7.215\ECOLOGY_customer` 下形如 `分组\客户\QC编号\ecology` 的客户标准目录；不能填写其他服务器、本机绝对路径或任意共享。SMB 账号由服务端统一管理，浏览器不会接收或返回 SMB 凭据。
 
 ### 安装独立 Web 环境
 
@@ -124,6 +129,33 @@ python3 -m venv .venv-web
 ```
 
 ### 启动
+
+先配置固定标准文件共享。若该共享已经挂载，可把挂载根配置为本地路径：
+
+```bash
+export SVN_SYNC_WEB_STANDARD_PATH='/Volumes/ECOLOGY_customer'
+export SVN_SYNC_WEB_STANDARD_UNC_PREFIX='\\192.168.7.215\ECOLOGY_customer'
+export SVN_SYNC_WEB_SOURCE_LABEL='E9 标准文件共享'
+
+# 推荐同时限制网站允许连接的 SVN 前缀；多个前缀用逗号分隔
+export SVN_SYNC_WEB_ALLOWED_SVN_PREFIXES='https://svn.example.com/svn/'
+```
+
+若尚未挂载，配置本机已有的 SMB 凭据文件。服务会读取其中的 `[standard]`，自动挂载并在任务间复用，服务停止时只卸载自己创建的临时挂载；该文件不得加入 Git：
+
+```bash
+export E9_SMB_CREDENTIALS_FILE='/绝对路径/e9-smb-credentials.toml'
+```
+
+也可使用 `SVN_SYNC_WEB_SMB_CREDENTIALS_FILE` 覆盖上述变量。多个固定来源 Profile 可使用 JSON 数组：
+
+```bash
+export SVN_SYNC_WEB_SOURCE_PROFILES='[
+  {"id":"e9-default","label":"E9 标准文件共享","standard_path":"/Volumes/ECOLOGY_customer","unc_prefix":"\\\\192.168.7.215\\ECOLOGY_customer"}
+]'
+```
+
+然后启动：
 
 ```bash
 .venv-web/bin/python svn_sync_web.py
@@ -139,14 +171,23 @@ python3 -m venv .venv-web
 - 生成人读 Markdown 与 AI Markdown；
 - 在浏览器复制结果或下载 `.md` 文件；
 - 下载文件自动使用客户名作为前缀，并清理 Windows / macOS 不支持的文件名字符；
-- 加载内置示例快速体验完整流程。
+- 加载内置示例快速体验升级清单流程；
+- 标准文件清单只接受 `ecology` 下的相对文件路径，不解析 URL、`$/...` 或颜色标记；
+- 清单非空时只覆盖列出的、且 SVN 与客户标准目录同时存在的文件；任一项只存在一端会阻止整个任务；
+- 清单留空时必须额外勾选确认，服务会在该 SVN 最新 revision 与客户标准目录之间求文件交集，只覆盖交集，不会 `svn add` 标准目录独有文件；
+- 每个 SVN 任务强制使用 `--config-dir`、`--no-auth-cache` 和 `--password-from-stdin`，不会读取或写入主机 SVN 认证缓存；
+- 提交预览使用一次性确认令牌和幂等键，重复点击不会再次执行同一任务的 `svn commit`；
+- 实际提交说明会追加唯一的 `LZR-WEB` 核验标记，若网络超时可据此在 SVN 日志中确认是否已经提交；
+- 为保证下载前能够可靠预留磁盘容量，检出根目录（含继承）和目标文件的祖先目录暂不能带 SVN 属性；远端文件只接受 `svn:eol-style`、`svn:executable`、`svn:needs-lock` 三种安全内建属性，含 `svn:keywords`、特殊文件、自定义或未知属性的任务会在真正 checkout/update 前停止；
+- 默认最多同时执行 2 个任务、保留 10 个活跃任务，单任务临时目录上限 1 GiB；成功后立即清理。
 
-> 当前版本特意只监听本机回环地址。登录、HTTPS、审计和提交身份隔离完成前，不得改为 `0.0.0.0` 直接开放局域网访问。
+> 当前版本仍特意只监听本机回环地址。虽然 SVN 凭据和临时目录已经按任务隔离，但在增加 HTTPS、登录会话、CSRF/Origin 防护和审计前，不得改为 `0.0.0.0` 直接开放局域网访问，否则浏览器到服务端之间的 SVN 密码会经过明文 HTTP。
 
 Web 专项测试：
 
 ```bash
-.venv-web/bin/python -m unittest tests.test_web_upgrade_service tests.test_web_app -v
+.venv-web/bin/python -m unittest \
+  tests.test_web_upgrade_service tests.test_web_standard_service tests.test_web_app -v
 ```
 
 ---
@@ -345,6 +386,7 @@ python3 svn_sync_cli.py
 ├── clipboard_core.py                   # Windows/macOS HTML 剪贴板适配
 ├── svn_sync_web.py                     # 本地 Web 启动入口（固定 127.0.0.1）
 ├── web_app.py / web_upgrade_service.py # Web API 与升级清单适配层
+├── web_standard_service.py             # Web 标准文件临时任务、凭据隔离与清理
 ├── web/                                # HTML 模板及本地 CSS/JavaScript
 ├── SVN_Sync_Tool.spec                  # 现代 GUI 的 Windows PyInstaller 配置
 ├── tests/                              # 核心、安全门与职责边界回归测试

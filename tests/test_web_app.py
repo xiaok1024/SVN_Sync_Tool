@@ -34,6 +34,7 @@ class WebAppApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("升级工具中心", response.text)
         self.assertIn("LZR", response.text)
+        self.assertIn("SVN 标准文件提交", response.text)
         self.assertIn("default-src 'self'", response.headers["content-security-policy"])
         self.assertEqual(response.headers["x-frame-options"], "DENY")
         self.assertEqual(response.headers["cache-control"], "no-store")
@@ -42,6 +43,51 @@ class WebAppApiTest(unittest.TestCase):
         response = self.client.get("/api/health")
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["ok"])
+
+    def test_standard_source_profiles_do_not_expose_server_paths(self):
+        response = self.client.get("/api/v1/standard-files/source-profiles")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["ok"])
+        self.assertNotIn("standard_path", response.text)
+        self.assertNotIn("historical_path", response.text)
+
+    def test_standard_task_rejects_unconfigured_source_without_echoing_password(self):
+        password = "do-not-echo-this-password"
+        response = self.client.post(
+            "/api/v1/standard-files/tasks",
+            json={
+                "svn_url": "https://svn.example.com/svn/customer/ecology",
+                "svn_username": "demo-user",
+                "svn_password": password,
+                "source_profile_id": "missing",
+                "customer_standard_path": r"\\192.168.7.215\ECOLOGY_customer\Y\示例客户\QC123456\ecology",
+                "file_list": "src/A.java",
+                "cover_all_confirmed": False,
+                "commit_message": "QC123456 标准文件",
+            },
+        )
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["error"]["code"], "source_profile_not_found")
+        self.assertNotIn(password, response.text)
+
+    def test_standard_task_rejects_arbitrary_server_path_fields(self):
+        response = self.client.post(
+            "/api/v1/standard-files/tasks",
+            json={
+                "svn_url": "https://svn.example.com/svn/customer/ecology",
+                "svn_username": "demo-user",
+                "svn_password": "demo-password",
+                "source_profile_id": "missing",
+                "customer_standard_path": r"\\192.168.7.215\ECOLOGY_customer\Y\示例客户\QC123456\ecology",
+                "file_list": "src/A.java",
+                "cover_all_confirmed": False,
+                "commit_message": "QC123456 标准文件",
+                "standard_path": "/tmp/should-not-be-accepted",
+            },
+        )
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["error"]["code"], "invalid_field")
 
     def test_extract_and_generate_round_trip(self):
         extract = self.client.post(
@@ -99,6 +145,12 @@ class WebAppApiTest(unittest.TestCase):
     def test_untrusted_host_is_rejected(self):
         response = self.client.get("/", headers={"host": "untrusted.example"})
         self.assertEqual(response.status_code, 400)
+
+    def test_local_mac_mini_hostname_is_allowed(self):
+        response = self.client.get(
+            "/api/health", headers={"host": "lzr-mac-mini.local:8765"})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["ok"])
 
     def test_static_route_cannot_read_repository_files(self):
         response = self.client.get("/static/%2e%2e/README.md")

@@ -6,6 +6,8 @@ import os
 import posixpath
 import re
 import shutil
+import tempfile
+import urllib.parse
 from dataclasses import dataclass
 
 
@@ -30,6 +32,30 @@ def _normalize_relative_path(relative):
     return normalized
 
 
+def parse_repository_relative_input(value, svn_root=""):
+    """把 ``$/仓库/路径`` 严格映射到当前 checkout 根，拒绝其他仓库/子根。"""
+    text = (value or "").strip()
+    if not text.startswith("$/"):
+        return None
+    relative = urllib.parse.unquote(text[2:].lstrip("/"))
+    root = (svn_root or "").strip()
+    if root:
+        root_path = urllib.parse.unquote(urllib.parse.urlsplit(root).path).strip("/")
+        root_parts = [part for part in root_path.split("/") if part]
+        svn_indexes = [
+            index for index, part in enumerate(root_parts) if part.lower() == "svn"]
+        if not svn_indexes or svn_indexes[0] + 1 >= len(root_parts):
+            return None
+        checkout_from_repo = "/".join(root_parts[svn_indexes[0] + 1:])
+        if relative == checkout_from_repo:
+            relative = ""
+        elif relative.startswith(checkout_from_repo + "/"):
+            relative = relative[len(checkout_from_repo) + 1:]
+        else:
+            return None
+    return _normalize_relative_path(relative)
+
+
 def parse_file_input(url_or_path, svn_root=""):
     """解析清单输入，返回 ``(ecology 相对路径, 本地源文件)``。
 
@@ -40,7 +66,10 @@ def parse_file_input(url_or_path, svn_root=""):
     if not text:
         return None, None
     text = re.sub(r"^\[(?:red|black)\]\s*", "", text, flags=re.I)
-    text = re.sub(r"\([Vv]\d+\)\s*$", "", text).strip()
+    text = re.sub(r"\([Vv]\d+\)(?:\s*[-—].*)?\s*$", "", text).strip()
+
+    if text.startswith("$/"):
+        return parse_repository_relative_input(text, svn_root), None
 
     is_windows_absolute = bool(re.match(r"^[A-Za-z]:[\\/]", text))
     is_unc = text.startswith(("\\\\", "//")) and not re.match(r"^//[^/]+/svn/", text, re.I)
@@ -52,13 +81,25 @@ def parse_file_input(url_or_path, svn_root=""):
             return relative, text if relative else None
 
     root = (svn_root or "").strip().rstrip("/")
-    if root and text.startswith(root + "/"):
+    if re.match(r"https?://", text, re.I):
+        parsed_text = urllib.parse.urlsplit(text)
+        decoded_path = urllib.parse.unquote(parsed_text.path)
+        parsed_root = urllib.parse.urlsplit(root) if root else None
+        decoded_root_path = urllib.parse.unquote(parsed_root.path).rstrip("/") if parsed_root else ""
+        same_origin = bool(parsed_root) and (
+            parsed_text.scheme.lower(), parsed_text.hostname, parsed_text.port
+        ) == (
+            parsed_root.scheme.lower(), parsed_root.hostname, parsed_root.port
+        )
+        if same_origin and decoded_root_path and decoded_path.startswith(decoded_root_path + "/"):
+            relative = decoded_path[len(decoded_root_path) + 1:]
+        else:
+            match = re.search(r"/svn/[^/]+/(.*)", decoded_path)
+            if not match:
+                return None, None
+            relative = match.group(1)
+    elif root and text.startswith(root + "/"):
         relative = text[len(root) + 1:]
-    elif re.match(r"https?://", text, re.I):
-        match = re.search(r"/svn/[^/]+/(.*)", text)
-        if not match:
-            return None, None
-        relative = match.group(1)
     else:
         relative = text.lstrip("/\\")
     return _normalize_relative_path(relative), None
@@ -66,6 +107,29 @@ def parse_file_input(url_or_path, svn_root=""):
 
 def extract_relative_path(url_or_path, svn_root=""):
     return parse_file_input(url_or_path, svn_root)[0]
+
+
+def iter_standard_file_lines(lines):
+    """过滤清单中的标题/黑色上下文行，产出需要处理的文件行。
+
+    同时兼容 ``[red] URL`` 与颜色标记单独占一行的升级清单格式。
+    未标色的普通文件行保持既有行为，继续参与标准文件扫描。
+    """
+    pending_color = None
+    for raw_line in lines:
+        line = (raw_line or "").strip()
+        if not line or line.startswith(("#", "//")) or re.match(r"^QC\d+\b", line, re.I):
+            continue
+        color_only = re.fullmatch(r"\[(red|black)\]", line, re.I)
+        if color_only:
+            pending_color = color_only.group(1).lower()
+            continue
+        inline_color = re.match(r"^\[(red|black)\]\s*", line, re.I)
+        color = inline_color.group(1).lower() if inline_color else pending_color
+        pending_color = None
+        if color == "black":
+            continue
+        yield line
 
 
 def _safe_child(root, relative):
@@ -92,9 +156,7 @@ class StandardFileService:
         if historical_path:
             sources.append((self.engine._resolve_source_path(historical_path, log), "历史文件"))
         results, details, parsed_count = [], [], 0
-        for line in lines:
-            if not line or line.startswith(("#", "//")) or re.match(r"^\s*\[black\]", line, re.I):
-                continue
+        for line in iter_standard_file_lines(lines):
             relative, local_source_file = parse_file_input(line, svn_root)
             if not relative:
                 details.append("  [SKIP] 非法或无法识别的路径: %s" % line)
@@ -188,7 +250,7 @@ class StandardFileService:
             add_outputs.append(add_out)
             if rc != 0:
                 return False, "登记本次覆盖文件失败: %s\n%s" % (path, add_out), ""
-        rc, status_out = self.engine._run_svn_bytes("status", target_root)
+        rc, status_out = self.engine._run_svn_bytes("status", ".", cwd=target_root)
         if rc != 0:
             return False, "读取待提交清单失败: " + status_out, ""
         if not status_out.strip():
@@ -206,6 +268,45 @@ class StandardFileService:
             return True, commit_out, None, [], []
         urls, relative_paths = self.engine._get_revision_urls(target_dir, revision)
         return True, commit_out, revision, urls, relative_paths
+
+    def commit_selected_paths(self, target_dir, relative_paths, message):
+        """提交经过调用方预览确认的精确路径集合。"""
+        target_root = os.path.realpath(os.path.abspath(target_dir))
+        safe_targets = []
+        for relative in dict.fromkeys(relative_paths):
+            normalized = _normalize_relative_path(relative)
+            if not normalized:
+                raise ValueError("拒绝提交非法相对路径: " + str(relative))
+            safe_targets.append(_safe_child(target_root, normalized))
+        if not safe_targets:
+            return False, "没有已确认的 SVN 路径可提交", None, [], []
+
+        targets_file = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                    "w", encoding="utf-8", newline="\n", delete=False) as handle:
+                targets_file = handle.name
+                for path in safe_targets:
+                    handle.write(path + "\n")
+            rc, commit_out = self.engine._run_svn(
+                None, "commit", "--targets", targets_file, "-m", message)
+        finally:
+            if targets_file:
+                try:
+                    os.remove(targets_file)
+                except OSError:
+                    pass
+        if rc != 0:
+            return False, commit_out, None, [], []
+        revision = self.engine._parse_revision(commit_out)
+        if not revision:
+            return True, commit_out, None, [], []
+        try:
+            urls, committed_paths = self.engine._get_revision_urls(target_dir, revision)
+        except (OSError, RuntimeError, TimeoutError):
+            # 提交已明确成功时，后续 URL 查询失败不能把结果误判成提交未知。
+            urls, committed_paths = [], []
+        return True, commit_out, revision, urls, committed_paths
 
     def commit(self, target_dir, covered_items, message):
         """非交互兼容入口；GUI/CLI 应优先分别调用 prepare_commit 和 commit_working_copy。"""

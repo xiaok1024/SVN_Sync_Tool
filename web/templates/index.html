@@ -28,10 +28,20 @@
   </header>
 
   <main class="site-main" id="workspace">
+    <nav class="tool-switch" aria-label="工具功能">
+      <a href="#upgrade-list" data-tool-link="upgrade" aria-current="page">
+        <span>01</span>升级清单提取
+      </a>
+      <a href="#svn-standard" data-tool-link="standard">
+        <span>02</span>SVN 标准文件提交
+      </a>
+    </nav>
+
+    <section id="upgradeToolView" data-tool-view="upgrade">
     <section class="intro" aria-labelledby="page-title">
       <div class="intro-copy">
         <p class="eyebrow">UPGRADE LIST · 01</p>
-        <h1 id="page-title">把升级清单整理成<br>清晰、可靠的交付结果。</h1>
+        <h1 id="page-title" tabindex="-1">把升级清单整理成<br>清晰、可靠的交付结果。</h1>
         <p class="intro-description">粘贴带颜色的富文本清单，校对红黑文件标记，一次生成人读与 AI Markdown。</p>
       </div>
       <div class="local-note">
@@ -163,12 +173,206 @@
         </div>
       </div>
     </section>
+    </section>
+
+    <section id="standardToolView" data-tool-view="standard" hidden>
+      <section class="intro standard-intro" aria-labelledby="standard-page-title">
+        <div class="intro-copy">
+          <p class="eyebrow">STANDARD FILES · 02</p>
+          <h1 id="standard-page-title" tabindex="-1">在提交之前，<br>看清每一个文件。</h1>
+          <p class="intro-description">可按相对路径清单处理，也可安全覆盖两端共有文件；任务始终基于 SVN 最新版本生成预览，确认后再使用你的账号提交。</p>
+        </div>
+        <div class="local-note">
+          <span class="local-note-icon shield-icon" aria-hidden="true"></span>
+          <div>
+            <strong>凭据不落盘</strong>
+            <span>不使用本机 SVN 缓存，临时目录自动清理</span>
+          </div>
+        </div>
+      </section>
+
+      <ol class="flow-steps standard-flow-steps" aria-label="标准文件提交流程">
+        <li class="flow-step is-active" data-standard-stage="form">
+          <span class="step-index">01</span><span><strong>配置任务</strong><small>地址、账号与清单</small></span>
+        </li>
+        <li class="flow-step" data-standard-stage="checkout">
+          <span class="step-index">02</span><span><strong>临时检出</strong><small>只拉相关路径</small></span>
+        </li>
+        <li class="flow-step" data-standard-stage="preview">
+          <span class="step-index">03</span><span><strong>覆盖预览</strong><small>核对每项变更</small></span>
+        </li>
+        <li class="flow-step" data-standard-stage="commit">
+          <span class="step-index">04</span><span><strong>确认提交</strong><small>一次性授权</small></span>
+        </li>
+        <li class="flow-step" data-standard-stage="cleanup">
+          <span class="step-index">05</span><span><strong>自动清理</strong><small>释放临时空间</small></span>
+        </li>
+      </ol>
+
+      <div class="standard-layout">
+        <article class="panel standard-form-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">CONFIGURE</p>
+              <h2>创建提交预览</h2>
+            </div>
+            <span class="readonly-tag">不直接提交</span>
+          </div>
+
+          <div class="inline-error-summary" id="standardErrorSummary" role="alert" tabindex="-1" hidden></div>
+          <div class="source-profile-alert" id="sourceProfileAlert" hidden>
+            <strong>服务端尚未配置标准文件来源</strong>
+            <span>请先按 README 配置来源 Profile，网页不会接收任意本机目录。</span>
+          </div>
+
+          <form id="standardTaskForm" autocomplete="off" novalidate>
+            <fieldset class="standard-form-section">
+              <legend>SVN 连接</legend>
+              <label class="field-label" for="standardSvnUrl">客户 SVN 检出根</label>
+              <input class="text-input" id="standardSvnUrl" type="url" inputmode="url" autocapitalize="none" autocomplete="off" spellcheck="false" placeholder="https://svn.example.com/svn/customer/ecology">
+              <p class="input-help">填写与清单相对路径对应的检出根；一次任务只能使用一个仓库。</p>
+
+              <div class="credential-grid">
+                <div>
+                  <label class="field-label" for="standardSvnUsername">SVN 账号</label>
+                  <input class="text-input" id="standardSvnUsername" type="text" autocomplete="off" autocapitalize="none" spellcheck="false">
+                </div>
+                <div>
+                  <label class="field-label" for="standardSvnPassword">SVN 密码</label>
+                  <input class="text-input" id="standardSvnPassword" type="password" autocomplete="new-password">
+                </div>
+              </div>
+              <p class="credential-note">账号和密码仅用于本次任务，不进入浏览器存储、服务器日志或 SVN 认证缓存。</p>
+            </fieldset>
+
+            <fieldset class="standard-form-section">
+              <legend>标准文件来源</legend>
+              <label class="field-label" for="standardSourceProfile">来源配置</label>
+              <select class="text-input" id="standardSourceProfile" disabled>
+                <option value="">正在读取服务端配置…</option>
+              </select>
+              <p class="profile-detail" id="standardSourceProfileDetail">网页只显示配置名称，不暴露服务器真实目录。</p>
+              <label class="field-label" for="standardCustomerPath">客户标准文件目录</label>
+              <input class="text-input" id="standardCustomerPath" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="\\192.168.7.215\ECOLOGY_customer\Y\客户名称\QC123456\ecology">
+              <p class="input-help">粘贴完整的客户标准文件 <code>ecology</code> 目录；共享账号由服务器统一管理，网页不会要求填写。</p>
+            </fieldset>
+
+            <fieldset class="standard-form-section">
+              <legend>提交内容</legend>
+              <div class="field-label-row">
+                <label class="field-label" for="standardFileList">文件清单</label>
+                <button class="text-button compact-text-button" id="standardSampleButton" type="button">加载示例</button>
+              </div>
+              <textarea class="editor standard-file-list" id="standardFileList" rows="11" spellcheck="false" placeholder="每行一个 ecology 下的相对文件路径，例如 src/weaver/example/Demo.java"></textarea>
+              <div class="field-footer">
+                <span>只接受相对于 ecology 的文件路径；不接受 URL、$/、颜色标记或绝对路径。</span>
+                <output id="standardFileCount">0 行</output>
+              </div>
+              <label class="cover-all-confirm" id="standardCoverAllConfirmWrap">
+                <input id="standardCoverAllConfirm" type="checkbox">
+                <span><strong>清单为空：覆盖全部交集文件</strong><small>只覆盖 SVN 最新版本与客户标准目录中同时存在的文件；不会新增标准目录独有文件。</small></span>
+              </label>
+
+              <label class="field-label" for="standardCommitMessage">提交说明</label>
+              <input class="text-input" id="standardCommitMessage" type="text" maxlength="500" autocomplete="off" placeholder="例如：QC123456 补充标准文件">
+              <div class="field-footer"><span>使用个人 SVN 账号，并在预览中追加唯一 LZR-WEB 核验标记。</span><output id="standardMessageCount">0 / 500</output></div>
+            </fieldset>
+
+            <div class="panel-actions standard-form-actions">
+              <button class="button button-primary" id="createStandardPreviewButton" type="submit" disabled>
+                <span class="button-label" data-default="创建提交预览">创建提交预览</span><span class="button-arrow" aria-hidden="true">→</span>
+              </button>
+              <button class="button button-secondary" id="resetStandardFormButton" type="reset">清空</button>
+            </div>
+          </form>
+        </article>
+
+        <article class="panel standard-task-panel" aria-labelledby="standard-task-title">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">TASK</p>
+              <h2 id="standard-task-title">任务状态</h2>
+            </div>
+            <span class="task-status-badge" id="standardTaskStateBadge" data-state="idle">尚未创建</span>
+          </div>
+
+          <div class="task-status-card" id="standardTaskStatus" role="status" aria-live="polite" aria-atomic="true">
+            <span class="task-status-icon" aria-hidden="true"></span>
+            <div><strong>等待配置</strong><span>填写左侧信息后创建提交预览。</span></div>
+          </div>
+
+          <div class="task-progress-track" aria-hidden="true"><span id="standardTaskProgressBar"></span></div>
+
+          <div class="standard-task-empty" id="standardTaskEmptyState">
+            <span class="empty-state-mark" aria-hidden="true">↗</span>
+            <strong>先预览，再提交</strong>
+            <p>服务器会创建独立临时工作副本。预览不会修改 SVN 仓库，只有再次确认才会提交。</p>
+          </div>
+
+          <section id="standardPreviewSection" hidden>
+            <div class="preview-heading">
+              <div><p class="panel-kicker">PREVIEW</p><h3 id="standardPreviewTitle" tabindex="-1">提交预览</h3></div>
+              <span id="standardPreviewRevision">—</span>
+            </div>
+            <div class="preview-summary-grid" id="standardPreviewSummary"></div>
+            <div class="preview-issues" id="standardPreviewIssues" role="alert" hidden></div>
+            <div class="preview-table-wrap">
+              <table class="preview-table">
+                <caption class="sr-only">待提交标准文件列表</caption>
+                <thead><tr><th scope="col">文件</th><th scope="col">来源</th><th scope="col">结果</th></tr></thead>
+                <tbody id="standardPreviewItems"></tbody>
+              </table>
+            </div>
+            <div class="standard-preview-actions">
+              <button class="button button-primary" id="confirmStandardCommitButton" type="button" disabled>核对并确认提交</button>
+              <button class="button button-secondary" id="cancelStandardTaskButton" type="button">取消并清理</button>
+            </div>
+          </section>
+
+          <section class="standard-result" id="standardCommitResult" hidden>
+            <div class="result-mark" id="standardResultMark" aria-hidden="true">✓</div>
+            <div><p class="panel-kicker">RESULT</p><h3 id="standardResultTitle">处理完成</h3><p id="standardResultMessage"></p></div>
+            <div class="result-revision" id="standardResultRevision" hidden></div>
+            <div class="result-url-list" id="standardResultUrls"></div>
+          </section>
+
+          <details class="task-log-panel" id="standardTaskLogPanel">
+            <summary>查看安全执行记录</summary>
+            <ol class="task-log" id="standardTaskLog"></ol>
+          </details>
+        </article>
+      </div>
+    </section>
 
     <footer class="site-footer">
-      <span>升级清单核心规则与桌面版、终端版保持一致</span>
+      <span>核心规则与桌面版、终端版保持一致 · SVN 写入始终二次确认</span>
       <span>Web preview · v{{ app_version }}</span>
     </footer>
   </main>
+
+  <dialog class="commit-dialog" id="standardCommitDialog" aria-labelledby="standardCommitDialogTitle">
+    <form method="dialog">
+      <p class="panel-kicker">FINAL CHECK</p>
+      <h2 id="standardCommitDialogTitle">确认提交 SVN</h2>
+      <p class="dialog-description">这一步会真实写入 SVN 仓库。请核对检出根、文件数量与提交说明。</p>
+      <dl class="commit-dialog-summary">
+        <div><dt>SVN 检出根</dt><dd id="dialogSvnUrl">—</dd></div>
+        <div><dt>变更文件</dt><dd id="dialogFileCount">—</dd></div>
+        <div><dt>提交说明</dt><dd id="dialogCommitMessage">—</dd></div>
+      </dl>
+      <label class="commit-acknowledge">
+        <input id="standardCommitAcknowledge" type="checkbox">
+        <span>我已核对预览，并确认只提交以上文件。</span>
+      </label>
+      <div class="dialog-error" id="standardCommitDialogError" role="alert" hidden></div>
+      <div class="dialog-actions">
+        <button class="button button-secondary" id="closeStandardCommitDialogButton" type="button">返回检查</button>
+        <button class="button button-danger" id="submitStandardCommitButton" type="button" disabled>
+          <span class="button-label" data-default="确认并提交 SVN">确认并提交 SVN</span>
+        </button>
+      </div>
+    </form>
+  </dialog>
 
   <div class="lzr-signature" aria-hidden="true">LZR</div>
   <div class="notice" id="notice" role="status" aria-live="polite" aria-atomic="true"></div>
