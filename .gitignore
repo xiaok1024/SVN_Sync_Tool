@@ -17,6 +17,7 @@ Desktop.ini
 .idea/
 .venv/
 .venv-macos/
+.venv-web/
 .wheelhouse/
 *.swp
 *.swo

@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="将带颜色升级清单整理成人读与 AI Markdown。">
+  <title>升级工具中心 · LZR</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}">
+  <script src="{{ url_for('static', path='/app.js') }}" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#workspace">跳到工作区</a>
+
+  <header class="site-header">
+    <div class="header-inner">
+      <a class="brand" href="/" aria-label="升级工具中心首页">
+        <span class="brand-symbol" aria-hidden="true"><span></span></span>
+        <span class="brand-copy">
+          <strong>升级工具中心</strong>
+          <small>Upgrade Toolbox</small>
+        </span>
+      </a>
+      <div class="service-state" aria-label="当前为本机预览">
+        <span class="state-dot" aria-hidden="true"></span>
+        本机预览
+      </div>
+    </div>
+  </header>
+
+  <main class="site-main" id="workspace">
+    <section class="intro" aria-labelledby="page-title">
+      <div class="intro-copy">
+        <p class="eyebrow">UPGRADE LIST · 01</p>
+        <h1 id="page-title">把升级清单整理成<br>清晰、可靠的交付结果。</h1>
+        <p class="intro-description">粘贴带颜色的富文本清单，校对红黑文件标记，一次生成人读与 AI Markdown。</p>
+      </div>
+      <div class="local-note">
+        <span class="local-note-icon" aria-hidden="true"></span>
+        <div>
+          <strong>仅在本机处理</strong>
+          <span>服务端不落盘，不读取主机剪贴板</span>
+        </div>
+      </div>
+    </section>
+
+    <ol class="flow-steps" aria-label="处理步骤">
+      <li class="flow-step is-active" data-stage="1">
+        <span class="step-index">01</span>
+        <span><strong>粘贴源内容</strong><small>保留红黑颜色</small></span>
+      </li>
+      <li class="flow-step" data-stage="2">
+        <span class="step-index">02</span>
+        <span><strong>校对文件清单</strong><small>支持手工修正</small></span>
+      </li>
+      <li class="flow-step" data-stage="3">
+        <span class="step-index">03</span>
+        <span><strong>生成 Markdown</strong><small>复制或下载</small></span>
+      </li>
+    </ol>
+
+    <section class="workspace-grid" aria-label="升级清单工作区">
+      <article class="panel source-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="panel-kicker">SOURCE</p>
+            <h2>粘贴升级清单</h2>
+          </div>
+          <div class="panel-tools">
+            <button class="text-button" type="button" id="sampleButton">加载示例</button>
+            <button class="text-button" type="button" id="fileButton">读取 HTML</button>
+            <input id="htmlFile" type="file" accept=".html,.htm,text/html" hidden>
+          </div>
+        </div>
+
+        <label class="field-label" for="sourceInput">原始内容</label>
+        <textarea
+          id="sourceInput"
+          class="editor source-editor"
+          rows="14"
+          spellcheck="false"
+          placeholder="在这里按 Cmd / Ctrl + V 粘贴网页中的带颜色升级清单…"
+          aria-describedby="sourceHelp sourceState"
+        ></textarea>
+        <div class="field-footer">
+          <span id="sourceHelp">优先读取浏览器剪贴板中的 HTML，以保留红色和黑色。</span>
+          <span class="input-state" id="sourceState" data-state="empty">等待粘贴</span>
+        </div>
+
+        <div class="panel-actions">
+          <button class="button button-primary" type="button" id="extractButton">
+            <span class="button-label" data-default="提取升级清单">提取升级清单</span>
+            <span class="button-arrow" aria-hidden="true">→</span>
+          </button>
+          <button class="button button-secondary" type="button" id="clearButton">清空</button>
+        </div>
+      </article>
+
+      <article class="panel list-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="panel-kicker">REVIEW</p>
+            <h2>校对提取结果</h2>
+          </div>
+          <span class="readonly-tag">可编辑</span>
+        </div>
+
+        <div class="summary-grid" aria-label="提取结果统计">
+          <div class="summary-item"><span>QC</span><strong id="qcCount">—</strong></div>
+          <div class="summary-item"><span>文件</span><strong id="fileCount">—</strong></div>
+          <div class="summary-item summary-red"><span>红色</span><strong id="redCount">—</strong></div>
+          <div class="summary-item summary-dark"><span>黑色</span><strong id="blackCount">—</strong></div>
+        </div>
+
+        <label class="field-label" for="listInput">可编辑清单</label>
+        <textarea
+          id="listInput"
+          class="editor list-editor"
+          rows="14"
+          spellcheck="false"
+          placeholder="提取后的 QC 分组与 [red] / [black] 文件会显示在这里。"
+          disabled
+        ></textarea>
+
+        <div class="warning-list" id="warningList" aria-live="polite" hidden></div>
+
+        <div class="generate-row">
+          <div class="format-switch" role="group" aria-label="Markdown 输出格式">
+            <button type="button" class="format-option is-selected" data-format="md" aria-pressed="true" disabled>人读 Markdown</button>
+            <button type="button" class="format-option" data-format="ai-md" aria-pressed="false" disabled>AI Markdown</button>
+          </div>
+          <button class="button button-primary" type="button" id="generateButton" disabled>生成结果</button>
+        </div>
+      </article>
+    </section>
+
+    <section class="panel result-panel" aria-labelledby="result-title">
+      <div class="result-heading">
+        <div>
+          <p class="panel-kicker">OUTPUT</p>
+          <h2 id="result-title">Markdown 结果</h2>
+        </div>
+        <div class="result-meta">
+          <span id="resultCustomer">尚未生成</span>
+          <span id="resultFilename">—</span>
+        </div>
+      </div>
+
+      <textarea
+        id="resultOutput"
+        class="result-output"
+        rows="18"
+        spellcheck="false"
+        readonly
+        placeholder="生成后的 Markdown 会显示在这里。"
+        aria-label="Markdown 生成结果"
+      ></textarea>
+
+      <div class="result-actions">
+        <span class="result-hint" id="resultHint">编辑清单后，选择格式并生成。</span>
+        <div>
+          <button class="button button-secondary" type="button" id="copyButton" disabled>复制结果</button>
+          <button class="button button-primary" type="button" id="downloadButton" disabled>下载文件</button>
+        </div>
+      </div>
+    </section>
+
+    <footer class="site-footer">
+      <span>升级清单核心规则与桌面版、终端版保持一致</span>
+      <span>Web preview · v{{ app_version }}</span>
+    </footer>
+  </main>
+
+  <div class="lzr-signature" aria-hidden="true">LZR</div>
+  <div class="notice" id="notice" role="status" aria-live="polite" aria-atomic="true"></div>
+</body>
+</html>

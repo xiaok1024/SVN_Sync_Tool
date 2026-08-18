@@ -2,11 +2,12 @@
 
 一个跨平台（Windows / macOS）工具，用于从 SVN 拉取代码、用整理好的本地目录（或网络共享）覆盖交叉文件、并自动提交变更。三步流程一键完成，提交完成后可一键复制 SVN 提交记录。
 
-提供三个入口：
+提供四个入口：
 
 - **现代图形界面**（`svn_sync_qt.py`）：Windows 主要使用方式，基于 PySide6 / Qt Widgets，打包为 exe 分发。
 - **旧版图形界面**（`svn_sync_tool.py`）：保留为迁移期功能对照和回归入口，不再作为 Windows 正式打包入口。
 - **终端版**（`svn_sync_cli.py`）：macOS 推荐使用方式，功能与 GUI 的 6 个页面一一对应，支持交互式菜单和命令行参数两种用法，详见下方「终端版」章节。macOS 不再更新 `.app` 打包产物。
+- **本地 Web 预览**（`svn_sync_web.py`）：第一阶段提供“升级清单提取”，浏览器完成富文本粘贴、校对、生成、复制与下载；当前固定监听 `127.0.0.1`，尚未开放局域网访问。
 
 A Windows Qt GUI and macOS CLI tool for checking out code from SVN, overwriting cross-referenced files from a local organized directory (or network share), and automatically committing changes.
 
@@ -19,7 +20,7 @@ A Windows Qt GUI and macOS CLI tool for checking out code from SVN, overwriting 
 | **SVN 拉取** | 输入 SVN 地址（支持中文路径），选择拉取目录，支持用户名/密码认证或缓存认证 |
 | **交叉覆盖** | 遍历 SVN 检出目录下的每个文件，到整理好的目录中查找同名同路径文件，有则覆盖，没有则跳过 |
 | **全自动流程** | 一键执行：SVN 拉取 → 交叉覆盖 → SVN 提交，实时日志输出，无需手动操作 |
-| **升级清单提取** | 从复制的带颜色升级清单（QC 分组 + 红/黑标记的 SVN 文件 URL）提取文件清单，并生成人读升级 Markdown 与 AI 专用 Markdown |
+| **升级清单提取** | 从复制的带颜色升级清单（QC 分组 + 红/黑标记的完整 SVN URL 或 `$/...` 路径）提取文件清单，并生成人读升级 Markdown 与 AI 专用 Markdown |
 | **版本号路径生成** | 快速完成这件事而设计的——不用打开 SVN log 界面一行行翻，提供一个版本号，工具直接查询出所有变更文件，并自动按 `(Vxxx)` 格式拼接好完整 URL |
 | **标准文件获取** | 按源码清单从 KB/历史目录补全客户工作副本，提交前预览整个工作副本的 SVN 状态；支持提交后恢复本地二开版本 |
 
@@ -111,6 +112,45 @@ python3 svn_sync_cli.py standard --url https://svn.example.com/svn/cust/ecology 
 
 ---
 
+## 本地 Web 预览
+
+第一阶段 Web 版只提供无状态、只读的“升级清单提取”，直接复用 `upgrade_list_core.py`，服务端不会读取主机剪贴板、写入文件或执行 SVN。用户粘贴的 HTML、校对清单和生成结果只保留在当前浏览器页面与本次请求内；主动点击下载时，浏览器才会把生成的 Markdown 保存到用户选择的位置。
+
+### 安装独立 Web 环境
+
+```bash
+python3 -m venv .venv-web
+.venv-web/bin/python -m pip install -r requirements-web.txt
+```
+
+### 启动
+
+```bash
+.venv-web/bin/python svn_sync_web.py
+```
+
+随后访问：`http://127.0.0.1:8765/`
+
+页面支持：
+
+- 从浏览器粘贴带颜色富文本，或读取本地 HTML 文件；
+- 提取按 QC 分组的 `[red]` / `[black]` 清单；
+- 在生成前手工校对清单；
+- 生成人读 Markdown 与 AI Markdown；
+- 在浏览器复制结果或下载 `.md` 文件；
+- 下载文件自动使用客户名作为前缀，并清理 Windows / macOS 不支持的文件名字符；
+- 加载内置示例快速体验完整流程。
+
+> 当前版本特意只监听本机回环地址。登录、HTTPS、审计和提交身份隔离完成前，不得改为 `0.0.0.0` 直接开放局域网访问。
+
+Web 专项测试：
+
+```bash
+.venv-web/bin/python -m unittest tests.test_web_upgrade_service tests.test_web_app -v
+```
+
+---
+
 ## 使用说明 / Usage
 
 ### 页面 1: SVN 拉取 / Page 1: SVN Checkout
@@ -153,10 +193,10 @@ python3 svn_sync_cli.py standard --url https://svn.example.com/svn/cust/ecology 
 
 ### 页面 4: 升级清单提取 / Page 4: Upgrade List Extract
 
-从网页（如 QC 任务系统）复制的**带颜色升级清单**中，提取需要升级的文件并生成文档。清单中通常按 QC 分组，文件 URL 用**红色**标记需打包、**黑色**标记仅作上下文参考。
+从网页（如 QC 任务系统）复制的**带颜色升级清单**中，提取需要升级的文件并生成文档。清单中通常按 QC 分组，完整 SVN URL 或 `$/仓库/路径(V版本)` 用**红色**标记需打包、**黑色**标记仅作上下文参考。
 
 1. 在网页中复制带样式的升级清单（必须是富文本，不能是纯文本，否则丢失颜色）
-2. 点击 **从剪贴板提取** —— 工具读取剪贴板 HTML，解析出按 QC 分组的清单（每行 `[red]/[black] + SVN URL`），显示在可编辑文本框中
+2. 点击 **从剪贴板提取** —— 工具读取剪贴板 HTML，解析出按 QC 分组的清单（每行 `[red]/[black] + 完整 SVN URL 或 $/... 路径`），显示在可编辑文本框中
 3. 如需可手工微调清单内容（改动会带入后续生成）
 4. 点击 **生成升级 Markdown** —— 生成人读的升级清单（按 QC 列出标题/模块/文件+版本+颜色标识）
 5. 点击 **生成 AI Markdown** —— 生成 AI 执行用清单（按文件类型分类：源码迁移、二进制/SQL/生成物跳过，含统计与去重信息）
@@ -275,6 +315,7 @@ python3 svn_sync_cli.py
 - **语言**: Python 3.10+
 - **Windows GUI**: PySide6-Essentials / Qt Widgets（Qt 6）
 - **旧 GUI 回归**: tkinter / ttkbootstrap
+- **本地 Web**: FastAPI / Uvicorn / Jinja2（独立 `requirements-web.txt`）
 - **SVN**: 通过 subprocess 调用系统 svn CLI
 - **共享核心**: `svn_sync_core.py`、`svn_sync_workflow.py`、`svn_standard_file_core.py`、`upgrade_list_core.py`
 - **打包**: PyInstaller（仅 Windows 持续更新 exe；macOS 直接运行 CLI）
@@ -290,6 +331,7 @@ python3 svn_sync_cli.py
 ├── .gitignore                          # Git 排除规则
 ├── AGENTS.md                           # 项目 AI 协作与维护规则
 ├── requirements.txt                    # 打包依赖
+├── requirements-web.txt                # 本地 Web 与接口测试依赖
 ├── svn_sync_qt.py                      # 现代 Windows GUI 入口
 ├── qt_app.py / qt_pages.py             # Qt 主窗口、六个功能页面
 ├── qt_components.py / qt_theme.py      # Qt 通用组件与视觉主题
@@ -301,6 +343,9 @@ python3 svn_sync_cli.py
 ├── svn_standard_file_core.py           # 标准文件扫描、覆盖与 SVN 提交业务层
 ├── upgrade_list_core.py                # 富文本升级清单解析与 Markdown 生成
 ├── clipboard_core.py                   # Windows/macOS HTML 剪贴板适配
+├── svn_sync_web.py                     # 本地 Web 启动入口（固定 127.0.0.1）
+├── web_app.py / web_upgrade_service.py # Web API 与升级清单适配层
+├── web/                                # HTML 模板及本地 CSS/JavaScript
 ├── SVN_Sync_Tool.spec                  # 现代 GUI 的 Windows PyInstaller 配置
 ├── tests/                              # 核心、安全门与职责边界回归测试
 ├── outputs/                            # 预编译成品（纳入版本库）

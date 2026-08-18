@@ -1,0 +1,122 @@
+# -*- coding: utf-8 -*-
+
+import json
+import unittest
+from pathlib import Path
+
+
+try:
+    from fastapi.testclient import TestClient
+    from web_app import MAX_REQUEST_BYTES, app
+    WEB_AVAILABLE = True
+except ModuleNotFoundError:
+    TestClient = None
+    MAX_REQUEST_BYTES = 2 * 1024 * 1024
+    app = None
+    WEB_AVAILABLE = False
+
+
+SAMPLE_HTML = (
+    '<style>.red { color: #ff0000; }</style>'
+    '<div>QC321 Web 接口验证 —— 门户</div>'
+    '<div class="red">https://svn.example.com/svn/customer/ecology/src/Test.java(V20)</div>'
+)
+
+
+@unittest.skipUnless(WEB_AVAILABLE, "需要 requirements-web.txt 中的 Web 依赖")
+class WebAppApiTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(app)
+
+    def test_index_has_brand_and_security_headers(self):
+        response = self.client.get("/")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("升级工具中心", response.text)
+        self.assertIn("LZR", response.text)
+        self.assertIn("default-src 'self'", response.headers["content-security-policy"])
+        self.assertEqual(response.headers["x-frame-options"], "DENY")
+        self.assertEqual(response.headers["cache-control"], "no-store")
+
+    def test_health_endpoint(self):
+        response = self.client.get("/api/health")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["ok"])
+
+    def test_extract_and_generate_round_trip(self):
+        extract = self.client.post(
+            "/api/v1/upgrade-list/extract",
+            json={"html": SAMPLE_HTML},
+        )
+        self.assertEqual(extract.status_code, 200)
+        list_text = extract.json()["list_text"]
+        edited = list_text.replace("Web 接口验证", "浏览器校对生效")
+
+        generate = self.client.post(
+            "/api/v1/upgrade-list/generate",
+            json={"list_text": edited, "format": "md"},
+        )
+        self.assertEqual(generate.status_code, 200)
+        self.assertIn("浏览器校对生效", generate.json()["content"])
+        self.assertEqual(generate.json()["filename"], "customer-upgrade-file-list.md")
+
+    def test_non_json_and_malformed_json_have_stable_errors(self):
+        unsupported = self.client.post(
+            "/api/v1/upgrade-list/extract",
+            content="html",
+            headers={"content-type": "text/plain"},
+        )
+        self.assertEqual(unsupported.status_code, 415)
+        self.assertEqual(unsupported.json()["error"]["code"], "unsupported_media_type")
+
+        malformed = self.client.post(
+            "/api/v1/upgrade-list/extract",
+            content="{not-json",
+            headers={"content-type": "application/json"},
+        )
+        self.assertEqual(malformed.status_code, 400)
+        self.assertEqual(malformed.json()["error"]["code"], "malformed_json")
+
+    def test_request_size_limit(self):
+        body = json.dumps({"html": "x" * MAX_REQUEST_BYTES})
+        response = self.client.post(
+            "/api/v1/upgrade-list/extract",
+            content=body,
+            headers={"content-type": "application/json"},
+        )
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(response.json()["error"]["code"], "request_too_large")
+
+    def test_error_does_not_echo_untrusted_html(self):
+        payload = "</textarea><script>alert('x')</script>"
+        response = self.client.post(
+            "/api/v1/upgrade-list/extract",
+            json={"html": payload},
+        )
+        self.assertEqual(response.status_code, 422)
+        self.assertNotIn("script", response.text)
+
+    def test_untrusted_host_is_rejected(self):
+        response = self.client.get("/", headers={"host": "untrusted.example"})
+        self.assertEqual(response.status_code, 400)
+
+    def test_static_route_cannot_read_repository_files(self):
+        response = self.client.get("/static/%2e%2e/README.md")
+        self.assertEqual(response.status_code, 404)
+
+
+class WebSourceSafetyTest(unittest.TestCase):
+    def test_frontend_never_assigns_untrusted_content_to_inner_html(self):
+        root = Path(__file__).resolve().parents[1]
+        javascript = (root / "web" / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertNotIn("innerHTML", javascript)
+
+    def test_entry_is_fixed_to_loopback_address(self):
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "svn_sync_web.py").read_text(encoding="utf-8")
+        self.assertIn('host="127.0.0.1"', source)
+        self.assertNotIn('host="0.0.0.0"', source)
+
+
+if __name__ == "__main__":
+    unittest.main()

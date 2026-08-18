@@ -3,8 +3,10 @@
 
 import os
 import re
+from bisect import bisect_right
 from collections import Counter, OrderedDict, defaultdict
 from html.parser import HTMLParser
+from urllib.parse import quote
 
 # ═══════════════ 升级清单提取逻辑（对标 Alfred redtext 链路） ═══════════════
 # 移植自 script 仓库的 clipboard_extract_red_text.py / generate_upgrade_md.py
@@ -84,8 +86,29 @@ def rt_split_selectors(selector_text):
 
 
 def rt_parse_css_color_rules(css_text):
+    css_text = css_text or ""
+    # 原实现使用跨全文回溯正则；对很长且没有左花括号的样式文本会呈
+    # 二次复杂度。先线性切分花括号，再识别与原正则相同的
+    # ``非花括号文本 { 非花括号文本 }`` 序列。
+    segments = []
+    braces = []
+    segment_start = 0
+    for index, char in enumerate(css_text):
+        if char not in "{}":
+            continue
+        segments.append(css_text[segment_start:index])
+        braces.append(char)
+        segment_start = index + 1
+    segments.append(css_text[segment_start:])
+
     rules = []
-    for selector_text, body in re.findall(r"([^{}]+)\{([^{}]+)\}", css_text or ""):
+    for index in range(len(braces) - 1):
+        if braces[index] != "{" or braces[index + 1] != "}":
+            continue
+        selector_text = segments[index]
+        body = segments[index + 1]
+        if not selector_text or not body:
+            continue
         color = rt_extract_color_from_style(body)
         if not color:
             continue
@@ -196,9 +219,50 @@ class RedTextHTMLParser(HTMLParser):
         return self.line_records
 
 
+class _StyleBlockHTMLParser(HTMLParser):
+    """线性收集文档内的 style 文本，支持 HTML 合法的结束标签空白。"""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self.in_style = False
+        self.current_parts = []
+        self.style_blocks = []
+
+    def _append(self, value):
+        if self.in_style and value:
+            self.current_parts.append(value)
+
+    def handle_starttag(self, tag, _attrs):
+        if tag.lower() == "style":
+            self.in_style = True
+            self.current_parts = []
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "style" and self.in_style:
+            self.style_blocks.append("".join(self.current_parts))
+            self.in_style = False
+            self.current_parts = []
+
+    def handle_data(self, data):
+        self._append(data)
+
+    def handle_entityref(self, name):
+        self._append("&%s;" % name)
+
+    def handle_charref(self, name):
+        self._append("&#%s;" % name)
+
+
+def rt_extract_style_blocks(html):
+    parser = _StyleBlockHTMLParser()
+    parser.feed(html or "")
+    parser.close()
+    return parser.style_blocks
+
+
 def rt_analyze_html(html, strict=False):
     css_rules = []
-    for style_text in re.findall(r"<style\b[^>]*>(.*?)</style>", html, flags=re.I | re.S):
+    for style_text in rt_extract_style_blocks(html):
         css_rules.extend(rt_parse_css_color_rules(style_text))
     parser = RedTextHTMLParser(strict=strict, css_rules=css_rules)
     parser.feed(html)
@@ -206,8 +270,95 @@ def rt_analyze_html(html, strict=False):
     return parser.get_line_records()
 
 
+def rt_parse_repository_path_from_line(line):
+    """解析 ``$/仓库/相对路径(V数字)``，允许版本号后跟空白分隔的备注。"""
+    candidate = (line or "").strip()
+    if not candidate.startswith("$/"):
+        return None
+
+    version_start = None
+    version_end = None
+    cursor = 2
+    while True:
+        possible_start = candidate.find("(", cursor)
+        if possible_start < 0:
+            break
+        digit_start = possible_start + 2
+        if (
+            digit_start < len(candidate)
+            and candidate[possible_start + 1:digit_start] in {"V", "v"}
+            and candidate[digit_start].isdigit()
+        ):
+            possible_end = digit_start + 1
+            while possible_end < len(candidate) and candidate[possible_end].isdigit():
+                possible_end += 1
+            if (
+                possible_end < len(candidate)
+                and candidate[possible_end] == ")"
+                and (possible_end + 1 == len(candidate) or candidate[possible_end + 1].isspace())
+            ):
+                version_start = possible_start
+                version_end = possible_end
+                break
+        cursor = possible_start + 1
+
+    if version_start is None:
+        return None
+
+    repository_path = candidate[2:version_start]
+    separator = repository_path.find("/")
+    if separator <= 0 or separator == len(repository_path) - 1:
+        return None
+    repository = repository_path[:separator]
+    relative_path = repository_path[separator + 1:]
+    version = candidate[version_start + 1:version_end]
+    return repository, relative_path, rt_normalize_version(version)
+
+
 def rt_contains_svn_url(text):
-    return bool(RT_LOOSE_SVN_URL_RE.search(text or ""))
+    """线性判断文本中是否存在带版本号的完整 SVN URL 或 ``$/`` 路径。"""
+    if rt_parse_repository_path_from_line(text):
+        return True
+    for token in (text or "").split():
+        version_positions = []
+        cursor = 0
+        while True:
+            version_start = token.find("(", cursor)
+            if version_start < 0:
+                break
+            digit_start = version_start + 2
+            if (
+                digit_start < len(token)
+                and token[version_start + 1:digit_start] in {"V", "v"}
+                and token[digit_start].isdigit()
+            ):
+                digit_end = digit_start + 1
+                while digit_end < len(token) and token[digit_end].isdigit():
+                    digit_end += 1
+                if digit_end < len(token) and token[digit_end] == ")":
+                    version_positions.append(version_start)
+            cursor = version_start + 1
+        if not version_positions:
+            continue
+
+        index = 0
+        while index < len(token):
+            if token.startswith("https://", index):
+                authority_start = index + len("https://")
+            elif token.startswith("http://", index):
+                authority_start = index + len("http://")
+            else:
+                index += 1
+                continue
+            first_slash = token.find("/", authority_start)
+            if (
+                first_slash > authority_start
+                and token.startswith("/svn/", first_slash)
+                and bisect_right(version_positions, first_slash + len("/svn/")) < len(version_positions)
+            ):
+                return True
+            index = authority_start
+    return False
 
 
 def rt_marked_line(color, text):
@@ -319,9 +470,21 @@ def rt_sort_versions(versions):
 
 def rt_parse_svn_urls_from_line(line):
     return [
-        (customer, path, rt_normalize_version(version))
+        (customer, path, version)
+        for customer, path, version, _is_repository_path in rt_parse_file_references_from_line(line)
+    ]
+
+
+def rt_parse_file_references_from_line(line):
+    references = [
+        (customer, path, rt_normalize_version(version), False)
         for customer, path, version in RT_MD_SVN_URL_RE.findall(line.strip())
     ]
+    repository_path = rt_parse_repository_path_from_line(line)
+    if repository_path:
+        customer, path, version = repository_path
+        references.append((customer, path, version, True))
+    return references
 
 
 def rt_is_standard_ecology_file(customer_name, relative_path):
@@ -379,11 +542,11 @@ def rt_parse_txt(text):
         entry = RTQCEntry(code, title, module)
         for line in block[1:]:
             marker_color, url_line = rt_parse_line_marker(line)
-            parsed_urls = rt_parse_svn_urls_from_line(url_line)
-            if not parsed_urls:
+            parsed_references = rt_parse_file_references_from_line(url_line)
+            if not parsed_references:
                 raise ValueError("无法解析 SVN URL: " + line)
-            for customer, relative_path, version in parsed_urls:
-                if rt_is_standard_ecology_file(customer, relative_path):
+            for customer, relative_path, version, is_repository_path in parsed_references:
+                if not is_repository_path and rt_is_standard_ecology_file(customer, relative_path):
                     continue
                 customer_names.append(customer)
                 raw_counter[(code, relative_path, version)] += 1
@@ -406,8 +569,10 @@ def rt_build_human_md(entries):
             for relative_path, file_entry in entry.files.items():
                 version_text = ", ".join(file_entry.versions)
                 marker_text = rt_color_label(file_entry.marker_color())
+                link_destination = quote(relative_path, safe="/-._~%")
                 lines.append(
-                    "  - [`%s`](%s) `版本: %s` `标识: %s`" % (relative_path, relative_path, version_text, marker_text)
+                    "  - [`%s`](%s) `版本: %s` `标识: %s`"
+                    % (relative_path, link_destination, version_text, marker_text)
                 )
         else:
             lines.append("- 文件: （当前清单未列出文件）")
