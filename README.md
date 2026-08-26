@@ -5,7 +5,7 @@
 提供两种使用方式：
 
 - **图形界面**（`svn_sync_tool.py`）：Windows 主要使用方式，打包为 exe 分发。
-- **终端版**（`svn_sync_cli.py`）：macOS 推荐使用方式，功能与 GUI 的 5 个标签页一一对应，支持交互式菜单和命令行参数两种用法，详见下方「终端版」章节。macOS 不再更新 `.app` 打包产物。
+- **终端版**（`svn_sync_cli.py`）：macOS 推荐使用方式，功能与 GUI 的 6 个标签页一一对应，支持交互式菜单和命令行参数两种用法，详见下方「终端版」章节。macOS 不再更新 `.app` 打包产物。
 
 A cross-platform (Windows / macOS) GUI tool for checking out code from SVN, overwriting cross-referenced files from a local organized directory (or network share), and automatically committing changes. Complete the three-step workflow with one click.
 
@@ -20,6 +20,7 @@ A cross-platform (Windows / macOS) GUI tool for checking out code from SVN, over
 | **全自动流程** | 一键执行：SVN 拉取 → 交叉覆盖 → SVN 提交，实时日志输出，无需手动操作 |
 | **升级清单提取** | 从复制的带颜色升级清单（QC 分组 + 红/黑标记的 SVN 文件 URL）提取文件清单，并生成人读升级 Markdown 与 AI 专用 Markdown |
 | **版本号路径生成** | 快速完成这件事而设计的——不用打开 SVN log 界面一行行翻，提供一个版本号，工具直接查询出所有变更文件，并自动按 `(Vxxx)` 格式拼接好完整 URL |
+| **标准文件获取** | 按清单从 KB/历史文件目录补全客户 SVN 缺失源码：自动裁切清单路径、扫描预览、确认覆盖、可选自动提交，并一键复制提交文件 URL |
 
 | Feature | Description |
 |---------|-------------|
@@ -27,6 +28,7 @@ A cross-platform (Windows / macOS) GUI tool for checking out code from SVN, over
 | **Cross Overwrite** | Iterates every file in the SVN checkout directory, looks for matching files (same relative path) in the organized directory, overwrites if found, skips if not |
 | **Auto Pipeline** | One-click execution: SVN checkout → cross-file overwrite → SVN commit, with real-time log output |
 | **Upgrade List Extract** | Extract the file list from a copied colored upgrade list (QC groups + red/black-marked SVN URLs), and generate a human-readable upgrade Markdown and an AI-oriented Markdown |
+| **Standard File Fetch** | Fill missing source files in a customer SVN from KB/historical file directories: normalize list paths, preview the scan, confirm overwrites, optionally auto-commit, and copy the committed file URLs |
 
 ---
 
@@ -57,7 +59,7 @@ The Windows exe runs by double-click with no Python required. On macOS, run the 
 
 ## 终端版 / CLI（macOS 推荐）
 
-`svn_sync_cli.py` 与 GUI 共用同一套业务逻辑，功能与 5 个标签页一一对应，两种用法：
+`svn_sync_cli.py` 与 GUI 共用同一套业务逻辑，功能与 6 个标签页一一对应，两种用法：
 
 ### 交互模式
 
@@ -65,7 +67,7 @@ The Windows exe runs by double-click with no Python required. On macOS, run the 
 python3 svn_sync_cli.py
 ```
 
-进入主菜单选择功能（1-5 对应 GUI 的 5 个标签页），随后按提示逐项输入参数：
+进入主菜单选择功能（1-6 对应 GUI 的 6 个标签页），随后按提示逐项输入参数：
 
 - 常用值（SVN 地址、目录、用户名等，**不含密码**）会记住在 `~/.config/svn_sync_tool/cli.json`，下次回车即可复用；
 - 密码输入不回显；来源为 `smb://` 共享时才会询问 SMB 账号；
@@ -92,6 +94,10 @@ python3 svn_sync_cli.py extract --format ai-md -o upgrade-file-list-ai.md
 
 # 5. 版本号路径生成
 python3 svn_sync_cli.py paths --url https://svn.example.com/svn/cust/ecology -r "123,456-789" --sort rev --copy
+
+# 6. 标准文件获取（升级任务需 --standard；二开任务 --mode secondev，仅查历史文件）
+python3 svn_sync_cli.py standard --url https://svn.example.com/svn/cust/ecology --target ~/work/ecology --mode upgrade --title "升级任务A" --standard /mnt/kb --historical /mnt/hist --list files.txt --dry-run
+python3 svn_sync_cli.py standard --url https://svn.example.com/svn/cust/ecology --target ~/work/ecology --mode upgrade --title "升级任务A" --standard /mnt/kb --historical /mnt/hist --list files.txt --yes --commit --copy
 ```
 
 在终端里漏填的必填参数会自动转为交互提问补全；非终端环境（如 CI）漏填则直接报错退出。各子命令详细参数见 `python3 svn_sync_cli.py <子命令> --help`。
@@ -156,24 +162,31 @@ python3 svn_sync_cli.py paths --url https://svn.example.com/svn/cust/ecology -r 
 
 ### 标签页 6: 标准文件获取 / Tab 6: Standard File Acquisition
 
-用于在版本升级或二开任务中，补全客户 SVN 中缺失的源码文件。
+用于在版本升级或二开任务中，补全客户 SVN 中缺失的源码文件：按文件清单从 KB / 历史文件目录中定位文件，扫描预览后覆盖到已检出的客户 SVN 工作副本，可选自动提交，并把提交文件 URL 一键复制到剪贴板。
 
 1. 填写**任务标题**，选择任务类型：**升级任务**（upgrade）或 **二开任务**（secondev）
-   - 升级任务：先查 KB 文件路径，未找到再查历史文件路径
-   - 二开任务：仅查历史文件路径，KB 文件路径行自动隐藏
-2. 填写**客户 SVN 地址**、**目标 SVN 目录**（已检出的客户 SVN 工作副本）
-3. 填写 **KB 文件路径**（升级任务必填）和**历史文件路径**
-4. 在**文件清单**中粘贴源码路径列表（每行一个：相对路径 `src/com/api/.../DocAccService.java`，或包含 `ecology` 的本地全路径 `D:\...\ecology\src\...`），也可从剪贴板粘贴；本地全路径会自动裁切为相对 ecology 路径，并作为“提交后覆盖本地”的本地源
-5. 工具自动去 KB/历史文件路径的 `ecology/` 子目录下按相对路径查找
-6. 点击 **扫描预览** 查看文件命中情况（可覆盖/已存在跳过/未找到来源）
-7. 点击 **确认覆盖** 将文件复制到目标 SVN 目录
-8. 覆盖完成后可点击 **提交 SVN 标准文件** 提交变更；提交成功后自动导出变更文件 URL 到日志，并可通过 **复制提交文件路径** 按钮一键复制
-9. 提交完成后，如果文件清单里贴的是本地全路径，可点击 **提交后覆盖本地**，用这些本地文件覆盖目标 SVN 工作副本中对应的已提交文件；该操作不会再次提交 SVN
-10. 支持 SMB 共享路径、UNC 路径作为来源目录（需填写 SMB 凭据）
+   - 升级任务：KB 文件路径（标准文件）→ 历史文件路径，按优先级查找来源
+   - 二开任务：仅查历史文件路径，KB 文件路径输入行自动隐藏
+2. 填写**客户 SVN 地址**、**目标 SVN 目录**（必须是已检出的客户 SVN 工作副本）；SVN 用户/密码留空时使用缓存认证
+3. 填写 **KB 文件路径**（升级任务必填）和**历史文件路径**，支持本地路径、`\\` UNC 与 `smb://` 共享地址（来源填 `smb://` 时需填写 SMB 账号/密码）
+4. 在**文件清单**中粘贴源码路径列表（每行一个），也可点击 **从剪贴板粘贴**：
+   - 相对路径：`src/com/api/.../DocAccService.java`
+   - SVN URL：`https://svn.example.com/svn/cust/ecology/src/...`（自动裁切为相对路径）
+   - 本地全路径：`D:\...\ecology\src\...`（自动裁切为相对 ecology 路径，并作为「提交后覆盖本地」的本地源）
+   - 自动剥除 `[red]/[black]` 前缀与 `(Vxxx)` 版本号后缀；`#`/`//` 注释行与 `[black]` 行自动跳过
+5. 按需勾选：**允许覆盖已存在的文件**（默认勾选，取消后目标已存在的文件跳过）、**覆盖后提交 SVN**（默认勾选）
+6. 点击 **扫描预览**，工具按优先级到各来源目录的 `ecology/` 子目录（及目录本身）查找并显示命中情况：**待覆盖** / **跳过(目标已存在)**（未勾选允许覆盖）/ **未找到来源**；CLI/核心版还会比对文件内容，来源与目标一致时标记为 **内容相同** 并跳过
+7. 点击 **确认覆盖** 将文件复制到目标 SVN 目录（执行前弹窗确认覆盖数量）
+8. 覆盖后按设置自动提交（GUI 默认勾选「覆盖后提交 SVN」；CLI 需显式加 `--commit`），或点击 **提交 SVN 标准文件** 手动提交：提交信息自动生成为「任务标题 + 来源类型（标准文件/历史文件）」，提交对象是目标 SVN 目录的整体工作副本（其他已修改/已登记变更会一并提交）；CLI 模式提交前会展示 `svn status` 供确认
+9. 提交成功后自动解析版本号，把变更文件 URL（`{SVN地址}/{路径}(V{版本})`）写入日志，并可用 **复制提交文件路径** 一键复制
+10. 提交完成后，若文件清单里贴的是本地全路径，可点击 **提交后覆盖本地**，用这些本地文件覆盖目标 SVN 工作副本中对应的已提交文件；该操作只覆盖、不会再次提交 SVN
 
-> 来源查找优先级：`{KB路径}/ecology/{rel_path}` → `{KB路径}/{rel_path}` → `{历史路径}/ecology/{rel_path}` → `{历史路径}/{rel_path}`。目录条目（非文件）自动过滤。
+> 来源查找优先级（升级任务）：`{KB路径}/ecology/{rel_path}` → `{KB路径}/{rel_path}` → `{历史路径}/ecology/{rel_path}` → `{历史路径}/{rel_path}`；二开任务：`{历史路径}/ecology/{rel_path}` → `{历史路径}/{rel_path}`。目录条目（非文件）自动过滤。
+>
+> 终端版对应 `standard` 子命令（主菜单项 6）：`--dry-run` 仅扫描预览、`--skip-existing` 跳过目标已存在文件、`--yes` 非交互确认覆盖、`--commit` 覆盖后提交、`--copy` 复制提交文件 URL。
 
 ---
+
 ## 共享目录地址 / Network Share
 
 「整理好的目录（来源）」除了本地路径，也可以直接填**网络共享地址**。工具会按操作系统自动处理，**两个平台都无需手动改写路径**：
