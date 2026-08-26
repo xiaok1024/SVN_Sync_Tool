@@ -35,6 +35,7 @@ class WebAppApiTest(unittest.TestCase):
         self.assertIn("升级工具中心", response.text)
         self.assertIn("LZR", response.text)
         self.assertIn("SVN 标准文件提交", response.text)
+        self.assertIn("版本号路径生成", response.text)
         self.assertIn("default-src 'self'", response.headers["content-security-policy"])
         self.assertEqual(response.headers["x-frame-options"], "DENY")
         self.assertEqual(response.headers["cache-control"], "no-store")
@@ -152,6 +153,75 @@ class WebAppApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["ok"])
 
+    def test_cross_site_write_request_is_rejected(self):
+        response = self.client.post(
+            "/api/v1/upgrade-list/extract",
+            json={"html": "test"},
+            headers={"origin": "http://untrusted.example"},
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["error"]["code"], "origin_mismatch")
+
+    def test_revision_path_sort_endpoint_reuses_shared_sorting(self):
+        response = self.client.post(
+            "/api/v1/revision-paths/sort",
+            json={
+                "text": ("http://svn.example.com/svn/R/b/Zeta.java(V192)\n"
+                         "http://svn.example.com/svn/R/a/Alpha.java(V189)"),
+                "sort": "rev",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["sort"], "rev")
+        self.assertEqual(payload["stats"]["file_count"], 2)
+        self.assertTrue(payload["text"].startswith("http://svn.example.com/svn/R/a/Alpha.java(V189)"))
+
+    def test_revision_path_query_validates_input_without_echoing_password(self):
+        password = "do-not-echo-this-password"
+        response = self.client.post(
+            "/api/v1/revision-paths/query",
+            json={
+                "svn_url": "https://svn.example.com/svn/customer",
+                "svn_username": "demo-user",
+                "svn_password": password,
+                "revision_spec": "not-a-revision",
+                "sort": "rev",
+            },
+        )
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["error"]["code"], "invalid_revision_spec")
+        self.assertNotIn(password, response.text)
+
+    def test_revision_path_query_rejects_arbitrary_extra_fields(self):
+        response = self.client.post(
+            "/api/v1/revision-paths/query",
+            json={
+                "svn_url": "https://svn.example.com/svn/customer",
+                "revision_spec": "123",
+                "sort": "rev",
+                "config_dir": "/tmp/should-not-be-accepted",
+            },
+        )
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["error"]["code"], "invalid_field")
+
+    def test_revision_path_endpoints_reject_cross_site_writes(self):
+        for path in ("/api/v1/revision-paths/query", "/api/v1/revision-paths/sort"):
+            response = self.client.post(
+                path,
+                json={"svn_url": "https://svn.example.com/svn/R",
+                      "revision_spec": "1", "sort": "rev", "text": "a(V1)"},
+                headers={"origin": "http://untrusted.example"},
+            )
+            self.assertEqual(response.status_code, 403, path)
+
+    def test_static_assets_are_always_revalidated(self):
+        response = self.client.get("/static/app.js")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("no-cache", response.headers["cache-control"])
+
     def test_static_route_cannot_read_repository_files(self):
         response = self.client.get("/static/%2e%2e/README.md")
         self.assertEqual(response.status_code, 404)
@@ -163,11 +233,11 @@ class WebSourceSafetyTest(unittest.TestCase):
         javascript = (root / "web" / "static" / "app.js").read_text(encoding="utf-8")
         self.assertNotIn("innerHTML", javascript)
 
-    def test_entry_is_fixed_to_loopback_address(self):
+    def test_entry_requires_explicit_lan_mode(self):
         root = Path(__file__).resolve().parents[1]
         source = (root / "svn_sync_web.py").read_text(encoding="utf-8")
-        self.assertIn('host="127.0.0.1"', source)
-        self.assertNotIn('host="0.0.0.0"', source)
+        self.assertIn('"0.0.0.0" if args.lan else "127.0.0.1"', source)
+        self.assertIn('parser.add_argument(\n        "--lan"', source)
 
 
 if __name__ == "__main__":

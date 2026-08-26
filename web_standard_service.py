@@ -13,7 +13,6 @@ import os
 import re
 import secrets
 import shutil
-import subprocess
 import tempfile
 import threading
 import time
@@ -28,11 +27,18 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 from svn_standard_file_core import StandardFileService
-from svn_sync_core import SVN_EXECUTABLE, SyncEngine, redact_sensitive_text
+from svn_sync_core import SyncEngine, redact_sensitive_text
 from svn_sync_workflow import (
     get_repository_head_revision,
     list_repository_files,
     prepare_sparse_working_copy,
+)
+from web_svn_common import (
+    WebSvnEngine,
+    WebSvnError,
+    normalize_svn_url,
+    read_allowed_svn_prefixes,
+    supports_password_from_stdin,
 )
 
 
@@ -52,12 +58,8 @@ TERMINAL_STATES = {"committed", "no_changes", "failed", "expired", "cancelled", 
 DEFAULT_STANDARD_UNC_PREFIX = r"\\192.168.7.215\ECOLOGY_customer"
 
 
-class StandardWebError(Exception):
-    def __init__(self, code, message, status_code=422):
-        super().__init__(message)
-        self.code = code
-        self.message = message
-        self.status_code = status_code
+class StandardWebError(WebSvnError):
+    """标准文件任务的业务错误；结构与其他 Web SVN 功能保持一致。"""
 
 
 @dataclass(frozen=True)
@@ -201,50 +203,8 @@ def _directory_size(path):
     return total
 
 
-def _supports_password_from_stdin():
-    try:
-        result = subprocess.run(
-            [SVN_EXECUTABLE, "help", "checkout", "--verbose"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return b"--password-from-stdin" in result.stdout
-
-
 def _strip_version_suffix(value):
     return re.sub(r"\([Vv]\d+\)(?:\s*[-—].*)?\s*$", "", value).strip()
-
-
-def _normalize_svn_url(value, allowed_prefixes=(), allow_file_urls=False):
-    text = str(value or "").strip().rstrip("/")
-    if not text or len(text) > 2048 or any(ord(char) < 32 for char in text):
-        raise StandardWebError("invalid_svn_url", "客户 SVN 地址格式不正确")
-    parsed = urllib.parse.urlsplit(text)
-    try:
-        parsed.port
-    except ValueError:
-        raise StandardWebError("invalid_svn_url", "客户 SVN 地址端口格式不正确") from None
-    if any(ord(char) < 32 or ord(char) == 127
-           for char in urllib.parse.unquote(text)):
-        raise StandardWebError("invalid_svn_url", "客户 SVN 地址包含不安全字符")
-    valid_http = parsed.scheme.lower() in {"http", "https"} and bool(parsed.hostname)
-    valid_test_file = allow_file_urls and parsed.scheme.lower() == "file" and bool(parsed.path)
-    if not (valid_http or valid_test_file):
-        raise StandardWebError("invalid_svn_url", "客户 SVN 地址只支持 http 或 https")
-    if parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise StandardWebError("invalid_svn_url", "SVN 地址不能包含账号、查询参数或片段")
-    if allowed_prefixes:
-        accepted = any(
-            text == prefix.rstrip("/") or text.startswith(prefix.rstrip("/") + "/")
-            for prefix in allowed_prefixes
-        )
-        if not accepted:
-            raise StandardWebError("svn_url_not_allowed", "该 SVN 地址不在服务端允许范围内", 403)
-    return text
 
 
 def parse_web_file_list(file_list, _svn_url=None):
@@ -308,47 +268,6 @@ def parse_customer_standard_path(value, unc_prefix=DEFAULT_STANDARD_UNC_PREFIX):
             "invalid_customer_path",
             "客户标准文件路径格式应为 固定共享根\\分组\\客户\\QC编号\\ecology")
     return "/".join(parts)
-
-
-class WebSvnEngine(SyncEngine):
-    """强制使用独立配置、禁用缓存并通过 stdin 传递密码。"""
-
-    def __init__(self, username, password, config_dir):
-        super().__init__()
-        self.svn_user = username
-        self.svn_pass = password
-        self.svn_config_dir = str(config_dir)
-        self.svn_no_auth_cache = True
-        self.svn_password_from_stdin = True
-        self.commit_process_started = False
-        config_path = Path(config_dir)
-        config_path.mkdir(parents=True, exist_ok=True, mode=0o700)
-        try:
-            config_path.chmod(0o700)
-        except OSError:
-            pass
-        (config_path / "config").write_text(
-            "[auth]\npassword-stores =\nstore-passwords = no\nstore-auth-creds = no\n",
-            encoding="utf-8",
-        )
-        (config_path / "servers").write_text(
-            "[global]\nstore-passwords = no\nstore-plaintext-passwords = no\nstore-auth-creds = no\n",
-            encoding="utf-8",
-        )
-
-    def _run_svn(self, _log_widget, *args):
-        return self._run_svn_bytes(*args, timeout=180)
-
-    def _svn_process_started(self, args):
-        if args and args[0] == "commit":
-            self.commit_process_started = True
-
-    def reset_commit_tracking(self):
-        self.commit_process_started = False
-
-    def release_credentials(self):
-        self.svn_user = ""
-        self.svn_pass = ""
 
 
 @dataclass
@@ -453,9 +372,7 @@ class StandardJobManager:
     @classmethod
     def from_environment(cls, environ=None):
         env = environ or os.environ
-        prefixes = [part.strip() for part in
-                    str(env.get("SVN_SYNC_WEB_ALLOWED_SVN_PREFIXES", "") or "").split(",")
-                    if part.strip()]
+        prefixes = read_allowed_svn_prefixes(env)
         # 保留 ``None``，让 load_source_profiles 能区分正常启动与测试显式传入
         # 的环境映射，并在正常启动时按 ecology-9-dev 路径注册表查找凭据引用。
         return cls(load_source_profiles(environ), allowed_svn_prefixes=prefixes)
@@ -811,7 +728,7 @@ class StandardJobManager:
     def create_job(
             self, *, svn_url, username, password, profile_id, file_list, commit_message,
             customer_standard_path="", cover_all_confirmed=False):
-        if self.require_password_stdin and not _supports_password_from_stdin():
+        if self.require_password_stdin and not supports_password_from_stdin():
             raise StandardWebError(
                 "svn_password_stdin_unsupported",
                 "当前 SVN CLI 不支持安全的 stdin 密码输入，已拒绝创建任务",
@@ -822,8 +739,9 @@ class StandardJobManager:
             raise StandardWebError("source_profile_not_found", "标准文件来源配置不存在", 404)
         if not profile.available:
             raise StandardWebError("source_profile_unavailable", "标准文件来源当前不可用", 503)
-        clean_url = _normalize_svn_url(
-            svn_url, self.allowed_svn_prefixes, allow_file_urls=self.allow_file_urls)
+        clean_url = normalize_svn_url(
+            svn_url, self.allowed_svn_prefixes, allow_file_urls=self.allow_file_urls,
+            error_type=StandardWebError)
         clean_username = str(username or "").strip()
         clean_password = str(password or "")
         if (not clean_username or len(clean_username) > 256 or "\n" in clean_username

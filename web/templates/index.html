@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="将带颜色升级清单整理成人读与 AI Markdown。">
+  <meta name="description" content="本地升级工具中心：版本号路径生成、SVN 标准文件提交、升级清单提取。">
   <title>升级工具中心 · LZR</title>
   <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}">
   <script src="{{ url_for('static', path='/app.js') }}" defer></script>
@@ -29,158 +29,139 @@
 
   <main class="site-main" id="workspace">
     <nav class="tool-switch" aria-label="工具功能">
-      <a href="#upgrade-list" data-tool-link="upgrade" aria-current="page">
-        <span>01</span>升级清单提取
+      <a href="#revision-paths" data-tool-link="path" aria-current="page">
+        <span>01</span>版本号路径生成
       </a>
       <a href="#svn-standard" data-tool-link="standard">
         <span>02</span>SVN 标准文件提交
       </a>
+      <a href="#upgrade-list" data-tool-link="upgrade">
+        <span>03</span>升级清单提取
+      </a>
     </nav>
 
-    <section id="upgradeToolView" data-tool-view="upgrade">
-    <section class="intro" aria-labelledby="page-title">
-      <div class="intro-copy">
-        <p class="eyebrow">UPGRADE LIST · 01</p>
-        <h1 id="page-title" tabindex="-1">把升级清单整理成<br>清晰、可靠的交付结果。</h1>
-        <p class="intro-description">粘贴带颜色的富文本清单，校对红黑文件标记，一次生成人读与 AI Markdown。</p>
-      </div>
-      <div class="local-note">
-        <span class="local-note-icon" aria-hidden="true"></span>
-        <div>
-          <strong>仅在本机处理</strong>
-          <span>服务端不落盘，不读取主机剪贴板</span>
+    <section id="pathToolView" data-tool-view="path">
+      <section class="intro path-intro" aria-labelledby="path-page-title">
+        <div class="intro-copy">
+          <p class="eyebrow">REVISION PATHS · 01</p>
+          <h1 id="path-page-title" tabindex="-1">给一个版本号，拿到完整文件路径。</h1>
+          <p class="intro-description">不用逐行翻 SVN log：查询变更文件并拼好带 <code>(V版本)</code> 的完整 URL，支持三种排序。</p>
         </div>
-      </div>
-    </section>
-
-    <ol class="flow-steps" aria-label="处理步骤">
-      <li class="flow-step is-active" data-stage="1">
-        <span class="step-index">01</span>
-        <span><strong>粘贴源内容</strong><small>保留红黑颜色</small></span>
-      </li>
-      <li class="flow-step" data-stage="2">
-        <span class="step-index">02</span>
-        <span><strong>校对文件清单</strong><small>支持手工修正</small></span>
-      </li>
-      <li class="flow-step" data-stage="3">
-        <span class="step-index">03</span>
-        <span><strong>生成 Markdown</strong><small>复制或下载</small></span>
-      </li>
-    </ol>
-
-    <section class="workspace-grid" aria-label="升级清单工作区">
-      <article class="panel source-panel">
-        <div class="panel-heading">
+        <div class="local-note">
+          <span class="local-note-icon shield-icon" aria-hidden="true"></span>
           <div>
-            <p class="panel-kicker">SOURCE</p>
-            <h2>粘贴升级清单</h2>
-          </div>
-          <div class="panel-tools">
-            <button class="text-button" type="button" id="sampleButton">加载示例</button>
-            <button class="text-button" type="button" id="fileButton">读取 HTML</button>
-            <input id="htmlFile" type="file" accept=".html,.htm,text/html" hidden>
+            <strong>只读查询</strong>
+            <span>只执行 svn log，不写入仓库，不使用主机认证缓存</span>
           </div>
         </div>
+      </section>
 
-        <label class="field-label" for="sourceInput">原始内容</label>
-        <textarea
-          id="sourceInput"
-          class="editor source-editor"
-          rows="14"
-          spellcheck="false"
-          placeholder="在这里按 Cmd / Ctrl + V 粘贴网页中的带颜色升级清单…"
-          aria-describedby="sourceHelp sourceState"
-        ></textarea>
-        <div class="field-footer">
-          <span id="sourceHelp">优先读取浏览器剪贴板中的 HTML，以保留红色和黑色。</span>
-          <span class="input-state" id="sourceState" data-state="empty">等待粘贴</span>
-        </div>
-
-        <div class="panel-actions">
-          <button class="button button-primary" type="button" id="extractButton">
-            <span class="button-label" data-default="提取升级清单">提取升级清单</span>
-            <span class="button-arrow" aria-hidden="true">→</span>
-          </button>
-          <button class="button button-secondary" type="button" id="clearButton">清空</button>
-        </div>
-      </article>
-
-      <article class="panel list-panel">
-        <div class="panel-heading">
-          <div>
-            <p class="panel-kicker">REVIEW</p>
-            <h2>校对提取结果</h2>
+      <div class="path-layout">
+        <article class="panel path-form-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">QUERY</p>
+              <h2>版本号路径生成</h2>
+            </div>
+            <span class="readonly-tag">只读</span>
           </div>
-          <span class="readonly-tag">可编辑</span>
-        </div>
 
-        <div class="summary-grid" aria-label="提取结果统计">
-          <div class="summary-item"><span>QC</span><strong id="qcCount">—</strong></div>
-          <div class="summary-item"><span>文件</span><strong id="fileCount">—</strong></div>
-          <div class="summary-item summary-red"><span>红色</span><strong id="redCount">—</strong></div>
-          <div class="summary-item summary-dark"><span>黑色</span><strong id="blackCount">—</strong></div>
-        </div>
+          <div class="inline-error-summary" id="pathErrorSummary" role="alert" tabindex="-1" hidden></div>
 
-        <label class="field-label" for="listInput">可编辑清单</label>
-        <textarea
-          id="listInput"
-          class="editor list-editor"
-          rows="14"
-          spellcheck="false"
-          placeholder="提取后的 QC 分组与 [red] / [black] 文件会显示在这里。"
-          disabled
-        ></textarea>
+          <form id="pathQueryForm" autocomplete="off" novalidate>
+            <fieldset class="standard-form-section">
+              <legend>SVN 连接</legend>
+              <label class="field-label" for="pathSvnUrl">SVN 仓库根地址</label>
+              <input class="text-input" id="pathSvnUrl" type="url" inputmode="url" autocapitalize="none" autocomplete="off" spellcheck="false" placeholder="http://10.1.3.12/svn/S客户开发">
+              <p class="input-help">支持中文路径。请填写<strong>仓库根地址</strong>：<code>svn log</code> 返回的是仓库绝对路径，生成的 URL 由该地址直接拼接；填子目录会重复一段路径。</p>
 
-        <div class="warning-list" id="warningList" aria-live="polite" hidden></div>
+              <div class="credential-grid">
+                <div>
+                  <label class="field-label" for="pathSvnUsername">SVN 账号</label>
+                  <input class="text-input" id="pathSvnUsername" type="text" autocomplete="off" autocapitalize="none" spellcheck="false">
+                </div>
+                <div>
+                  <label class="field-label" for="pathSvnPassword">SVN 密码</label>
+                  <input class="text-input" id="pathSvnPassword" type="password" autocomplete="new-password">
+                </div>
+              </div>
+              <p class="credential-note"><strong>两者都留空</strong>即使用运行本服务这台机器上已缓存的 SVN 认证（只读查询，不会写入仓库）；填写时两者必须同时填，凭据只用于本次查询，不写入浏览器存储、服务器日志或 SVN 认证缓存。</p>
+            </fieldset>
 
-        <div class="generate-row">
-          <div class="format-switch" role="group" aria-label="Markdown 输出格式">
-            <button type="button" class="format-option is-selected" data-format="md" aria-pressed="true" disabled>人读 Markdown</button>
-            <button type="button" class="format-option" data-format="ai-md" aria-pressed="false" disabled>AI Markdown</button>
+            <fieldset class="standard-form-section">
+              <legend>版本号</legend>
+              <label class="field-label" for="pathRevisionSpec">SVN 版本号</label>
+              <input class="text-input" id="pathRevisionSpec" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" placeholder="189-192">
+              <div class="field-footer">
+                <span>单版本 <code>123</code>｜多个 <code>123,456</code> 或 <code>123 456</code>｜区间 <code>123-456</code>｜联合 <code>123,456-789,1000</code></span>
+                <output id="pathRevisionCount">0 个版本</output>
+              </div>
+
+              <label class="field-label" for="pathSortMode">排序方式</label>
+              <select class="text-input" id="pathSortMode">
+                <option value="rev">按版本排序</option>
+                <option value="path">按路径排序</option>
+                <option value="name">按文件名排序</option>
+              </select>
+              <p class="input-help">切换排序方式后，可直接点「仅排序下方内容」重排已有结果，不会重新查询 SVN。</p>
+            </fieldset>
+
+            <div class="panel-actions path-form-actions">
+              <button class="button button-primary" id="pathQueryButton" type="submit">
+                <span class="button-label" data-default="查询并生成">查询并生成</span><span class="button-arrow" aria-hidden="true">→</span>
+              </button>
+              <button class="button button-secondary" id="pathSortButton" type="button">
+                <span class="button-label" data-default="仅排序下方内容">仅排序下方内容</span>
+              </button>
+              <button class="button button-secondary" id="pathResetButton" type="reset">清空</button>
+            </div>
+          </form>
+        </article>
+
+        <article class="panel path-result-panel" aria-labelledby="path-result-title">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">OUTPUT</p>
+              <h2 id="path-result-title" tabindex="-1">文件路径</h2>
+            </div>
+            <span class="task-status-badge" id="pathStateBadge" data-state="idle">尚未查询</span>
           </div>
-          <button class="button button-primary" type="button" id="generateButton" disabled>生成结果</button>
-        </div>
-      </article>
-    </section>
 
-    <section class="panel result-panel" aria-labelledby="result-title">
-      <div class="result-heading">
-        <div>
-          <p class="panel-kicker">OUTPUT</p>
-          <h2 id="result-title">Markdown 结果</h2>
-        </div>
-        <div class="result-meta">
-          <span id="resultCustomer">尚未生成</span>
-          <span id="resultFilename">—</span>
-        </div>
+          <div class="summary-grid path-summary-grid" aria-label="查询结果统计">
+            <div class="summary-item"><span>文件</span><strong id="pathFileCount">—</strong></div>
+            <div class="summary-item"><span>请求版本</span><strong id="pathRequestedCount">—</strong></div>
+            <div class="summary-item"><span>命中版本</span><strong id="pathMatchedCount">—</strong></div>
+            <div class="summary-item summary-red"><span>提示</span><strong id="pathErrorCount">—</strong></div>
+          </div>
+
+          <label class="field-label" for="pathResultOutput">生成的文件路径</label>
+          <textarea
+            id="pathResultOutput"
+            class="editor path-result-output"
+            rows="18"
+            spellcheck="false"
+            placeholder="查询结果会显示在这里；也可以直接粘贴已有的 (V版本) 路径，然后只做本地排序。"
+          ></textarea>
+
+          <div class="warning-list" id="pathWarningList" aria-live="polite" hidden></div>
+
+          <div class="result-actions">
+            <span class="result-hint" id="pathResultHint">填写仓库地址与版本号后开始查询。</span>
+            <div>
+              <button class="button button-secondary" type="button" id="pathCopyButton" disabled>复制结果</button>
+              <button class="button button-primary" type="button" id="pathDownloadButton" disabled>下载文件</button>
+            </div>
+          </div>
+        </article>
       </div>
-
-      <textarea
-        id="resultOutput"
-        class="result-output"
-        rows="18"
-        spellcheck="false"
-        readonly
-        placeholder="生成后的 Markdown 会显示在这里。"
-        aria-label="Markdown 生成结果"
-      ></textarea>
-
-      <div class="result-actions">
-        <span class="result-hint" id="resultHint">编辑清单后，选择格式并生成。</span>
-        <div>
-          <button class="button button-secondary" type="button" id="copyButton" disabled>复制结果</button>
-          <button class="button button-primary" type="button" id="downloadButton" disabled>下载文件</button>
-        </div>
-      </div>
-    </section>
     </section>
 
     <section id="standardToolView" data-tool-view="standard" hidden>
       <section class="intro standard-intro" aria-labelledby="standard-page-title">
         <div class="intro-copy">
           <p class="eyebrow">STANDARD FILES · 02</p>
-          <h1 id="standard-page-title" tabindex="-1">在提交之前，<br>看清每一个文件。</h1>
-          <p class="intro-description">可按相对路径清单处理，也可安全覆盖两端共有文件；任务始终基于 SVN 最新版本生成预览，确认后再使用你的账号提交。</p>
+          <h1 id="standard-page-title" tabindex="-1">在提交之前，看清每一个文件。</h1>
+          <p class="intro-description">基于 SVN 最新版本生成覆盖预览，二次确认后用你自己的账号精确提交本次路径。</p>
         </div>
         <div class="local-note">
           <span class="local-note-icon shield-icon" aria-hidden="true"></span>
@@ -342,6 +323,144 @@
           </details>
         </article>
       </div>
+    </section>
+
+    <section id="upgradeToolView" data-tool-view="upgrade" hidden>
+    <section class="intro" aria-labelledby="page-title">
+      <div class="intro-copy">
+        <p class="eyebrow">UPGRADE LIST · 03</p>
+        <h1 id="page-title" tabindex="-1">把升级清单整理成可交付的 Markdown。</h1>
+        <p class="intro-description">粘贴带颜色富文本，校对红黑标记，一次生成人读与 AI 两份 Markdown。</p>
+      </div>
+      <div class="local-note">
+        <span class="local-note-icon" aria-hidden="true"></span>
+        <div>
+          <strong>仅在本机处理</strong>
+          <span>服务端不落盘，不读取主机剪贴板</span>
+        </div>
+      </div>
+    </section>
+
+    <ol class="flow-steps" aria-label="处理步骤">
+      <li class="flow-step is-active" data-stage="1">
+        <span class="step-index">01</span>
+        <span><strong>粘贴源内容</strong><small>保留红黑颜色</small></span>
+      </li>
+      <li class="flow-step" data-stage="2">
+        <span class="step-index">02</span>
+        <span><strong>校对文件清单</strong><small>支持手工修正</small></span>
+      </li>
+      <li class="flow-step" data-stage="3">
+        <span class="step-index">03</span>
+        <span><strong>生成 Markdown</strong><small>复制或下载</small></span>
+      </li>
+    </ol>
+
+    <section class="workspace-grid" aria-label="升级清单工作区">
+      <article class="panel source-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="panel-kicker">SOURCE</p>
+            <h2>粘贴升级清单</h2>
+          </div>
+          <div class="panel-tools">
+            <button class="text-button" type="button" id="sampleButton">加载示例</button>
+            <button class="text-button" type="button" id="fileButton">读取 HTML</button>
+            <input id="htmlFile" type="file" accept=".html,.htm,text/html" hidden>
+          </div>
+        </div>
+
+        <label class="field-label" for="sourceInput">原始内容</label>
+        <textarea
+          id="sourceInput"
+          class="editor source-editor"
+          rows="14"
+          spellcheck="false"
+          placeholder="在这里按 Cmd / Ctrl + V 粘贴网页中的带颜色升级清单…"
+          aria-describedby="sourceHelp sourceState"
+        ></textarea>
+        <div class="field-footer">
+          <span id="sourceHelp">优先读取浏览器剪贴板中的 HTML，以保留红色和黑色。</span>
+          <span class="input-state" id="sourceState" data-state="empty">等待粘贴</span>
+        </div>
+
+        <div class="panel-actions">
+          <button class="button button-primary" type="button" id="extractButton">
+            <span class="button-label" data-default="提取升级清单">提取升级清单</span>
+            <span class="button-arrow" aria-hidden="true">→</span>
+          </button>
+          <button class="button button-secondary" type="button" id="clearButton">清空</button>
+        </div>
+      </article>
+
+      <article class="panel list-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="panel-kicker">REVIEW</p>
+            <h2>校对提取结果</h2>
+          </div>
+          <span class="readonly-tag">可编辑</span>
+        </div>
+
+        <div class="summary-grid" aria-label="提取结果统计">
+          <div class="summary-item"><span>QC</span><strong id="qcCount">—</strong></div>
+          <div class="summary-item"><span>文件</span><strong id="fileCount">—</strong></div>
+          <div class="summary-item summary-red"><span>红色</span><strong id="redCount">—</strong></div>
+          <div class="summary-item summary-dark"><span>黑色</span><strong id="blackCount">—</strong></div>
+        </div>
+
+        <label class="field-label" for="listInput">可编辑清单</label>
+        <textarea
+          id="listInput"
+          class="editor list-editor"
+          rows="14"
+          spellcheck="false"
+          placeholder="提取后的 QC 分组与 [red] / [black] 文件会显示在这里。"
+          disabled
+        ></textarea>
+
+        <div class="warning-list" id="warningList" aria-live="polite" hidden></div>
+
+        <div class="generate-row">
+          <div class="format-switch" role="group" aria-label="Markdown 输出格式">
+            <button type="button" class="format-option is-selected" data-format="md" aria-pressed="true" disabled>人读 Markdown</button>
+            <button type="button" class="format-option" data-format="ai-md" aria-pressed="false" disabled>AI Markdown</button>
+          </div>
+          <button class="button button-primary" type="button" id="generateButton" disabled>生成结果</button>
+        </div>
+      </article>
+    </section>
+
+    <section class="panel result-panel" aria-labelledby="result-title">
+      <div class="result-heading">
+        <div>
+          <p class="panel-kicker">OUTPUT</p>
+          <h2 id="result-title">Markdown 结果</h2>
+        </div>
+        <div class="result-meta">
+          <span id="resultCustomer">尚未生成</span>
+          <span id="resultFilename">—</span>
+        </div>
+      </div>
+
+      <textarea
+        id="resultOutput"
+        class="result-output"
+        rows="18"
+        spellcheck="false"
+        readonly
+        placeholder="生成后的 Markdown 会显示在这里。"
+        aria-label="Markdown 生成结果"
+      ></textarea>
+
+      <div class="result-actions">
+        <span class="result-hint" id="resultHint">编辑清单后，选择格式并生成。</span>
+        <div>
+          <button class="button button-secondary" type="button" id="copyButton" disabled>复制结果</button>
+          <button class="button button-primary" type="button" id="downloadButton" disabled>下载文件</button>
+        </div>
+      </div>
+    </section>
     </section>
 
     <footer class="site-footer">

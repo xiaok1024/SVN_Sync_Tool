@@ -20,6 +20,8 @@
   --danger-soft: #fff0f0;
   --shadow: 0 16px 38px rgba(19, 33, 68, 0.06);
   --radius: 18px;
+  /* 页面所有相邻区块（导航、简介条、流程条、卡片网格）共用一个间距 */
+  --block-gap: 20px;
   --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
   --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
 }
@@ -173,7 +175,13 @@ select:focus-visible {
 .site-main {
   width: min(1220px, calc(100% - 48px));
   margin: 0 auto;
-  padding: 54px 0 40px;
+  padding: 24px 0 40px;
+}
+
+[data-tool-view] {
+  display: flex;
+  flex-direction: column;
+  gap: var(--block-gap);
 }
 
 .tool-switch {
@@ -181,7 +189,7 @@ select:focus-visible {
   max-width: 100%;
   display: flex;
   gap: 5px;
-  margin: -22px 0 24px;
+  margin: 0 0 var(--block-gap);
   overflow-x: auto;
   border: 1px solid var(--line);
   border-radius: 13px;
@@ -227,35 +235,35 @@ select:focus-visible {
 .intro {
   position: relative;
   overflow: hidden;
-  min-height: 250px;
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   justify-content: space-between;
-  gap: 48px;
-  border-radius: 24px;
+  gap: 28px;
+  border-radius: 16px;
   background: var(--navy);
   color: #fff;
-  padding: 44px 48px;
-  box-shadow: 0 24px 54px rgba(17, 26, 46, 0.16);
+  padding: 18px 24px;
+  box-shadow: 0 10px 26px rgba(17, 26, 46, 0.12);
 }
 
 .intro::after {
   content: "";
   position: absolute;
-  width: 340px;
-  height: 340px;
-  top: -190px;
-  right: -90px;
-  border: 1px solid rgba(126, 161, 255, 0.28);
+  width: 190px;
+  height: 190px;
+  top: -128px;
+  right: -54px;
+  border: 1px solid rgba(126, 161, 255, 0.22);
   border-radius: 50%;
-  box-shadow: 0 0 0 62px rgba(126, 161, 255, 0.04), 0 0 0 124px rgba(126, 161, 255, 0.025);
+  box-shadow: 0 0 0 34px rgba(126, 161, 255, 0.035), 0 0 0 68px rgba(126, 161, 255, 0.02);
   pointer-events: none;
 }
 
 .intro-copy {
   position: relative;
   z-index: 1;
-  max-width: 730px;
+  min-width: 0;
+  max-width: 860px;
 }
 
 .eyebrow,
@@ -267,19 +275,29 @@ select:focus-visible {
   letter-spacing: 0.18em;
 }
 
+.intro .eyebrow {
+  margin: 0 0 5px;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+}
+
 .intro h1 {
   margin: 0;
-  font-size: clamp(32px, 4vw, 48px);
-  line-height: 1.2;
-  letter-spacing: -0.035em;
+  font-size: clamp(19px, 1.7vw, 23px);
+  line-height: 1.35;
+  letter-spacing: -0.018em;
+}
+
+.intro h1 br {
+  display: none;
 }
 
 .intro-description {
-  max-width: 640px;
-  margin: 20px 0 0;
-  color: #b9c2d4;
-  font-size: 16px;
-  line-height: 1.75;
+  max-width: 780px;
+  margin: 5px 0 0;
+  color: #a9b3c7;
+  font-size: 13px;
+  line-height: 1.6;
 }
 
 .local-note {
@@ -288,17 +306,17 @@ select:focus-visible {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
-  gap: 12px;
-  min-width: 245px;
+  gap: 9px;
   border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 14px;
+  border-radius: 999px;
   background: rgba(255, 255, 255, 0.06);
-  padding: 14px 16px;
+  padding: 7px 14px 7px 11px;
 }
 
 .local-note-icon {
-  width: 28px;
-  height: 28px;
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
   border: 2px solid #8fafff;
   border-radius: 50%;
   position: relative;
@@ -312,39 +330,41 @@ select:focus-visible {
 }
 
 .local-note-icon::before {
-  width: 8px;
+  width: 6px;
   height: 2px;
-  left: 8px;
-  top: 13px;
+  left: 5px;
+  top: 8px;
 }
 
 .local-note-icon::after {
   width: 2px;
-  height: 8px;
-  left: 11px;
-  top: 8px;
+  height: 6px;
+  left: 7px;
+  top: 5px;
 }
 
 .local-note div {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 1px;
 }
 
 .local-note strong {
-  font-size: 13px;
+  font-size: 12px;
+  line-height: 1.35;
 }
 
 .local-note span:last-child {
-  color: #aeb9ce;
-  font-size: 11px;
+  color: #a9b3c7;
+  font-size: 10.5px;
+  line-height: 1.35;
 }
 
 .flow-steps {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
   gap: 0;
-  margin: 30px 0;
+  margin: 0;
   padding: 0 18px;
   list-style: none;
 }
@@ -416,7 +436,7 @@ select:focus-visible {
 .workspace-grid {
   display: grid;
   grid-template-columns: minmax(0, 0.94fr) minmax(0, 1.06fr);
-  gap: 20px;
+  gap: var(--block-gap);
 }
 
 .panel {
@@ -521,10 +541,20 @@ select:focus-visible {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: 6px 12px;
+  flex-wrap: wrap;
   color: var(--muted-2);
   padding-top: 9px;
   font-size: 11px;
+}
+
+.field-footer > span {
+  min-width: 0;
+}
+
+.field-footer > output {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .input-state {
@@ -779,7 +809,7 @@ select:focus-visible {
 .standard-layout {
   display: grid;
   grid-template-columns: minmax(350px, 0.86fr) minmax(0, 1.14fr);
-  gap: 20px;
+  gap: var(--block-gap);
   align-items: start;
 }
 
@@ -981,6 +1011,12 @@ select:focus-visible {
   border-color: #caeadc;
   background: var(--success-soft);
   color: var(--success);
+}
+
+.task-status-badge[data-state="warning"] {
+  border-color: #ecdca6;
+  background: var(--warning-soft);
+  color: var(--warning);
 }
 
 .task-status-badge[data-state="error"] {
@@ -1521,6 +1557,56 @@ select:focus-visible {
   background: #9f2f33;
 }
 
+/* ── 版本号路径生成 ── */
+
+.path-layout {
+  display: grid;
+  grid-template-columns: minmax(340px, 0.82fr) minmax(0, 1.18fr);
+  gap: var(--block-gap);
+  align-items: start;
+}
+
+.path-form-panel,
+.path-result-panel {
+  min-width: 0;
+  padding: 26px;
+}
+
+.path-result-panel {
+  position: sticky;
+  top: 90px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.path-summary-grid {
+  margin: 0;
+}
+
+.path-result-output {
+  min-height: 320px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.75;
+  white-space: pre;
+  overflow-wrap: normal;
+  overflow-x: auto;
+}
+
+.path-form-actions {
+  flex-wrap: wrap;
+}
+
+.path-intro .intro-description code,
+.path-form-panel code {
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: var(--surface-soft);
+  font-family: var(--mono);
+  font-size: 0.92em;
+}
+
 @media (max-width: 980px) {
   .intro {
     align-items: flex-start;
@@ -1528,18 +1614,20 @@ select:focus-visible {
   }
 
   .local-note {
-    width: 100%;
+    align-self: stretch;
   }
 
   .workspace-grid {
     grid-template-columns: 1fr;
   }
 
-  .standard-layout {
+  .standard-layout,
+  .path-layout {
     grid-template-columns: 1fr;
   }
 
-  .standard-task-panel {
+  .standard-task-panel,
+  .path-result-panel {
     position: static;
   }
 
@@ -1559,16 +1647,7 @@ select:focus-visible {
   }
 
   .intro {
-    min-height: auto;
-    padding: 30px 24px;
-  }
-
-  .intro h1 br {
-    display: none;
-  }
-
-  .intro-description {
-    font-size: 15px;
+    padding: 16px 18px;
   }
 
   .flow-steps {
@@ -1676,7 +1755,7 @@ select:focus-visible {
   }
 
   .intro h1 {
-    font-size: 29px;
+    font-size: 18px;
   }
 
   .field-footer {

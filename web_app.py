@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
 from json import JSONDecodeError
 from pathlib import Path
@@ -19,6 +20,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from web_upgrade_service import UpgradeWebError, extract_upgrade_list, generate_upgrade_markdown
+from web_path_service import PathQueryService, PathWebError, sort_revision_path_text
 from web_standard_service import StandardJobManager, StandardWebError
 
 
@@ -26,6 +28,18 @@ LOGGER = logging.getLogger("svn_sync_web")
 PROJECT_ROOT = Path(__file__).resolve().parent
 WEB_ROOT = PROJECT_ROOT / "web"
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
+
+
+def _allowed_hosts():
+    configured = os.environ.get("SVN_SYNC_WEB_ALLOWED_HOSTS", "")
+    hosts = {
+        "127.0.0.1",
+        "localhost",
+        "lzr-mac-mini.local",
+        "testserver",
+    }
+    hosts.update(value.strip().lower() for value in configured.split(",") if value.strip())
+    return sorted(hosts)
 
 
 class ExtractRequest(BaseModel):
@@ -48,6 +62,23 @@ class StandardJobRequest(BaseModel):
     file_list: str
     cover_all_confirmed: bool = False
     commit_message: str
+
+
+class RevisionPathQueryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    svn_url: str
+    svn_username: str = ""
+    svn_password: str = ""
+    revision_spec: str
+    sort: str = "rev"
+
+
+class RevisionPathSortRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str
+    sort: str = "rev"
 
 
 class StandardCommitRequest(BaseModel):
@@ -98,6 +129,8 @@ async def _read_json(request, model_type):
         raise UpgradeWebError("invalid_field", "请求字段缺失或类型不正确") from None
 
 
+PATH_QUERY_SERVICE = PathQueryService.from_environment()
+
 try:
     STANDARD_JOB_MANAGER = StandardJobManager.from_environment()
 except ValueError as exc:
@@ -122,12 +155,28 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.state.standard_jobs = STANDARD_JOB_MANAGER
+app.state.path_queries = PATH_QUERY_SERVICE
 app.add_middleware(
     TrustedHostMiddleware,
-    allowed_hosts=["127.0.0.1", "localhost", "lzr-mac-mini.local", "testserver"],
+    allowed_hosts=_allowed_hosts(),
 )
 app.mount("/static", StaticFiles(directory=WEB_ROOT / "static"), name="static")
 templates = Jinja2Templates(directory=WEB_ROOT / "templates")
+
+
+@app.middleware("http")
+async def reject_cross_site_requests(request, call_next):
+    """拒绝浏览器从其他站点发起的写请求，降低局域网模式下的 CSRF 风险。"""
+    if request.method not in {"GET", "HEAD", "OPTIONS"}:
+        fetch_site = request.headers.get("sec-fetch-site", "").strip().lower()
+        if fetch_site and fetch_site not in {"same-origin", "none"}:
+            return _error_response(403, "cross_site_request", "不允许跨站请求")
+        origin = request.headers.get("origin", "").strip()
+        if origin:
+            expected = f"{request.url.scheme}://{request.headers.get('host', '')}"
+            if origin.rstrip("/").lower() != expected.rstrip("/").lower():
+                return _error_response(403, "origin_mismatch", "请求来源与当前网站不一致")
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -144,6 +193,9 @@ async def add_security_headers(request, call_next):
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     if request.url.path == "/" or request.url.path.startswith("/api/"):
         response.headers["Cache-Control"] = "no-store"
+    elif request.url.path.startswith("/static/"):
+        # 本地工具会频繁改前端；必须每次回源校验，避免页面跑旧 JS/CSS。
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
     return response
 
 
@@ -153,7 +205,8 @@ async def handle_upgrade_error(_request, exc):
 
 
 @app.exception_handler(StandardWebError)
-async def handle_standard_error(_request, exc):
+@app.exception_handler(PathWebError)
+async def handle_svn_web_error(_request, exc):
     return _error_response(exc.status_code, exc.code, exc.message)
 
 
@@ -199,6 +252,25 @@ async def extract(request: Request):
 async def generate(request: Request):
     payload = await _read_json(request, GenerateRequest)
     return await run_in_threadpool(generate_upgrade_markdown, payload.list_text, payload.format)
+
+
+@app.post("/api/v1/revision-paths/query")
+async def query_revision_paths_endpoint(request: Request):
+    payload = await _read_json(request, RevisionPathQueryRequest)
+    return await run_in_threadpool(
+        request.app.state.path_queries.query,
+        svn_url=payload.svn_url,
+        username=payload.svn_username,
+        password=payload.svn_password,
+        revision_spec=payload.revision_spec,
+        sort=payload.sort,
+    )
+
+
+@app.post("/api/v1/revision-paths/sort")
+async def sort_revision_paths_endpoint(request: Request):
+    payload = await _read_json(request, RevisionPathSortRequest)
+    return await run_in_threadpool(sort_revision_path_text, payload.text, payload.sort)
 
 
 def _job_token(request):

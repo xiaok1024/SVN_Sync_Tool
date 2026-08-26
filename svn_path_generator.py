@@ -61,15 +61,22 @@ def parse_revision_spec(spec):
     return sorted(revisions)
 
 
-def query_revision_paths(url, spec, svn_user="", svn_pass=""):
-    """按版本号查询变更文件，返回 ``([(path, rev)], [错误信息])``。"""
+def query_revision_paths(url, spec, svn_user="", svn_pass="", runner=None):
+    """按版本号查询变更文件，返回 ``([(path, rev)], [错误信息])``。
+
+    ``runner`` 可注入一个 ``callable(args) -> (returncode, output)`` 的无界面
+    执行器，供 Web 端使用隔离配置与 stdin 密码的引擎；默认仍走
+    ``run_svn_command``。版本解析、XML 解析和错误汇总始终只有这一处实现。
+    """
     revisions = parse_revision_spec(spec)
     if not revisions:
         raise RuntimeError("无法解析版本号，请检查格式（示例: 123 / 123,456 / 123 456 / 123-456）")
+    if runner is None:
+        def runner(args):
+            return run_svn_command(args, svn_user, svn_pass)
     results, errors = [], []
     for revision in revisions:
-        rc, output = run_svn_command(
-            ["log", "--xml", "-v", "-r", str(revision), url], svn_user, svn_pass)
+        rc, output = runner(["log", "--xml", "-v", "-r", str(revision), url])
         if rc != 0:
             errors.append("版本 %d: 查询失败 - %s" % (revision, output[:200].strip()))
             continue

@@ -144,6 +144,18 @@ function showWarnings(warnings = []) {
   elements.warningList.hidden = false;
 }
 
+/** 服务端没有返回统一错误体时的兜底说明，避免把 404 误读成业务失败。 */
+function httpFallbackMessage(status) {
+  if (status === 404) {
+    return "接口不存在（404）：页面已是新版，但服务端进程还是旧的，请重启 Web 服务。";
+  }
+  if (status === 405) return "接口不支持该请求方式（405），请重启 Web 服务后重试。";
+  if (status === 502 || status === 503 || status === 504) {
+    return `服务暂时不可用（${status}），请稍后重试。`;
+  }
+  return `处理失败（HTTP ${status}），请稍后重试。`;
+}
+
 async function postJson(url, payload) {
   const response = await fetch(url, {
     method: "POST",
@@ -154,10 +166,12 @@ async function postJson(url, payload) {
   try {
     data = await response.json();
   } catch (_error) {
-    throw new Error("服务返回了无法识别的响应");
+    throw new Error(response.ok
+      ? "服务返回了无法识别的响应"
+      : httpFallbackMessage(response.status));
   }
   if (!response.ok || !data.ok) {
-    throw new Error(data?.error?.message || "处理失败，请稍后重试");
+    throw new Error(data?.error?.message || httpFallbackMessage(response.status));
   }
   return data;
 }
@@ -444,8 +458,21 @@ const standardElements = {
   closeDialogButton: document.querySelector("#closeStandardCommitDialogButton"),
 };
 
+/** 键的顺序即导航顺序；第一项同时是无 hash 时的默认工具。 */
+const TOOLS = {
+  path: { hash: "#revision-paths", title: "#path-page-title" },
+  standard: { hash: "#svn-standard", title: "#standard-page-title" },
+  upgrade: { hash: "#upgrade-list", title: "#page-title" },
+};
+const DEFAULT_TOOL = Object.keys(TOOLS)[0];
+
+function toolFromHash(hash) {
+  const found = Object.keys(TOOLS).find((name) => TOOLS[name].hash === hash);
+  return found || DEFAULT_TOOL;
+}
+
 function selectTool(tool, focusTitle = false) {
-  const selected = tool === "standard" ? "standard" : "upgrade";
+  const selected = TOOLS[tool] ? tool : DEFAULT_TOOL;
   standardElements.toolViews.forEach((view) => {
     view.hidden = view.dataset.toolView !== selected;
   });
@@ -456,11 +483,10 @@ function selectTool(tool, focusTitle = false) {
       link.removeAttribute("aria-current");
     }
   });
-  const desiredHash = selected === "standard" ? "#svn-standard" : "#upgrade-list";
+  const desiredHash = TOOLS[selected].hash;
   if (window.location.hash !== desiredHash) history.replaceState(null, "", desiredHash);
   if (focusTitle) {
-    const title = document.querySelector(selected === "standard" ? "#standard-page-title" : "#page-title");
-    title?.focus({ preventScroll: true });
+    document.querySelector(TOOLS[selected].title)?.focus({ preventScroll: true });
   }
 }
 
@@ -473,7 +499,7 @@ standardElements.toolLinks.forEach((link) => {
 });
 
 window.addEventListener("hashchange", () => {
-  selectTool(window.location.hash === "#svn-standard" ? "standard" : "upgrade");
+  selectTool(toolFromHash(window.location.hash));
 });
 
 function standardApiError(message, code = "request_failed") {
@@ -498,7 +524,8 @@ async function standardRequest(url, { method = "GET", payload = null, token = nu
     throw standardApiError("服务返回了无法识别的响应");
   }
   if (!response.ok || !data.ok) {
-    throw standardApiError(data?.error?.message || "请求失败，请稍后重试", data?.error?.code);
+    throw standardApiError(
+      data?.error?.message || httpFallbackMessage(response.status), data?.error?.code);
   }
   return data;
 }
@@ -1057,7 +1084,321 @@ standardElements.acknowledge.addEventListener("change", () => {
 standardElements.closeDialogButton.addEventListener("click", () => standardElements.dialog.close());
 standardElements.submitCommitButton.addEventListener("click", submitStandardCommit);
 
-selectTool(window.location.hash === "#svn-standard" ? "standard" : "upgrade");
+const PATH_MAX_REVISIONS = 200;
+const PATH_SORT_LABELS = { rev: "按版本排序", path: "按路径排序", name: "按文件名排序" };
+
+const pathState = {
+  revision: 0,
+  sort: "rev",
+};
+
+const pathElements = {
+  form: document.querySelector("#pathQueryForm"),
+  errorSummary: document.querySelector("#pathErrorSummary"),
+  svnUrl: document.querySelector("#pathSvnUrl"),
+  username: document.querySelector("#pathSvnUsername"),
+  password: document.querySelector("#pathSvnPassword"),
+  revisionSpec: document.querySelector("#pathRevisionSpec"),
+  revisionCount: document.querySelector("#pathRevisionCount"),
+  sortMode: document.querySelector("#pathSortMode"),
+  queryButton: document.querySelector("#pathQueryButton"),
+  sortButton: document.querySelector("#pathSortButton"),
+  resetButton: document.querySelector("#pathResetButton"),
+  stateBadge: document.querySelector("#pathStateBadge"),
+  fileCount: document.querySelector("#pathFileCount"),
+  requestedCount: document.querySelector("#pathRequestedCount"),
+  matchedCount: document.querySelector("#pathMatchedCount"),
+  errorCount: document.querySelector("#pathErrorCount"),
+  output: document.querySelector("#pathResultOutput"),
+  warningList: document.querySelector("#pathWarningList"),
+  resultHint: document.querySelector("#pathResultHint"),
+  copyButton: document.querySelector("#pathCopyButton"),
+  downloadButton: document.querySelector("#pathDownloadButton"),
+};
+
+/** 与服务端 parse_revision_spec 一致的计数，仅用于界面提示。 */
+function countRevisionSpec(spec) {
+  const normalized = spec.trim().replace(/，/g, ",").replace(/[－–—]/g, "-");
+  if (!normalized) return 0;
+  const revisions = new Set();
+  normalized.split(/[,\s]+/).forEach((part) => {
+    if (!part) return;
+    if (part.includes("-")) {
+      const [rawStart, rawEnd] = part.split("-", 2);
+      const start = Number.parseInt(rawStart, 10);
+      const end = Number.parseInt(rawEnd, 10);
+      if (!Number.isInteger(start) || !Number.isInteger(end)) return;
+      const low = Math.min(start, end);
+      const high = Math.max(start, end);
+      // 界面只需要数量；超过上限即可停止展开，避免超大区间卡住输入框。
+      for (let value = low; value <= high && revisions.size <= PATH_MAX_REVISIONS; value += 1) {
+        revisions.add(value);
+      }
+      return;
+    }
+    const single = Number.parseInt(part, 10);
+    if (Number.isInteger(single)) revisions.add(single);
+  });
+  return revisions.size;
+}
+
+function updatePathRevisionCount() {
+  const count = countRevisionSpec(pathElements.revisionSpec.value);
+  pathElements.revisionCount.textContent = count > PATH_MAX_REVISIONS
+    ? `超过 ${PATH_MAX_REVISIONS} 个版本上限`
+    : `${count} 个版本`;
+}
+
+function setPathBadge(state, label) {
+  pathElements.stateBadge.dataset.state = state;
+  pathElements.stateBadge.textContent = label;
+}
+
+function clearPathErrors() {
+  pathElements.errorSummary.hidden = true;
+  pathElements.errorSummary.textContent = "";
+  [pathElements.svnUrl, pathElements.username, pathElements.password,
+    pathElements.revisionSpec, pathElements.sortMode]
+    .forEach((control) => control.removeAttribute("aria-invalid"));
+}
+
+function showPathError(message, control = null) {
+  pathElements.errorSummary.textContent = message;
+  pathElements.errorSummary.hidden = false;
+  if (control) {
+    control.setAttribute("aria-invalid", "true");
+    control.focus();
+  } else {
+    pathElements.errorSummary.focus();
+  }
+}
+
+function renderPathMessages(messages = []) {
+  pathElements.warningList.replaceChildren();
+  if (!messages.length) {
+    pathElements.warningList.hidden = true;
+    return;
+  }
+  messages.forEach((message) => {
+    const item = document.createElement("p");
+    item.className = "warning-item";
+    item.textContent = message;
+    pathElements.warningList.append(item);
+  });
+  pathElements.warningList.hidden = false;
+}
+
+function updatePathSummary(stats = null) {
+  pathElements.fileCount.textContent = stats ? String(stats.file_count) : "—";
+  pathElements.requestedCount.textContent = stats?.revision_count === undefined
+    ? "—" : String(stats.revision_count);
+  pathElements.matchedCount.textContent = stats?.matched_revisions
+    ? String(stats.matched_revisions.length) : "—";
+  pathElements.errorCount.textContent = stats ? String(stats.error_count) : "—";
+}
+
+function setPathResultAvailability() {
+  const hasText = Boolean(pathElements.output.value.trim());
+  pathElements.copyButton.disabled = !hasText;
+  pathElements.downloadButton.disabled = !hasText;
+}
+
+function pathDownloadFilename() {
+  const raw = pathElements.svnUrl.value.trim().replace(/\/+$/, "");
+  let segment = "";
+  if (raw) {
+    try {
+      segment = decodeURIComponent(raw.split("/").pop() || "");
+    } catch (_error) {
+      segment = raw.split("/").pop() || "";
+    }
+  }
+  const safe = segment
+    .replace(/[<>:"/\\|?*\s]/g, "")
+    .replace(/^\.+|\.+$/g, "")
+    .slice(0, 60);
+  return `${safe || "svn"}-revision-paths.txt`;
+}
+
+function validatePathForm() {
+  clearPathErrors();
+  if (!pathElements.svnUrl.value.trim()) {
+    showPathError("请填写 SVN 仓库地址。", pathElements.svnUrl);
+    return false;
+  }
+  try {
+    const parsed = new URL(pathElements.svnUrl.value.trim());
+    if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("scheme");
+  } catch (_error) {
+    showPathError("SVN 仓库地址必须是完整的 http 或 https 地址。", pathElements.svnUrl);
+    return false;
+  }
+  if (!pathElements.revisionSpec.value.trim()) {
+    showPathError("请填写要查询的 SVN 版本号。", pathElements.revisionSpec);
+    return false;
+  }
+  const count = countRevisionSpec(pathElements.revisionSpec.value);
+  if (!count) {
+    showPathError("版本号只能包含数字、逗号、空格和连字符。", pathElements.revisionSpec);
+    return false;
+  }
+  if (count > PATH_MAX_REVISIONS) {
+    showPathError(`单次最多查询 ${PATH_MAX_REVISIONS} 个版本，请缩小版本范围。`, pathElements.revisionSpec);
+    return false;
+  }
+  const hasUser = Boolean(pathElements.username.value.trim());
+  const hasPassword = Boolean(pathElements.password.value);
+  if (hasUser !== hasPassword) {
+    showPathError(
+      "请同时填写 SVN 账号和密码；两者都留空则使用本机 SVN 缓存认证。",
+      hasUser ? pathElements.password : pathElements.username);
+    return false;
+  }
+  return true;
+}
+
+function applyPathResult(data, buildHint) {
+  pathElements.output.value = data.text;
+  pathState.sort = data.sort;
+  updatePathSummary(data.stats);
+  renderPathMessages(data.errors || []);
+  pathElements.resultHint.textContent = buildHint(data);
+  setPathResultAvailability();
+}
+
+async function runPathQuery(event) {
+  event.preventDefault();
+  if (!validatePathForm()) return;
+  const revision = (pathState.revision += 1);
+  setButtonBusy(pathElements.queryButton, true, "正在查询…");
+  pathElements.sortButton.disabled = true;
+  setPathBadge("active", "正在查询 SVN");
+  try {
+    const data = await postJson("/api/v1/revision-paths/query", {
+      svn_url: pathElements.svnUrl.value.trim(),
+      svn_username: pathElements.username.value,
+      svn_password: pathElements.password.value,
+      revision_spec: pathElements.revisionSpec.value,
+      sort: pathElements.sortMode.value,
+    });
+    if (revision !== pathState.revision) return;
+    applyPathResult(data, (result) => (
+      `共 ${result.stats.file_count} 个文件，命中 ${result.stats.matched_revisions.length} / `
+      + `${result.stats.revision_count} 个版本（${PATH_SORT_LABELS[result.sort]}，`
+      + `${result.auth_mode === "host-cache" ? "本机缓存认证" : "本次填写的账号"}）。`
+    ));
+    if (!data.stats.file_count) {
+      setPathBadge("warning", "无变更文件");
+      showNotice("这些版本没有查询到变更文件。", "warning");
+    } else if (data.stats.error_count) {
+      setPathBadge("warning", "已完成，有提示");
+      showNotice(`已生成 ${data.stats.file_count} 个文件路径，另有 ${data.stats.error_count} 条提示。`, "warning");
+    } else {
+      setPathBadge("success", "查询完成");
+      showNotice(`已生成 ${data.stats.file_count} 个文件路径。`, "success");
+    }
+  } catch (error) {
+    if (revision !== pathState.revision) return;
+    setPathBadge("error", "查询失败");
+    showPathError(error.message);
+    showNotice(error.message, "error");
+  } finally {
+    pathElements.password.value = "";
+    setButtonBusy(pathElements.queryButton, false);
+    pathElements.sortButton.disabled = false;
+  }
+}
+
+async function runPathSort() {
+  if (!pathElements.output.value.trim()) {
+    showPathError("请先查询，或在下方粘贴已有的 (V版本) 路径。", pathElements.output);
+    return;
+  }
+  const revision = (pathState.revision += 1);
+  clearPathErrors();
+  setButtonBusy(pathElements.sortButton, true, "正在排序…");
+  try {
+    const data = await postJson("/api/v1/revision-paths/sort", {
+      text: pathElements.output.value,
+      sort: pathElements.sortMode.value,
+    });
+    if (revision !== pathState.revision) return;
+    applyPathResult(data, (result) => (
+      `已本地排序 ${result.stats.file_count} 条路径（${PATH_SORT_LABELS[result.sort]}），未访问 SVN。`
+    ));
+    setPathBadge("success", "排序完成");
+    showNotice(`已按${PATH_SORT_LABELS[data.sort]}重排 ${data.stats.file_count} 条路径。`, "success");
+  } catch (error) {
+    if (revision !== pathState.revision) return;
+    showPathError(error.message);
+    showNotice(error.message, "error");
+  } finally {
+    setButtonBusy(pathElements.sortButton, false);
+  }
+}
+
+async function copyPathResult() {
+  const text = pathElements.output.value;
+  if (!text.trim()) return;
+  try {
+    await navigator.clipboard.writeText(text);
+    showNotice("文件路径已复制到剪贴板。", "success");
+  } catch (_error) {
+    pathElements.output.select();
+    const copied = document.execCommand("copy");
+    showNotice(copied ? "文件路径已复制到剪贴板。" : "复制失败，请手工复制。", copied ? "success" : "error");
+  }
+}
+
+function downloadPathResult() {
+  const text = pathElements.output.value;
+  if (!text.trim()) return;
+  const filename = pathDownloadFilename();
+  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+  showNotice(`已下载 ${filename}。`, "success");
+}
+
+pathElements.form.addEventListener("submit", runPathQuery);
+pathElements.form.addEventListener("reset", () => {
+  pathState.revision += 1;
+  window.setTimeout(() => {
+    clearPathErrors();
+    pathElements.output.value = "";
+    pathElements.sortMode.value = "rev";
+    pathState.sort = "rev";
+    updatePathRevisionCount();
+    updatePathSummary();
+    renderPathMessages();
+    setPathResultAvailability();
+    setPathBadge("idle", "尚未查询");
+    pathElements.resultHint.textContent = "填写仓库地址与版本号后开始查询。";
+  }, 0);
+});
+pathElements.revisionSpec.addEventListener("input", () => {
+  clearPathErrors();
+  updatePathRevisionCount();
+});
+pathElements.revisionSpec.addEventListener("keydown", (event) => {
+  if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+    event.preventDefault();
+    pathElements.form.requestSubmit();
+  }
+});
+pathElements.output.addEventListener("input", setPathResultAvailability);
+pathElements.sortButton.addEventListener("click", runPathSort);
+pathElements.copyButton.addEventListener("click", copyPathResult);
+pathElements.downloadButton.addEventListener("click", downloadPathResult);
+
+selectTool(toolFromHash(window.location.hash));
 updateStandardCounters();
 loadStandardProfiles();
 restoreStandardTaskSession();
+updatePathRevisionCount();

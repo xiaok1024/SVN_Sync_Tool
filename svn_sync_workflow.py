@@ -12,14 +12,10 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 
 
-# 稀疏工作副本会把远端文件属性一并落盘。这里只接受 SVN 客户端会校验或
-# 规范化为很小值、且不会引入额外文件内容的内建属性；自定义属性可能远大于
-# 文件本身，不能在容量预留之前下载。
-_SPARSE_SAFE_FILE_PROPERTIES = frozenset({
-    "svn:eol-style",
-    "svn:executable",
-    "svn:needs-lock",
-})
+# 曾经因为容量预留的不确定性拒绝自定义/未知 SVN 属性；客户 SVN 目录总量
+# 有明确上限（远小于任务的临时目录容量门禁），已不需要按属性名逐一拦截。
+# eol-style 会影响文件在 Windows 上的落盘大小，仍单独处理，见下方 remote_size。
+_EOL_STYLE_PROPERTY = "svn:eol-style"
 
 
 @dataclass
@@ -126,7 +122,6 @@ def prepare_sparse_working_copy(
     if safety_check:
         safety_check(0, "checkout_before", None)
 
-    remote_root = url.rstrip("/") + "@"
     if revision is None:
         revision = get_repository_head_revision(engine, url)
     try:
@@ -136,28 +131,7 @@ def prepare_sparse_working_copy(
     if revision <= 0:
         raise ValueError("SVN revision 必须是正整数")
 
-    # depth-empty checkout 仍会把检出根及其继承属性写入 WC。目录属性值可以
-    # 远大于清单文件本身，因此在创建工作副本前只读取属性名并严格拒绝；
-    # 随后所有操作都固定到同一 numeric revision，避免预检与 checkout 漂移。
-    rc, root_props_output = engine._run_svn_bytes(
-        "proplist", "--xml", "--show-inherited-props", "-r", str(revision),
-        remote_root, force_utf8=True, timeout=60)
-    if rc != 0:
-        raise RuntimeError(
-            "读取 SVN 检出根目录属性失败: "
-            + (root_props_output.strip() or "未知错误"))
-    try:
-        root_properties = {
-            node.get("name", "")
-            for node in ET.fromstring(root_props_output).findall(".//property")
-            if node.get("name")
-        }
-    except ET.ParseError as exc:
-        raise RuntimeError("SVN 检出根目录属性响应格式不正确") from exc
-    if root_properties:
-        raise ValueError(
-            "SVN 检出根目录包含属性，暂不支持该地址以确保临时目录容量可控")
-
+    # 所有操作固定到同一 numeric revision，避免预检与 checkout 漂移。
     rc, output = engine._run_svn_bytes(
         "checkout", "--depth", "empty", "--ignore-externals",
         "-r", str(revision), url, destination, timeout=120)
@@ -168,7 +142,6 @@ def prepare_sparse_working_copy(
 
     root = os.path.realpath(os.path.abspath(destination))
     materialized, missing = [], []
-    checked_parent_directories = set()
     for index, relative in enumerate(dict.fromkeys(relative_paths), start=1):
         if safety_check:
             safety_check(index, "before", None)
@@ -215,12 +188,9 @@ def prepare_sparse_working_copy(
                 raise ValueError("暂不支持含 svn:keywords 的标准文件: " + relative)
             if "svn:special" in properties:
                 raise ValueError("暂不支持 SVN 特殊文件: " + relative)
-            if properties - _SPARSE_SAFE_FILE_PROPERTIES:
-                raise ValueError(
-                    "暂不支持含自定义或未知 SVN 属性的标准文件: " + relative)
             # eol-style 在 Windows 上可能把工作文件扩展到约 2 倍；传给
             # Web 容量门禁的值先放大，再由其计入 pristine + working。
-            if "svn:eol-style" in properties:
+            if _EOL_STYLE_PROPERTY in properties:
                 remote_size *= 2
         else:
             not_found = any(code in list_output for code in (
@@ -230,40 +200,6 @@ def prepare_sparse_working_copy(
                     "检查仓库文件大小失败（%s）: %s" % (
                         relative, list_output.strip() or "未知错误"))
 
-        # update --parents 还会把目标文件的每级祖先目录属性写入 WC。逐级只读
-        # 属性名并缓存检查结果，避免目录上的大自定义属性绕过文件容量预留。
-        parts = relative.replace("\\", "/").split("/")
-        for parent_index in range(1, len(parts)):
-            parent = "/".join(parts[:parent_index])
-            if parent in checked_parent_directories:
-                continue
-            parent_target = "%s/%s@" % (
-                url.rstrip("/"), urllib.parse.quote(parent, safe="/~-._"))
-            rc, parent_props_output = engine._run_svn_bytes(
-                "proplist", "--xml", "-r", str(revision), parent_target,
-                force_utf8=True, timeout=60)
-            if rc != 0:
-                not_found = any(code in parent_props_output for code in (
-                    "E145000", "E160013", "E200009", "W160013"))
-                if not not_found:
-                    raise RuntimeError(
-                        "读取 SVN 祖先目录属性失败（%s）: %s" % (
-                            parent, parent_props_output.strip() or "未知错误"))
-                checked_parent_directories.add(parent)
-                continue
-            try:
-                parent_properties = {
-                    node.get("name", "")
-                    for node in ET.fromstring(parent_props_output).findall(".//property")
-                    if node.get("name")
-                }
-            except ET.ParseError as exc:
-                raise RuntimeError("SVN 祖先目录属性响应格式不正确: " + parent) from exc
-            if parent_properties:
-                raise ValueError(
-                    "SVN 文件祖先目录包含属性，暂不支持该路径以确保临时目录容量可控: "
-                    + parent)
-            checked_parent_directories.add(parent)
         if safety_check:
             safety_check(index, "remote", remote_size)
         target = os.path.realpath(os.path.abspath(

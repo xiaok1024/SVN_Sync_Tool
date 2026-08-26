@@ -868,114 +868,35 @@ class StandardJobSafetyTest(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("svn") and shutil.which("svnadmin"), "需要本机 SVN CLI")
 class StandardJobLocalRepositoryIntegrationTest(unittest.TestCase):
-    def test_sparse_rejects_large_checkout_root_property_before_checkout(self):
+    def test_sparse_allows_custom_and_inherited_properties(self):
+        """客户 SVN 目录总量有明确上限，容量交给运行时门禁负责；
+        不再因为检出根、文件或祖先目录带自定义/未知属性而提前拒绝
+        （svn:keywords、svn:special 仍然是硬性拒绝，见下面的用例）。"""
         with tempfile.TemporaryDirectory() as root:
             repo = Path(root, "repo")
             seed = Path(root, "seed")
             destination = Path(root, "sparse")
             config = Path(root, "svn-config")
-            property_file = Path(root, "large-root-property.txt")
             subprocess.run(["svnadmin", "create", str(repo)], check=True, capture_output=True)
             repo_url = repo.as_uri()
             subprocess.run(["svn", "mkdir", repo_url + "/trunk", "-m", "init"],
                            check=True, capture_output=True)
             subprocess.run(["svn", "checkout", repo_url + "/trunk", str(seed)],
                            check=True, capture_output=True)
-            property_file.write_bytes(b"x" * (1024 * 1024))
+            subprocess.run(["svn", "propset", "demo:root", "root-value", str(seed)],
+                           check=True, capture_output=True)
+            binary_file = seed / "WEB-INF" / "lib" / "gson.jar"
+            binary_file.parent.mkdir(parents=True)
+            binary_file.write_bytes(b"PK\x03\x04binary-jar-payload")
+            subprocess.run(["svn", "add", "--parents", str(binary_file)],
+                           check=True, capture_output=True)
             subprocess.run(
-                ["svn", "propset", "demo:root", "-F", str(property_file), str(seed)],
+                ["svn", "propset", "svn:mime-type", "application/octet-stream",
+                 str(binary_file)],
                 check=True, capture_output=True,
             )
-            subprocess.run(["svn", "commit", str(seed), "-m", "root property seed"],
-                           check=True, capture_output=True)
-
-            engine = WebSvnEngine("local-test-user", "local-test-password", config)
-            safety_calls = []
-            try:
-                with self.assertRaisesRegex(ValueError, "检出根目录包含属性"):
-                    prepare_sparse_working_copy(
-                        engine,
-                        repo_url + "/trunk",
-                        str(destination),
-                        ["src/Missing.txt"],
-                        safety_check=lambda index, phase, size: safety_calls.append(
-                            (index, phase, size)),
-                    )
-                self.assertEqual(safety_calls, [(0, "checkout_before", None)])
-                self.assertFalse(destination.exists())
-            finally:
-                engine.release_credentials()
-
-    def test_sparse_rejects_large_parent_property_before_materializing_file(self):
-        with tempfile.TemporaryDirectory() as root:
-            repo = Path(root, "repo")
-            seed = Path(root, "seed")
-            destination = Path(root, "sparse")
-            config = Path(root, "svn-config")
-            property_file = Path(root, "large-parent-property.txt")
-            subprocess.run(["svnadmin", "create", str(repo)], check=True, capture_output=True)
-            repo_url = repo.as_uri()
-            subprocess.run(["svn", "mkdir", repo_url + "/trunk", "-m", "init"],
-                           check=True, capture_output=True)
-            subprocess.run(["svn", "checkout", repo_url + "/trunk", str(seed)],
-                           check=True, capture_output=True)
-            target = seed / "src" / "Tiny.txt"
-            target.parent.mkdir(parents=True)
-            target.write_text("x", encoding="utf-8")
-            subprocess.run(["svn", "add", "--parents", str(target)],
-                           check=True, capture_output=True)
-            property_file.write_bytes(b"x" * (1024 * 1024))
             subprocess.run(
-                ["svn", "propset", "demo:dir", "-F", str(property_file),
-                 str(target.parent)],
-                check=True, capture_output=True,
-            )
-            subprocess.run(["svn", "commit", str(seed), "-m", "parent property seed"],
-                           check=True, capture_output=True)
-
-            engine = WebSvnEngine("local-test-user", "local-test-password", config)
-            safety_calls = []
-            try:
-                with self.assertRaisesRegex(ValueError, "祖先目录包含属性"):
-                    prepare_sparse_working_copy(
-                        engine,
-                        repo_url + "/trunk",
-                        str(destination),
-                        ["src/Tiny.txt"],
-                        safety_check=lambda index, phase, size: safety_calls.append(
-                            (index, phase, size)),
-                    )
-                self.assertEqual(safety_calls, [
-                    (0, "checkout_before", None),
-                    (0, "checkout_after", None),
-                    (1, "before", None),
-                ])
-                self.assertFalse((destination / "src" / "Tiny.txt").exists())
-            finally:
-                engine.release_credentials()
-
-    def test_sparse_rejects_large_custom_property_before_materializing_file(self):
-        with tempfile.TemporaryDirectory() as root:
-            repo = Path(root, "repo")
-            seed = Path(root, "seed")
-            destination = Path(root, "sparse")
-            config = Path(root, "svn-config")
-            property_file = Path(root, "large-property.txt")
-            subprocess.run(["svnadmin", "create", str(repo)], check=True, capture_output=True)
-            repo_url = repo.as_uri()
-            subprocess.run(["svn", "mkdir", repo_url + "/trunk", "-m", "init"],
-                           check=True, capture_output=True)
-            subprocess.run(["svn", "checkout", repo_url + "/trunk", str(seed)],
-                           check=True, capture_output=True)
-            custom_file = seed / "src" / "Custom.txt"
-            custom_file.parent.mkdir(parents=True)
-            custom_file.write_text("x", encoding="utf-8")
-            property_file.write_bytes(b"x" * (1024 * 1024))
-            subprocess.run(["svn", "add", "--parents", str(custom_file)],
-                           check=True, capture_output=True)
-            subprocess.run(
-                ["svn", "propset", "demo:payload", "-F", str(property_file),
-                 str(custom_file)],
+                ["svn", "propset", "demo:dir", "dir-value", str(binary_file.parent)],
                 check=True, capture_output=True,
             )
             subprocess.run(["svn", "commit", str(seed), "-m", "custom property seed"],
@@ -983,33 +904,20 @@ class StandardJobLocalRepositoryIntegrationTest(unittest.TestCase):
 
             engine = WebSvnEngine("local-test-user", "local-test-password", config)
             safety_calls = []
-            svn_calls = []
-            original_run = engine._run_svn_bytes
-
-            def recording_run(*args, **kwargs):
-                svn_calls.append(args)
-                return original_run(*args, **kwargs)
-
-            engine._run_svn_bytes = recording_run
             try:
-                with self.assertRaisesRegex(ValueError, "自定义或未知 SVN 属性"):
-                    prepare_sparse_working_copy(
-                        engine,
-                        repo_url + "/trunk",
-                        str(destination),
-                        ["src/Custom.txt"],
-                        safety_check=lambda index, phase, size: safety_calls.append(
-                            (index, phase, size)),
-                    )
-                self.assertEqual(safety_calls, [
-                    (0, "checkout_before", None),
-                    (0, "checkout_after", None),
-                    (1, "before", None),
-                ])
-                self.assertFalse((destination / "src" / "Custom.txt").exists())
-                proplist_calls = [args for args in svn_calls if args and args[0] == "proplist"]
-                self.assertTrue(proplist_calls)
-                self.assertTrue(all("--verbose" not in args for args in proplist_calls))
+                result = prepare_sparse_working_copy(
+                    engine,
+                    repo_url + "/trunk",
+                    str(destination),
+                    ["WEB-INF/lib/gson.jar"],
+                    safety_check=lambda index, phase, size: safety_calls.append(
+                        (index, phase, size)),
+                )
+                self.assertEqual(result.materialized_paths, ["WEB-INF/lib/gson.jar"])
+                self.assertEqual(
+                    (destination / "WEB-INF" / "lib" / "gson.jar").read_bytes(),
+                    b"PK\x03\x04binary-jar-payload")
+                self.assertIn((1, "remote", len(b"PK\x03\x04binary-jar-payload")), safety_calls)
             finally:
                 engine.release_credentials()
 
