@@ -4,7 +4,9 @@ a = Analysis(
     ['svn_sync_qt.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    # 样式表用绝对路径引用 qt_assets 下的 SVG 图标，单文件模式会解包到
+    # sys._MEIPASS，qt_theme._asset_url 据此拼路径，这里必须一并打包。
+    datas=[('qt_assets', 'qt_assets')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

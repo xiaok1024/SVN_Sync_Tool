@@ -1,7 +1,22 @@
 # -*- coding: utf-8 -*-
 """SVN 同步工具的 Qt 视觉令牌与样式表。"""
 
-APP_STYLESHEET = r"""
+import sys
+from pathlib import Path
+
+
+def _asset_url(name):
+    """返回 qt_assets 下资源的绝对路径。
+
+    样式表里的 ``url()`` 按进程工作目录解析相对路径并不可靠，因此统一取绝对
+    路径；PyInstaller 单文件模式会把 datas 解包到 ``sys._MEIPASS``。
+    """
+    base = getattr(sys, "_MEIPASS", None)
+    root = Path(base) if base else Path(__file__).resolve().parent
+    return (root / "qt_assets" / name).as_posix()
+
+
+_STYLESHEET_TEMPLATE = r"""
 * {
     font-family: "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", sans-serif;
     font-size: 13px;
@@ -96,11 +111,16 @@ QComboBox:disabled { color: #a9b1bf; background: #f3f5f8; border-color: #e5e8ee;
 QComboBox::drop-down {
     subcontrol-origin: padding;
     subcontrol-position: center right;
-    width: 20px;
+    width: 22px;
     border: none;
     background: transparent;
 }
-QComboBox::down-arrow { width: 9px; height: 9px; }
+QComboBox::down-arrow {
+    width: 12px;
+    height: 12px;
+    image: url("__CHEVRON__");
+}
+QComboBox::down-arrow:disabled { image: url("__CHEVRON_DISABLED__"); }
 QComboBox QAbstractItemView {
     border: 1px solid #d7dee9;
     border-radius: 8px;
@@ -179,3 +199,10 @@ QScrollBar::handle:vertical { background: #c4ccda; min-height: 28px; border-radi
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QStatusBar { background: #ffffff; border-top: 1px solid #e5eaf2; color: #667085; }
 """
+
+
+APP_STYLESHEET = (
+    _STYLESHEET_TEMPLATE
+    .replace("__CHEVRON__", _asset_url("chevron-down.svg"))
+    .replace("__CHEVRON_DISABLED__", _asset_url("chevron-down-disabled.svg"))
+)
