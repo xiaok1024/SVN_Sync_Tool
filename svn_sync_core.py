@@ -81,6 +81,11 @@ class SyncEngine:
     def __init__(self):
         self.svn_user = ""
         self.svn_pass = ""
+        # Web 等受控调用方可为每次任务启用独立 SVN 配置与 stdin 密码。
+        # 默认值保持桌面版/CLI 的既有认证行为不变。
+        self.svn_config_dir = ""
+        self.svn_no_auth_cache = False
+        self.svn_password_from_stdin = False
         self.smb_user = ""
         self.smb_pass = ""
         self._temp_mounts = []
@@ -88,19 +93,35 @@ class SyncEngine:
     def _log(self, _widget, _message):
         pass
 
+    def _svn_process_started(self, _args):
+        """SVN 子进程成功创建后的轻量 hook；桌面端默认无需处理。"""
+        pass
+
     def _build_svn_cmd(self, *args):
         cmd = [SVN_EXECUTABLE, "--non-interactive",
                "--trust-server-cert-failures=unknown-ca,cn-mismatch,expired,not-yet-valid,other"]
+        config_dir = str(_value(self.svn_config_dir) or "").strip()
+        if config_dir:
+            cmd.extend(["--config-dir", config_dir])
         user = str(_value(self.svn_user) or "").strip()
         password = str(_value(self.svn_pass) or "").strip()
         if user:
             cmd.extend(["--username", user])
             if password:
-                cmd.extend(["--password", password])
-            else:
-                cmd.append("--no-auth-cache")
+                if self.svn_password_from_stdin:
+                    cmd.append("--password-from-stdin")
+                else:
+                    cmd.extend(["--password", password])
+        if self.svn_no_auth_cache or (user and not password):
+            cmd.append("--no-auth-cache")
         cmd.extend(args)
         return cmd
+
+    def _svn_password_input(self):
+        password = str(_value(self.svn_pass) or "")
+        if self.svn_password_from_stdin and password:
+            return (password + "\n").encode("utf-8")
+        return None
 
     def _svn_env(self):
         env = os.environ.copy()
@@ -113,11 +134,17 @@ class SyncEngine:
     def _run_svn(self, log_widget, *args):
         cmd = self._build_svn_cmd(*args)
         self._log(log_widget, ">> " + " ".join(redact_svn_command(cmd)) + "\n")
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        password_input = self._svn_password_input()
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE if password_input else None,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 env=self._svn_env(), creationflags=CREATE_NO_WINDOW)
+        self._svn_process_started(args)
         lines = []
         secrets = (str(_value(self.svn_pass) or ""),)
         try:
+            if password_input and proc.stdin:
+                proc.stdin.write(password_input)
+                proc.stdin.close()
             for raw_line in proc.stdout:
                 line = redact_sensitive_text(decode_svn_output(raw_line), secrets)
                 self._log(log_widget, line)
@@ -129,10 +156,17 @@ class SyncEngine:
         return proc.returncode, "".join(lines)
 
     def _run_svn_bytes(self, *args, force_utf8=False, cwd=None, timeout=30):
-        proc = subprocess.Popen(self._build_svn_cmd(*args), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        password_input = self._svn_password_input()
+        proc = subprocess.Popen(self._build_svn_cmd(*args),
+                                stdin=subprocess.PIPE if password_input else None,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 env=self._svn_env(), cwd=cwd, creationflags=CREATE_NO_WINDOW)
+        self._svn_process_started(args)
         try:
-            out, err = proc.communicate(timeout=timeout)
+            if password_input:
+                out, err = proc.communicate(input=password_input, timeout=timeout)
+            else:
+                out, err = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.communicate()
@@ -265,7 +299,7 @@ class SyncEngine:
                 return os.path.join(mount_path, *remaining) if remaining else mount_path
         return None
 
-    def _mount_smb_macos(self, address, log=None):
+    def _mount_smb_macos(self, address, log=None, readonly=False, no_prompt=False):
         smb_url = self._share_to_smb_url(address)
         raw = smb_url[6:]
         if "/" not in raw:
@@ -286,7 +320,12 @@ class SyncEngine:
         if log:
             self._log(log, "正在挂载 SMB: //%s/%s -> %s\n" % (server, share, mount_point))
         try:
-            cmd = ["mount_smbfs", source, mount_point] if user else ["mount_smbfs", "-N", source, mount_point]
+            cmd = ["mount_smbfs"]
+            if no_prompt or not user:
+                cmd.append("-N")
+            if readonly:
+                cmd.extend(["-o", "ro,nobrowse"])
+            cmd.extend([source, mount_point])
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         except subprocess.TimeoutExpired:
             self._safe_rmdir(mount_point)

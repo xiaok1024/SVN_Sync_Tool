@@ -20,10 +20,13 @@
 - `pyi_rth_qt_software.py`：Windows 打包启动钩子，在 Qt 加载前启用虚拟化环境兼容的软件渲染；
 - `svn_sync_tool.py`：旧 Tk GUI 兼容入口，并继续导出既有 `rt_*` API；
 - `svn_sync_cli.py`：终端交互与参数入口，只编排共享能力；
-- `svn_path_generator.py`：版本号解析、SVN 版本路径查询与排序的唯一实现，同时服务 Tab 5 和 `paths` 子命令；
+- `svn_path_generator.py`：版本号解析、SVN 版本路径查询与排序的唯一实现，同时服务 Tab 5、`paths` 子命令和 Web 版本号路径生成；其 `query_revision_paths` 支持注入 `runner`，供 Web 使用隔离引擎，不得为此复制查询逻辑；
 - `svn_standard_file_core.py`：标准文件扫描、路径安全、覆盖与提交准备；
 - `svn_standard_file_tab.py`：Tab 6 界面、确认流程与后台线程调度。
-- `upgrade_list_core.py` / `clipboard_core.py`：升级清单纯逻辑与跨平台 HTML 剪贴板适配。
+- `upgrade_list_core.py` / `clipboard_core.py`：升级清单纯逻辑与跨平台 HTML 剪贴板适配；
+- `web_app.py`：本地 Web 路由、请求大小/媒体类型限制、Host 与跨站写请求防护、安全响应头和统一错误体；
+- `web_svn_common.py`：Web 端 SVN 安全外壳的唯一来源——`WebSvnError`、SVN 地址与凭据校验、`--config-dir` + `--no-auth-cache` + `--password-from-stdin` 的 `WebSvnEngine`；
+- `web_upgrade_service.py` / `web_standard_service.py` / `web_path_service.py`：三个 Web 功能各自的输入限制、任务编排与响应组装，业务规则仍来自对应共享核心。
 
 现代 GUI 使用 `PySide6-Essentials` / Qt Widgets，旧 GUI 使用 `tkinter` / `ttkbootstrap`；终端版不依赖第三方包。SVN 操作统一通过系统 `svn` CLI。Windows 使用 PyInstaller 打包，macOS 直接运行终端版。发布产物位于 `outputs/`。
 
@@ -33,8 +36,10 @@
 - 修改前阅读 `README.md`、相关源码和对应测试；只加载与当前任务有关的模块，不要求遍历全部源码。
 - 保持现有模块职责稳定。无界面业务优先进入共享核心，GUI/CLI 保持为薄适配层；不要为了维持“单文件”而复制业务逻辑，也不要在没有明显收益时扩大重构范围。
 - `SyncEngine` 是 SVN、SMB、交叉文件和提交路径能力的唯一实现来源。Qt/Tk GUI 不得覆写或复制这些核心方法；`CliEngine` 只允许提供终端日志、变量和剪贴板适配。
-- Tab 5 的版本查询与 URL 排序统一复用 `svn_path_generator.py` 的纯逻辑 API；不得在 GUI 或 CLI 中再次实现 XML 解析和排序。
+- Tab 5、CLI `paths` 与 Web 版本号路径生成统一复用 `svn_path_generator.py` 的纯逻辑 API；不得在 GUI、CLI 或 Web 中再次实现版本号解析、XML 解析和排序。
 - `StandardFileService` 承担 Tab 6 的无界面业务；`SvnStandardFileTab` 不新增独立 SVN 执行器或配置解析业务。
+- Web 端任何执行 SVN 的新功能必须使用 `web_svn_common.py` 的 `WebSvnEngine` 与地址/凭据校验，不得直接调用 `run_svn_command` 或自建 `SyncEngine`，以保证浏览器提交的凭据不落主机 SVN 认证缓存。
+- `HostAuthSvnEngine` 复用主机 SVN 缓存认证，只允许用于只读查询：其子命令白名单是这条通道的安全边界，不得放宽为写操作，也不得用于标准文件提交等任何会写入仓库的功能。
 - `rt_*` 函数和 `RedTextHTMLParser` 负责升级清单富文本解析、红黑颜色识别与 Markdown 生成；修改这些规则时必须补充代表性 HTML/清单回归用例。
 - 保持 Windows、macOS、中文路径、SVN 输出编码、SMB/UNC 和 Unicode 规范化兼容。
 - 不主动安装依赖；缺少 PyInstaller、SVN CLI 或测试工具时，先说明用途、收益和缺失影响，等待用户确认。
@@ -57,6 +62,7 @@
 
 ```bash
 python3 -m py_compile svn_sync_qt.py qt_app.py qt_pages.py qt_components.py qt_theme.py pyi_rth_qt_software.py svn_sync_tool.py svn_sync_core.py svn_sync_workflow.py svn_path_generator.py svn_standard_file_core.py svn_standard_file_tab.py svn_sync_cli.py upgrade_list_core.py clipboard_core.py
+python3 -m py_compile web_app.py web_svn_common.py web_upgrade_service.py web_standard_service.py web_path_service.py svn_sync_web.py
 python3 svn_sync_cli.py --help
 python3 -m unittest discover -s tests -v
 ```
@@ -64,7 +70,8 @@ python3 -m unittest discover -s tests -v
 按变更范围追加验证：
 
 - 修改 `svn_sync_core.py`：运行共享核心、CLI 和标准文件测试，并确认 `SvnSyncTool` 没有重新覆写共享核心方法；
-- 修改 `svn_path_generator.py`：验证 GUI/CLI 共用的查询、XML 文件过滤、中文路径解码和三种排序；
+- 修改 `svn_path_generator.py`：验证 GUI/CLI/Web 共用的查询、XML 文件过滤、中文路径解码和三种排序；
+- 修改 Web 模块：在 `.venv-web` 中运行 `tests.test_web_upgrade_service`、`tests.test_web_standard_service`、`tests.test_web_path_service`、`tests.test_web_app`，并确认没有新增未脱敏的凭据输出路径；
 - 修改 `rt_*`：验证红/黑颜色、QC 分组、版本去重和人读/AI Markdown；
 - 修改现代 GUI：使用现有 `.venv-macos/bin/python svn_sync_qt.py` 做手工启动检查，并以 `QT_QPA_PLATFORM=offscreen` 运行结构测试；修改旧 GUI 时仍运行 `.venv-macos/bin/python svn_sync_tool.py`；若环境缺少 GUI 依赖，不自行安装，应说明未验证项；
 - 修改 SVN、SMB 或 Windows 打包逻辑：除自动测试外，列出需要用户在真实 Windows/SVN/SMB 环境手工验证的场景。
