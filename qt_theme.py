@@ -121,15 +121,22 @@ QComboBox::down-arrow {
     image: url("__CHEVRON__");
 }
 QComboBox::down-arrow:disabled { image: url("__CHEVRON_DISABLED__"); }
+/* 弹出列表：需配合 qt_components.styled_combo 显式指定 QListView，
+   否则 macOS 会弹出原生菜单，下面这些规则不会生效。 */
 QComboBox QAbstractItemView {
     border: 1px solid #d7dee9;
-    border-radius: 8px;
     background: #ffffff;
-    padding: 3px;
+    padding: 4px;
     outline: none;
-    selection-background-color: #eef2ff;
-    selection-color: #1d3b8f;
 }
+QComboBox QAbstractItemView::item {
+    min-height: 26px;
+    padding: 0 8px;
+    border-radius: 6px;
+    color: #344054;
+}
+QComboBox QAbstractItemView::item:hover { background: #f2f5fb; }
+QComboBox QAbstractItemView::item:selected { background: #eef2ff; color: #1d3b8f; }
 QPlainTextEdit#logView, QPlainTextEdit#resultView {
     background: #111827;
     color: #d8e0ee;

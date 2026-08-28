@@ -5,6 +5,8 @@ import traceback
 
 from PySide6.QtCore import QObject, QRunnable, Qt, Signal, Slot
 from PySide6.QtWidgets import (
+    QComboBox,
+    QListView,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -136,6 +138,23 @@ def password_edit():
 def set_button_busy(button, busy, normal_text, busy_text="处理中…"):
     button.setDisabled(busy)
     button.setText(busy_text if busy else normal_text)
+
+
+def styled_combo(*items):
+    """构造下拉框，并强制使用 Qt 自绘的弹出列表。
+
+    macOS 上 QComboBox 默认弹出原生菜单，样式表里的 QAbstractItemView
+    规则不会生效，弹出层观感与界面其余部分割裂；显式指定 QListView 后
+    两个平台表现一致。``items`` 可以是文本，也可以是 ``(文本, 数据)``。
+    """
+    combo = QComboBox()
+    combo.setView(QListView())
+    for item in items:
+        if isinstance(item, tuple):
+            combo.addItem(*item)
+        else:
+            combo.addItem(item)
+    return combo
 
 
 def compact_row(*widgets, stretch=True):

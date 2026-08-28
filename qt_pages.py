@@ -42,6 +42,7 @@ from qt_components import (
     password_edit,
     primary_button,
     set_button_busy,
+    styled_combo,
 )
 from svn_standard_file_core import StandardFileService
 from svn_sync_core import IS_MACOS, IS_WINDOWS
@@ -585,10 +586,8 @@ class RevisionPathsPage(BasePage):
         config.layout.addWidget(FieldRow(
             "版本号", self.revisions, hint="支持单版本、逗号/空格分隔和连续区间。"))
         self.context.bind_shared("svn_url", self.url)
-        self.sort = QComboBox()
-        self.sort.addItem("按版本排序", "rev")
-        self.sort.addItem("按路径排序", "path")
-        self.sort.addItem("按文件名排序", "name")
+        self.sort = styled_combo(
+            ("按版本排序", "rev"), ("按路径排序", "path"), ("按文件名排序", "name"))
         self.generate_button = primary_button("查询并生成", self.generate)
         local_sort_button = QPushButton("仅排序下方内容")
         local_sort_button.clicked.connect(self.sort_local)

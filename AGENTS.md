@@ -78,10 +78,51 @@ python3 -m unittest discover -s tests -v
 
 发布约束：
 
-- `dist/`、`build/`、`.venv-macos/`、`outputs/*.app/` 是本地构建内容，不作为主要提交对象；
+修复、优化或新功能在测试通过后，**默认连同两个平台的发布产物一起提交**（源码、
+`outputs/SVN_Sync_Tool.exe`、`outputs/SVN_Sync_Tool.app.zip`），不再等用户单独要求。
+
+- Windows exe 在 `e8` 虚拟机上打包，流程见下方「Windows 打包与验证」；
+- macOS `.app` 用 `SVN_Sync_Tool_macos.spec` 在本机构建，以 `ditto` 压成
+  `outputs/SVN_Sync_Tool.app.zip` 提交（`.app` 是目录，直接入库会让仓库快速膨胀；
+  `ditto` 能保留可执行位与符号链接）；
+- `dist/`、`build/`、`.venv*/`、`outputs/*.app/` 是本地构建内容，不提交；
 - `outputs/SVN_Sync_Tool-macos-arm64.zip` 是历史产物，不再更新或删除；
-- 只有用户明确要求 Windows 打包时才更新 `outputs/SVN_Sync_Tool.exe`；
-- 未更新发布产物时必须在交付说明中明确说明。
+- 确实未更新某个产物时，必须在交付说明中写明原因。
+
+两份 spec 不可混用：`SVN_Sync_Tool.spec` 是 Windows 单文件 exe（binaries/datas 内联进
+EXE、开启 UPX）；`SVN_Sync_Tool_macos.spec` 是 macOS 应用包（`EXE(exclude_binaries=True)`
++ `COLLECT` + `BUNDLE`、关闭 UPX，因为 UPX 会破坏 Mach-O 结构）。新增运行时资源时两份都要
+加进 `datas`，否则打包产物会缺文件。
+
+## Windows 打包与验证
+
+`e8` 是宿主机 `lzr-mbp-i9.local` 上的 Windows 虚拟机，经 2223 端口转发访问，同时用于
+Windows 侧的打包和界面验证。
+
+```bash
+# 1. 同步工作区（COPYFILE_DISABLE=1 避免 macOS 的 ._ 副产品被打进包里）
+COPYFILE_DISABLE=1 tar czf /tmp/proj.tar.gz \
+  --exclude='./.git' --exclude='./.venv*' --exclude='./dist' --exclude='./build' \
+  --exclude='./outputs' --exclude='__pycache__' --exclude='.DS_Store' .
+scp /tmp/proj.tar.gz e8:proj.tar.gz
+ssh e8 "Remove-Item -Recurse -Force C:\Users\liangzerui\SVN_Sync_Tool -ErrorAction SilentlyContinue; New-Item -ItemType Directory -Force -Path C:\Users\liangzerui\SVN_Sync_Tool | Out-Null; tar xzf C:\Users\liangzerui\proj.tar.gz -C C:\Users\liangzerui\SVN_Sync_Tool"
+
+# 2. 打包并取回
+ssh e8 "cd C:\Users\liangzerui\SVN_Sync_Tool; python -m PyInstaller --clean --noconfirm SVN_Sync_Tool.spec"
+scp e8:C:/Users/liangzerui/SVN_Sync_Tool/dist/SVN_Sync_Tool.exe outputs/SVN_Sync_Tool.exe
+```
+
+注意事项：
+
+- e8 的默认 shell 是 PowerShell，它会重新解析引号，含引号或管道的远程命令容易被拆坏；
+  优先用不带引号的简单命令，或分成多条执行。
+- PowerShell 对二进制 stdin 不可靠，**不要**用 `tar czf - | ssh e8 tar xzf -` 这类管道，
+  改为先 `scp` 再远端解压。
+- 虚拟机访问 PyPI 不稳定，安装依赖时用国内镜像并放宽超时：
+  `python -m pip install --timeout 120 --retries 5 -i https://pypi.tuna.tsinghua.edu.cn/simple ...`
+- 远程命令末尾接 `| tail` 会吞掉真实退出码，导致失败被误判为成功；需要判断成败时不要接管道。
+- 虚拟机快照回退会清掉 SSH 授权公钥，届时需用户在虚拟机内重新写入
+  `%ProgramData%\ssh\administrators_authorized_keys` 并收紧该文件权限。
 
 ## 变更交付要求
 
