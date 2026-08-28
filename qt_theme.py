@@ -63,20 +63,52 @@ QFrame#card {
 QLabel#cardTitle { color: #172033; font-size: 14px; font-weight: 700; }
 QLabel#cardSubtitle, QLabel#hint, QLabel#fieldHint { color: #7a8496; font-size: 11px; }
 QLabel#sectionKicker { color: #4f7cff; font-size: 11px; font-weight: 700; }
-QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QSpinBox {
+QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox {
     background: #ffffff;
     border: 1px solid #d9e0ea;
     border-radius: 8px;
     padding: 7px 9px;
     selection-background-color: #cddaff;
 }
-QLineEdit:hover, QTextEdit:hover, QPlainTextEdit:hover, QComboBox:hover { border-color: #aebbd0; }
-QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QComboBox:focus {
+QLineEdit:hover, QTextEdit:hover, QPlainTextEdit:hover { border-color: #aebbd0; }
+QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus {
     border: 1px solid #4f7cff;
 }
 QLineEdit:disabled, QTextEdit:disabled, QPlainTextEdit:disabled {
     background: #f3f5f8;
     color: #9aa3b2;
+}
+/* 下拉框与按钮同排显示，几何和配色对齐 QPushButton，不再沿用输入框规则；
+   同时接管 drop-down 区域，避免 macOS 原生控件外观混进扁平卡片界面。 */
+QComboBox {
+    background: #ffffff;
+    border: 1px solid #d7dee9;
+    border-radius: 8px;
+    padding: 7px 9px;
+    padding-right: 26px;
+    min-height: 18px;
+    color: #344054;
+    selection-background-color: #cddaff;
+}
+QComboBox:hover { background: #f7f9fc; border-color: #aebbd0; }
+QComboBox:focus { border-color: #4f7cff; }
+QComboBox:disabled { color: #a9b1bf; background: #f3f5f8; border-color: #e5e8ee; }
+QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    width: 20px;
+    border: none;
+    background: transparent;
+}
+QComboBox::down-arrow { width: 9px; height: 9px; }
+QComboBox QAbstractItemView {
+    border: 1px solid #d7dee9;
+    border-radius: 8px;
+    background: #ffffff;
+    padding: 3px;
+    outline: none;
+    selection-background-color: #eef2ff;
+    selection-color: #1d3b8f;
 }
 QPlainTextEdit#logView, QPlainTextEdit#resultView {
     background: #111827;
