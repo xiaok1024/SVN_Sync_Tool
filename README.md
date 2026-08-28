@@ -2,12 +2,13 @@
 
 一个跨平台（Windows / macOS）工具，用于从 SVN 拉取代码、用整理好的本地目录（或网络共享）覆盖交叉文件、并自动提交变更。三步流程一键完成，提交完成后可一键复制 SVN 提交记录。
 
-提供两种使用方式：
+提供三个入口：
 
-- **图形界面**（`svn_sync_tool.py`）：Windows 主要使用方式，打包为 exe 分发。
-- **终端版**（`svn_sync_cli.py`）：macOS 推荐使用方式，功能与 GUI 的 6 个标签页一一对应，支持交互式菜单和命令行参数两种用法，详见下方「终端版」章节。macOS 不再更新 `.app` 打包产物。
+- **现代图形界面**（`svn_sync_qt.py`）：Windows 主要使用方式，基于 PySide6 / Qt Widgets，打包为 exe 分发。
+- **旧版图形界面**（`svn_sync_tool.py`）：保留为迁移期功能对照和回归入口，不再作为 Windows 正式打包入口。
+- **终端版**（`svn_sync_cli.py`）：macOS 推荐使用方式，功能与 GUI 的 6 个页面一一对应，支持交互式菜单和命令行参数两种用法，详见下方「终端版」章节。macOS 不再更新 `.app` 打包产物。
 
-A cross-platform (Windows / macOS) GUI tool for checking out code from SVN, overwriting cross-referenced files from a local organized directory (or network share), and automatically committing changes. Complete the three-step workflow with one click.
+A Windows Qt GUI and macOS CLI tool for checking out code from SVN, overwriting cross-referenced files from a local organized directory (or network share), and automatically committing changes.
 
 ---
 
@@ -20,7 +21,7 @@ A cross-platform (Windows / macOS) GUI tool for checking out code from SVN, over
 | **全自动流程** | 一键执行：SVN 拉取 → 交叉覆盖 → SVN 提交，实时日志输出，无需手动操作 |
 | **升级清单提取** | 从复制的带颜色升级清单（QC 分组 + 红/黑标记的 SVN 文件 URL）提取文件清单，并生成人读升级 Markdown 与 AI 专用 Markdown |
 | **版本号路径生成** | 快速完成这件事而设计的——不用打开 SVN log 界面一行行翻，提供一个版本号，工具直接查询出所有变更文件，并自动按 `(Vxxx)` 格式拼接好完整 URL |
-| **标准文件获取** | 按清单从 KB/历史文件目录补全客户 SVN 缺失源码：自动裁切清单路径、扫描预览、确认覆盖、可选自动提交，并一键复制提交文件 URL |
+| **标准文件获取** | 按源码清单从 KB/历史目录补全客户工作副本，提交前预览整个工作副本的 SVN 状态；支持提交后恢复本地二开版本 |
 
 | Feature | Description |
 |---------|-------------|
@@ -28,7 +29,8 @@ A cross-platform (Windows / macOS) GUI tool for checking out code from SVN, over
 | **Cross Overwrite** | Iterates every file in the SVN checkout directory, looks for matching files (same relative path) in the organized directory, overwrites if found, skips if not |
 | **Auto Pipeline** | One-click execution: SVN checkout → cross-file overwrite → SVN commit, with real-time log output |
 | **Upgrade List Extract** | Extract the file list from a copied colored upgrade list (QC groups + red/black-marked SVN URLs), and generate a human-readable upgrade Markdown and an AI-oriented Markdown |
-| **Standard File Fetch** | Fill missing source files in a customer SVN from KB/historical file directories: normalize list paths, preview the scan, confirm overwrites, optionally auto-commit, and copy the committed file URLs |
+| **Revision Path Generator** | Query changed files by SVN revision and generate complete URLs with `(Vxxx)` suffixes |
+| **Standard File Acquisition** | Restore missing source files from KB/history directories and preview SVN status before commit |
 
 ---
 
@@ -36,7 +38,7 @@ A cross-platform (Windows / macOS) GUI tool for checking out code from SVN, over
 
 ![SVN Sync Tool](./README.assets/1782545885107.png)
 
-*(截图未生成，运行工具即可查看界面 / Screenshot not generated, run the tool to see the interface)*
+> 此图为旧版界面，仅供历史参考；当前 Windows GUI 已改为左侧导航、卡片式配置和分栏结果区。
 
 ---
 
@@ -59,7 +61,7 @@ The Windows exe runs by double-click with no Python required. On macOS, run the 
 
 ## 终端版 / CLI（macOS 推荐）
 
-`svn_sync_cli.py` 与 GUI 共用同一套业务逻辑，功能与 6 个标签页一一对应，两种用法：
+`svn_sync_cli.py` 与 GUI 共用同一套业务逻辑，功能与 6 个页面一一对应，两种用法：
 
 ### 交互模式
 
@@ -67,12 +69,13 @@ The Windows exe runs by double-click with no Python required. On macOS, run the 
 python3 svn_sync_cli.py
 ```
 
-进入主菜单选择功能（1-6 对应 GUI 的 6 个标签页），随后按提示逐项输入参数：
+进入主菜单选择功能（1-6 对应 GUI 的 6 个页面），随后按提示逐项输入参数：
 
 - 常用值（SVN 地址、目录、用户名等，**不含密码**）会记住在 `~/.config/svn_sync_tool/cli.json`，下次回车即可复用；
 - 密码输入不回显；来源为 `smb://` 共享时才会询问 SMB 账号；
 - 交叉覆盖会先列出文件清单，回车全部覆盖，或输入序号（如 `1,3-5`）只覆盖部分，确认后才执行；
 - 全自动流程执行前会显示参数摘要并要求确认；`checkout` 模式删除已有目录前会单独确认；
+- 全自动流程中任一文件覆盖失败都会立即终止，不会继续执行 `svn add` 或 `svn commit`；
 - 生成的提交路径 / 升级 Markdown / 版本号路径可直接复制到剪贴板或保存为文件。
 
 ### 参数模式（可脚本化）
@@ -93,11 +96,15 @@ python3 svn_sync_cli.py extract --format md -o upgrade-file-list.md
 python3 svn_sync_cli.py extract --format ai-md -o upgrade-file-list-ai.md
 
 # 5. 版本号路径生成
-python3 svn_sync_cli.py paths --url https://svn.example.com/svn/cust/ecology -r "123,456-789" --sort rev --copy
+python3 svn_sync_cli.py paths --url https://svn.example.com/svn/cust/ecology -r "123,456-789 1000" --sort rev --copy
 
-# 6. 标准文件获取（升级任务需 --standard；二开任务 --mode secondev，仅查历史文件）
-python3 svn_sync_cli.py standard --url https://svn.example.com/svn/cust/ecology --target ~/work/ecology --mode upgrade --title "升级任务A" --standard /mnt/kb --historical /mnt/hist --list files.txt --dry-run
-python3 svn_sync_cli.py standard --url https://svn.example.com/svn/cust/ecology --target ~/work/ecology --mode upgrade --title "升级任务A" --standard /mnt/kb --historical /mnt/hist --list files.txt --yes --commit --copy
+# 6. 标准文件获取（先预览；确认覆盖后显示整个目标目录的待提交状态）
+python3 svn_sync_cli.py standard --url https://svn.example.com/svn/cust/ecology \
+  --target ~/work/ecology --mode upgrade --title QC123 \
+  --standard /path/to/kb --historical /path/to/history --list files.txt --dry-run
+python3 svn_sync_cli.py standard --url https://svn.example.com/svn/cust/ecology \
+  --target ~/work/ecology --mode upgrade --title QC123 \
+  --standard /path/to/kb --historical /path/to/history --list files.txt --yes --commit --copy
 ```
 
 在终端里漏填的必填参数会自动转为交互提问补全；非终端环境（如 CI）漏填则直接报错退出。各子命令详细参数见 `python3 svn_sync_cli.py <子命令> --help`。
@@ -106,7 +113,7 @@ python3 svn_sync_cli.py standard --url https://svn.example.com/svn/cust/ecology 
 
 ## 使用说明 / Usage
 
-### 标签页 1: SVN 拉取 / Tab 1: SVN Checkout
+### 页面 1: SVN 拉取 / Page 1: SVN Checkout
 
 1. 输入 **SVN 仓库地址**
 2. （可选）填写 **用户名** 和 **密码**，留空则使用本地 SVN 缓存认证
@@ -116,7 +123,7 @@ python3 svn_sync_cli.py standard --url https://svn.example.com/svn/cust/ecology 
 
 ---
 
-### 标签页 2: 交叉覆盖 / Tab 2: Cross Overwrite
+### 页面 2: 交叉覆盖 / Page 2: Cross Overwrite
 
 1. 选择 **SVN 拉取目录**（目标，被覆盖的目录）
 2. 选择 **整理好的目录**（来源，取文件的目录）——也可直接填**网络共享地址**（见下方「共享目录地址」）
@@ -124,11 +131,11 @@ python3 svn_sync_cli.py standard --url https://svn.example.com/svn/cust/ecology 
 4. 点击列表中的文件可切换勾选/取消
 5. 点击 **覆盖选中** 执行覆盖
 
-也可直接点击 **一键覆盖（推荐）**，扫描 + 覆盖一步完成。
+也可直接点击 **一键覆盖**：工具先扫描并展示全部匹配文件，确认后再统一覆盖。
 
 ---
 
-### 标签页 3: 全自动流程 / Tab 3: Auto Pipeline
+### 页面 3: 全自动流程 / Page 3: Auto Pipeline
 
 1. 填写 **用户名/密码**（可选）
 2. 输入 **SVN 仓库地址**
@@ -144,7 +151,7 @@ python3 svn_sync_cli.py standard --url https://svn.example.com/svn/cust/ecology 
 
 ---
 
-### 标签页 4: 升级清单提取 / Tab 4: Upgrade List Extract
+### 页面 4: 升级清单提取 / Page 4: Upgrade List Extract
 
 从网页（如 QC 任务系统）复制的**带颜色升级清单**中，提取需要升级的文件并生成文档。清单中通常按 QC 分组，文件 URL 用**红色**标记需打包、**黑色**标记仅作上下文参考。
 
@@ -159,34 +166,42 @@ python3 svn_sync_cli.py standard --url https://svn.example.com/svn/cust/ecology 
 >
 > 剪贴板颜色读取分平台：macOS 用 `pbpaste -Prefer html` / NSPasteboard；Windows 读 `CF_HTML` 剪贴板格式。若剪贴板只有纯文本，会因缺少颜色而无法区分红/黑。
 
+---
 
-### 标签页 6: 标准文件获取 / Tab 6: Standard File Acquisition
+### 页面 5: 版本号路径生成 / Page 5: Revision Path Generator
 
-用于在版本升级或二开任务中，补全客户 SVN 中缺失的源码文件：按文件清单从 KB / 历史文件目录中定位文件，扫描预览后覆盖到已检出的客户 SVN 工作副本，可选自动提交，并把提交文件 URL 一键复制到剪贴板。
+用于按一个或多个 SVN 版本号查询变更文件，并生成带 `(V版本号)` 后缀的完整路径。
 
-1. 填写**任务标题**，选择任务类型：**升级任务**（upgrade）或 **二开任务**（secondev）
-   - 升级任务：KB 文件路径（标准文件）→ 历史文件路径，按优先级查找来源
-   - 二开任务：仅查历史文件路径，KB 文件路径输入行自动隐藏
-2. 填写**客户 SVN 地址**、**目标 SVN 目录**（必须是已检出的客户 SVN 工作副本）；SVN 用户/密码留空时使用缓存认证
-3. 填写 **KB 文件路径**（升级任务必填）和**历史文件路径**，支持本地路径、`\\` UNC 与 `smb://` 共享地址（来源填 `smb://` 时需填写 SMB 账号/密码）
-4. 在**文件清单**中粘贴源码路径列表（每行一个），也可点击 **从剪贴板粘贴**：
-   - 相对路径：`src/com/api/.../DocAccService.java`
-   - SVN URL：`https://svn.example.com/svn/cust/ecology/src/...`（自动裁切为相对路径）
-   - 本地全路径：`D:\...\ecology\src\...`（自动裁切为相对 ecology 路径，并作为「提交后覆盖本地」的本地源）
-   - 自动剥除 `[red]/[black]` 前缀与 `(Vxxx)` 版本号后缀；`#`/`//` 注释行与 `[black]` 行自动跳过
-5. 按需勾选：**允许覆盖已存在的文件**（默认勾选，取消后目标已存在的文件跳过）、**覆盖后提交 SVN**（默认勾选）
-6. 点击 **扫描预览**，工具按优先级到各来源目录的 `ecology/` 子目录（及目录本身）查找并显示命中情况：**待覆盖** / **跳过(目标已存在)**（未勾选允许覆盖）/ **未找到来源**；CLI/核心版还会比对文件内容，来源与目标一致时标记为 **内容相同** 并跳过
-7. 点击 **确认覆盖** 将文件复制到目标 SVN 目录（执行前弹窗确认覆盖数量）
-8. 覆盖后按设置自动提交（GUI 默认勾选「覆盖后提交 SVN」；CLI 需显式加 `--commit`），或点击 **提交 SVN 标准文件** 手动提交：提交信息自动生成为「任务标题 + 来源类型（标准文件/历史文件）」，提交对象是目标 SVN 目录的整体工作副本（其他已修改/已登记变更会一并提交）；CLI 模式提交前会展示 `svn status` 供确认
-9. 提交成功后自动解析版本号，把变更文件 URL（`{SVN地址}/{路径}(V{版本})`）写入日志，并可用 **复制提交文件路径** 一键复制
-10. 提交完成后，若文件清单里贴的是本地全路径，可点击 **提交后覆盖本地**，用这些本地文件覆盖目标 SVN 工作副本中对应的已提交文件；该操作只覆盖、不会再次提交 SVN
-
-> 来源查找优先级（升级任务）：`{KB路径}/ecology/{rel_path}` → `{KB路径}/{rel_path}` → `{历史路径}/ecology/{rel_path}` → `{历史路径}/{rel_path}`；二开任务：`{历史路径}/ecology/{rel_path}` → `{历史路径}/{rel_path}`。目录条目（非文件）自动过滤。
->
-> 终端版对应 `standard` 子命令（主菜单项 6）：`--dry-run` 仅扫描预览、`--skip-existing` 跳过目标已存在文件、`--yes` 非交互确认覆盖、`--commit` 覆盖后提交、`--copy` 复制提交文件 URL。
+1. 填写 SVN 仓库地址及可选的用户名/密码
+2. 输入单版本、多个版本或版本区间，如 `123`、`123,456`、`123 456`、`123-456`
+3. 选择按版本、路径或文件名排序
+4. 点击生成后复制结果；也可粘贴已有 `(Vxxx)` 路径执行本地排序
 
 ---
 
+
+### 页面 6: 标准文件获取 / Page 6: Standard File Acquisition
+
+用于在版本升级或二开任务中，补全客户 SVN 中缺失的源码文件。
+
+1. 填写**任务标题**，选择任务类型：**升级任务**（upgrade）或 **二开任务**（secondev）
+   - 升级任务：先查 KB 文件路径，未找到再查历史文件路径
+   - 二开任务：仅查历史文件路径，KB 文件路径行自动隐藏
+2. 填写**客户 SVN 地址**、**目标 SVN 目录**（已检出的客户 SVN 工作副本）
+3. 填写 **KB 文件路径**（升级任务必填）和**历史文件路径**
+4. 在**文件清单**中粘贴源码路径列表（每行一个：相对路径 `src/com/api/.../DocAccService.java`，或包含 `ecology` 的本地全路径 `D:\...\ecology\src\...`），也可从剪贴板粘贴；本地全路径会自动裁切为相对 ecology 路径，并作为“提交后覆盖本地”的本地源
+5. 工具自动去 KB/历史文件路径的 `ecology/` 子目录下按相对路径查找
+6. 点击 **扫描预览** 查看文件命中情况（可覆盖/已存在跳过/未找到来源）
+7. 点击 **确认覆盖** 将文件复制到目标 SVN 目录
+8. 覆盖完成后可点击 **提交 SVN 标准文件** 提交变更；提交成功后自动导出变更文件 URL 到日志，并可通过 **复制提交文件路径** 按钮一键复制
+9. 提交完成后，如果文件清单里贴的是本地全路径，可点击 **提交后覆盖本地**，用这些本地文件覆盖目标 SVN 工作副本中对应的已提交文件；该操作不会再次提交 SVN
+10. 支持 SMB 共享路径、UNC 路径作为来源目录（需填写 SMB 凭据）
+
+> 来源查找优先级：`{KB路径}/ecology/{rel_path}` → `{KB路径}/{rel_path}` → `{历史路径}/ecology/{rel_path}` → `{历史路径}/{rel_path}`。目录条目（非文件）自动过滤。
+>
+> SVN 提交采用 Windows 兼容模式：只对本次覆盖文件执行 `svn add --parents`，随后展示整个目标 SVN 工作副本的 `svn status` 并二次确认。未版本控制（`?`）文件不会自动加入，但目录中其他已修改、已登记新增或删除的文件会一并提交。
+
+---
 ## 共享目录地址 / Network Share
 
 「整理好的目录（来源）」除了本地路径，也可以直接填**网络共享地址**。工具会按操作系统自动处理，**两个平台都无需手动改写路径**：
@@ -214,7 +229,7 @@ The "organized directory (source)" accepts a **network share address** in additi
 ### 前置条件 / Prerequisites
 
 - **Python 3.10+**
-- **requirements.txt 中的打包依赖**（PyInstaller、ttkbootstrap）
+- **requirements.txt 中的打包依赖**（PyInstaller、PySide6-Essentials；`ttkbootstrap` 仅供旧版 GUI 回归）
 - **SVN CLI**（`svn` / `svn.exe` 需在 PATH 中；macOS 可用 Homebrew 安装：`brew install subversion`）
 
 ### 打包命令 / Build Command
@@ -224,14 +239,14 @@ The "organized directory (source)" accepts a **network share address** in additi
 ```bat
 py -m pip install -r requirements.txt
 
-REM 可选：直接从源码启动检查界面
-py svn_sync_tool.py
+REM 可选：直接从源码启动现代界面
+py svn_sync_qt.py
 
-REM 打包为单文件 exe（无控制台窗口）
-py -m PyInstaller --onefile --windowed --name "SVN_Sync_Tool" --collect-all ttkbootstrap svn_sync_tool.py
+REM 使用 Qt 专用 spec 打包为单文件 exe（无控制台窗口）
+py -m PyInstaller --clean --noconfirm SVN_Sync_Tool.spec
 
 REM 产物在 dist\ 下，复制到 outputs\
-copy dist\SVN_Sync_Tool.exe outputs\
+copy /Y dist\SVN_Sync_Tool.exe outputs\SVN_Sync_Tool.exe
 ```
 
 **macOS**：不再打包 `.app`，直接运行终端版即可：
@@ -240,9 +255,9 @@ copy dist\SVN_Sync_Tool.exe outputs\
 python3 svn_sync_cli.py
 ```
 
-> 如确需在 macOS 上运行图形界面（与 Windows 同一套代码），安装 `ttkbootstrap` 后运行 `python3 svn_sync_tool.py`。
+> 如需在 macOS 开发机检查现代 GUI，安装 requirements 后运行 `python3 svn_sync_qt.py`；正式使用仍推荐终端版。
 
-> `build/`、`dist/` 均已在 `.gitignore` 中忽略；`SVN_Sync_Tool.spec` 纳入版本库，用于稳定收集 `ttkbootstrap` 打包资源。仓库只保留 `outputs/` 下的成品。
+> `build/`、`dist/` 均已在 `.gitignore` 中忽略；`SVN_Sync_Tool.spec` 是现代 Qt GUI 的 Windows 正式构建入口。仓库只保留 `outputs/` 下的成品。
 
 ### 参数说明 / Arguments Explained
 
@@ -251,18 +266,20 @@ python3 svn_sync_cli.py
 | `--onefile` | 打包为单个文件（Windows exe 常用） |
 | `--windowed` | 不显示控制台窗口（GUI 程序专用） |
 | `--name "SVN_Sync_Tool"` | 指定输出文件名 |
-| `svn_sync_tool.py` | 入口脚本路径 |
+| `svn_sync_qt.py` | 现代 GUI 入口脚本 |
 
 ---
 
 ## 技术栈 / Tech Stack
 
 - **语言**: Python 3.10+
-- **GUI**: tkinter / ttkbootstrap（基于 ttk）
+- **Windows GUI**: PySide6-Essentials / Qt Widgets（Qt 6）
+- **旧 GUI 回归**: tkinter / ttkbootstrap
 - **SVN**: 通过 subprocess 调用系统 svn CLI
-- **打包**: PyInstaller（Windows 出 exe，macOS 出 .app）
+- **共享核心**: `svn_sync_core.py`、`svn_sync_workflow.py`、`svn_standard_file_core.py`、`upgrade_list_core.py`
+- **打包**: PyInstaller（仅 Windows 持续更新 exe；macOS 直接运行 CLI）
 
-> Windows/macOS 预编译产物会内嵌 Python 依赖（包括 `ttkbootstrap`），普通用户无需安装 Python、PyInstaller 或 pip 依赖；运行 SVN 功能仍需系统已安装 SVN 命令行工具。
+> Windows exe 会内嵌 Python 与 Qt GUI 依赖，普通用户无需安装 Python、PyInstaller 或 pip 依赖；运行 SVN 功能仍需系统已安装 SVN 命令行工具。macOS 推荐直接使用系统 Python 运行 CLI。
 
 ---
 
@@ -271,11 +288,21 @@ python3 svn_sync_cli.py
 ```
 .
 ├── .gitignore                          # Git 排除规则
+├── AGENTS.md                           # 项目 AI 协作与维护规则
 ├── requirements.txt                    # 打包依赖
-├── svn_sync_tool.py                    # GUI 入口 + 业务逻辑（SVN/共享地址/清单解析）
-├── svn_sync_cli.py                     # 终端版入口（复用 svn_sync_tool 业务逻辑）
+├── svn_sync_qt.py                      # 现代 Windows GUI 入口
+├── qt_app.py / qt_pages.py             # Qt 主窗口、六个功能页面
+├── qt_components.py / qt_theme.py      # Qt 通用组件与视觉主题
+├── svn_sync_tool.py                    # 旧 Tk GUI 兼容入口
+├── svn_sync_cli.py                     # macOS 终端入口（交互菜单 + 6 个子命令）
+├── svn_sync_core.py                    # GUI/CLI 共享的 SVN、SMB/UNC 与扫描核心
+├── svn_sync_workflow.py                # 拉取/覆盖/提交的无界面工作流编排
 ├── svn_path_generator.py               # 版本号路径生成（Tab 5 / paths 子命令）
-├── SVN_Sync_Tool.spec                  # PyInstaller 打包配置（Windows）
+├── svn_standard_file_core.py           # 标准文件扫描、覆盖与 SVN 提交业务层
+├── upgrade_list_core.py                # 富文本升级清单解析与 Markdown 生成
+├── clipboard_core.py                   # Windows/macOS HTML 剪贴板适配
+├── SVN_Sync_Tool.spec                  # 现代 GUI 的 Windows PyInstaller 配置
+├── tests/                              # 核心、安全门与职责边界回归测试
 ├── outputs/                            # 预编译成品（纳入版本库）
 │   ├── SVN_Sync_Tool.exe               #   Windows 可执行文件
 │   └── SVN_Sync_Tool-macos-arm64.zip   #   macOS 历史应用包（不再更新）
@@ -288,11 +315,10 @@ python3 svn_sync_cli.py
 ## 注意事项 / Notes
 
 - 首次使用 SVN 功能时，如果未填写用户名/密码，会使用系统 SVN 缓存的认证信息
-- 覆盖操作不可撤销，建议先在标签页 2 使用"扫描预览"查看变更
+- 覆盖操作不可撤销，建议先在页面 2 使用“扫描预览”查看变更
 - 如果 SVN 服务器使用自签名证书，工具已默认添加 --trust-server-cert-failures 参数信任常见证书问题
 - 来源目录支持直接填共享地址：Windows 用 `\\server\share`，macOS 用 `smb://server/share`，详见「共享目录地址」
 - macOS 上由工具临时挂载的共享会在关闭窗口时自动卸载；访达手动连接的挂载不会被卸载
 - 全自动流程提交成功后会列出本次提交文件的可访问 URL，可一键复制；提交解析使用 `svn info/log --xml`，不受中文（GBK/本地化）输出影响
 - 若本次运行无变更（不产生新提交），会回退导出工作副本当前版本的文件路径，方便随时复制
-- 源码打包环境要求 Python 3.10+（`ttkbootstrap` 依赖要求）；普通用户运行预编译产物无需安装 Python
-
+- 源码打包环境要求 Python 3.10+；普通用户运行预编译产物无需安装 Python

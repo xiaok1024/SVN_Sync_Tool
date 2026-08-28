@@ -31,8 +31,9 @@ import subprocess
 import sys
 import tempfile
 
-import svn_sync_tool as core
-from svn_sync_core import SyncEngine
+import clipboard_core
+import upgrade_list_core as core
+from svn_sync_core import IS_MACOS, IS_WINDOWS, SyncEngine
 from svn_standard_file_core import StandardFileService
 import svn_path_generator as pathgen
 
@@ -80,23 +81,23 @@ class CliEngine(SyncEngine):
 
     def _read_clipboard_content(self):
         """终端版剪贴板读取：HTML 优先，纯文本兜底（不依赖 tk）。"""
-        if core.IS_WINDOWS:
-            html = core.read_clipboard_html_windows()
+        if IS_WINDOWS:
+            html = clipboard_core.read_clipboard_html_windows()
             if html and html.strip():
                 return html, "html"
-        elif core.IS_MACOS:
-            html = core.read_clipboard_html_macos()
+        elif IS_MACOS:
+            html = clipboard_core.read_clipboard_html_macos()
             if html and html.strip():
                 return html, "html"
         return self._read_clipboard_text(), "text"
 
     def _read_clipboard_text(self):
         try:
-            if core.IS_MACOS:
+            if IS_MACOS:
                 r = subprocess.run(["pbpaste"], capture_output=True, text=True, errors="ignore")
                 if r.returncode == 0:
                     return r.stdout
-            elif core.IS_WINDOWS:
+            elif IS_WINDOWS:
                 r = subprocess.run(["powershell", "-NoProfile", "-Command", "Get-Clipboard"],
                                    capture_output=True, text=True, errors="ignore")
                 if r.returncode == 0:
@@ -109,10 +110,10 @@ class CliEngine(SyncEngine):
 def copy_to_clipboard(text):
     """把文本写入系统剪贴板，成功返回 True。"""
     try:
-        if core.IS_MACOS:
+        if IS_MACOS:
             r = subprocess.run(["pbcopy"], input=text.encode("utf-8"))
             return r.returncode == 0
-        if core.IS_WINDOWS:
+        if IS_WINDOWS:
             r = subprocess.run(["clip"], input=text, text=True, shell=True)
             return r.returncode == 0
     except Exception:
@@ -279,7 +280,7 @@ def prompt_svn_auth(defaults):
 
 def prompt_smb_auth(engine, source, defaults):
     """来源为共享地址且在 macOS 上时，询问 SMB 凭据（与 SVN 账号相互独立）。"""
-    if not (core.IS_MACOS and engine._is_share_address(source)):
+    if not (IS_MACOS and engine._is_share_address(source)):
         return "", ""
     print("来源为网络共享地址；若访达已连接过该共享（钥匙串记住密码），SMB 账号可留空自动复用。")
     smb_user = ask("SMB 账号（留空复用已有挂载/钥匙串）", defaults.get("smb_user", ""))

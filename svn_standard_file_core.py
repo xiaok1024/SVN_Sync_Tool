@@ -18,29 +18,54 @@ class StandardFileItem:
     target_exists: bool
     status: str
     detail: str
+    local_source_file: str | None = None
 
 
-def extract_relative_path(url_or_path, svn_root=""):
+def _normalize_relative_path(relative):
+    value = (relative or "").replace("\\", "/")
+    normalized = posixpath.normpath(value)
+    if (normalized in ("", ".", "..") or normalized.startswith("../")
+            or normalized.startswith("/")):
+        return None
+    return normalized
+
+
+def parse_file_input(url_or_path, svn_root=""):
+    """解析清单输入，返回 ``(ecology 相对路径, 本地源文件)``。
+
+    只有绝对文件系统路径中的 ``ecology`` 目录段会被识别为本地源文件；
+    HTTP SVN URL 即使包含 ``/ecology/`` 也不会误判为本地路径。
+    """
     text = (url_or_path or "").strip()
     if not text:
-        return None
+        return None, None
     text = re.sub(r"^\[(?:red|black)\]\s*", "", text, flags=re.I)
     text = re.sub(r"\([Vv]\d+\)\s*$", "", text).strip()
+
+    is_windows_absolute = bool(re.match(r"^[A-Za-z]:[\\/]", text))
+    is_unc = text.startswith(("\\\\", "//")) and not re.match(r"^//[^/]+/svn/", text, re.I)
+    is_local_absolute = os.path.isabs(text) or is_windows_absolute or is_unc
+    if is_local_absolute and not re.match(r"https?://", text, re.I):
+        ecology_match = re.search(r"(?:^|[\\/])ecology[\\/](.+)$", text, re.I)
+        if ecology_match:
+            relative = _normalize_relative_path(ecology_match.group(1))
+            return relative, text if relative else None
+
     root = (svn_root or "").strip().rstrip("/")
     if root and text.startswith(root + "/"):
         relative = text[len(root) + 1:]
     elif re.match(r"https?://", text, re.I):
         match = re.search(r"/svn/[^/]+/(.*)", text)
         if not match:
-            return None
+            return None, None
         relative = match.group(1)
     else:
         relative = text.lstrip("/\\")
-    relative = relative.replace("\\", "/")
-    normalized = posixpath.normpath(relative)
-    if normalized in ("", ".") or normalized == ".." or normalized.startswith("../") or normalized.startswith("/"):
-        return None
-    return normalized
+    return _normalize_relative_path(relative), None
+
+
+def extract_relative_path(url_or_path, svn_root=""):
+    return parse_file_input(url_or_path, svn_root)[0]
 
 
 def _safe_child(root, relative):
@@ -70,7 +95,7 @@ class StandardFileService:
         for line in lines:
             if not line or line.startswith(("#", "//")) or re.match(r"^\s*\[black\]", line, re.I):
                 continue
-            relative = extract_relative_path(line, svn_root)
+            relative, local_source_file = parse_file_input(line, svn_root)
             if not relative:
                 details.append("  [SKIP] 非法或无法识别的路径: %s" % line)
                 continue
@@ -101,7 +126,9 @@ class StandardFileService:
                 status, detail = "跳过(目标已存在)", "需勾选允许覆盖"
             else:
                 status, detail = "未找到来源", "来源目录中不存在"
-            results.append(StandardFileItem(relative, found, label, target_file, target_exists, status, detail))
+            results.append(StandardFileItem(
+                relative, found, label, target_file, target_exists, status, detail,
+                local_source_file=local_source_file))
         return results, parsed_count, details
 
     @staticmethod
@@ -119,6 +146,28 @@ class StandardFileService:
             except Exception as exc:
                 errors.append("%s: %s" % (item.rel_path, exc))
         return covered, errors
+
+    @staticmethod
+    def overwrite_from_local_sources(target_dir, items):
+        """用清单中的本地文件覆盖工作副本；此步骤不会执行 SVN 提交。"""
+        copied, errors = [], []
+        for item in items:
+            if item.status != "已覆盖" or not item.local_source_file:
+                continue
+            try:
+                expected_target = _safe_child(target_dir, item.rel_path)
+                if os.path.realpath(item.target_file) != os.path.realpath(expected_target):
+                    raise ValueError("目标文件与清单相对路径不一致")
+                if not os.path.isfile(item.local_source_file):
+                    raise FileNotFoundError("本地文件不存在")
+                os.makedirs(os.path.dirname(expected_target), exist_ok=True)
+                shutil.copy2(item.local_source_file, expected_target)
+                item.status = "已覆盖本地"
+                item.detail = "<- 本地源文件（未提交）"
+                copied.append(item)
+            except Exception as exc:
+                errors.append("%s: %s" % (item.rel_path, exc))
+        return copied, errors
 
     def prepare_commit(self, target_dir, covered_items):
         """只登记本次覆盖文件，然后返回整个目标目录的待提交状态供用户确认。"""
