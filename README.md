@@ -6,7 +6,7 @@
 
 - **现代图形界面**（`svn_sync_qt.py`）：Windows 主要使用方式，基于 PySide6 / Qt Widgets，打包为 exe 分发。
 - **旧版图形界面**（`svn_sync_tool.py`）：保留为迁移期功能对照和回归入口，不再作为 Windows 正式打包入口。
-- **终端版**（`svn_sync_cli.py`）：macOS 推荐使用方式，功能与 GUI 的 6 个页面一一对应，支持交互式菜单和命令行参数两种用法，详见下方「终端版」章节。macOS 不再更新 `.app` 打包产物。
+- **终端版**（`svn_sync_cli.py`）：macOS 推荐使用方式，功能与 GUI 的 6 个页面一一对应，支持交互式菜单和命令行参数两种用法，详见下方「终端版」章节。也可直接使用 `outputs/SVN_Sync_Tool.app.zip` 中的图形界面。
 - **Web 工具中心**（`svn_sync_web.py`）：提供“版本号路径生成”、“SVN 标准文件提交”和“升级清单提取”；SVN 任务使用隔离的临时工作副本/配置目录与用户自己的 SVN 凭据。默认仅监听 `127.0.0.1`，可通过显式参数开放可信局域网访问。
 
 A Windows Qt GUI and macOS CLI tool for checking out code from SVN, overwriting cross-referenced files from a local organized directory (or network share), and automatically committing changes.
@@ -52,7 +52,7 @@ Grab the pre-built artifact for your platform from the outputs/ directory:
 | 平台 | 产物 |
 |------|------|
 | **Windows** | `outputs/SVN_Sync_Tool.exe` |
-| **macOS** | 推荐直接运行终端版源码 `python3 svn_sync_cli.py`（历史 `outputs/SVN_Sync_Tool-macos-arm64.zip` 不再更新） |
+| **macOS** | `outputs/SVN_Sync_Tool.app.zip`（解压得到 `SVN_Sync_Tool.app`）；也可直接运行终端版源码 `python3 svn_sync_cli.py` |
 
 Windows exe 双击运行，无需安装 Python 或任何依赖（但系统需已安装 SVN 命令行工具）。macOS 终端版只依赖系统 Python 3 和 SVN 命令行工具，无需安装第三方包。
 
@@ -357,15 +357,30 @@ REM 产物在 dist\ 下，复制到 outputs\
 copy /Y dist\SVN_Sync_Tool.exe outputs\SVN_Sync_Tool.exe
 ```
 
-**macOS**：不再打包 `.app`，直接运行终端版即可：
+**macOS**（应用包）：
 
 ```bash
-python3 svn_sync_cli.py
+python3 -m venv .venv-macos
+.venv-macos/bin/python -m pip install -r requirements.txt
+
+# 用 macOS 专用 spec 打包为 .app
+.venv-macos/bin/python -m PyInstaller --clean --noconfirm SVN_Sync_Tool_macos.spec
+
+# 压成 zip 后放入 outputs/（ditto 可保留可执行位与符号链接）
+rm -rf outputs/SVN_Sync_Tool.app && cp -R dist/SVN_Sync_Tool.app outputs/
+ditto -c -k --sequesterRsrc --keepParent outputs/SVN_Sync_Tool.app outputs/SVN_Sync_Tool.app.zip
 ```
 
-> 如需在 macOS 开发机检查现代 GUI，安装 requirements 后运行 `python3 svn_sync_qt.py`；正式使用仍推荐终端版。
+也可以不打包，直接运行终端版或从源码启动图形界面：
 
-> `build/`、`dist/` 均已在 `.gitignore` 中忽略；`SVN_Sync_Tool.spec` 是现代 Qt GUI 的 Windows 正式构建入口。仓库只保留 `outputs/` 下的成品。
+```bash
+python3 svn_sync_cli.py                    # 终端版
+.venv-macos/bin/python svn_sync_qt.py      # 图形界面
+```
+
+> 两份 spec 不可混用：`SVN_Sync_Tool.spec` 是 Windows 单文件 exe（binaries/datas 内联进 EXE、开启 UPX）；`SVN_Sync_Tool_macos.spec` 是 macOS 应用包（`COLLECT` + `BUNDLE`、关闭 UPX，因为 UPX 会破坏 Mach-O 结构）。新增运行时资源时两份都要加进 `datas`。
+
+> `build/`、`dist/` 均已在 `.gitignore` 中忽略；`outputs/*.app/` 也不入库，仓库只保留 `outputs/` 下的 `.exe` 与 `.app.zip` 成品。
 
 ### 参数说明 / Arguments Explained
 
@@ -417,11 +432,13 @@ python3 svn_sync_cli.py
 ├── web_standard_service.py             # Web 标准文件临时任务、凭据隔离与清理
 ├── web_path_service.py                 # Web 版本号路径生成（只读查询与本地排序）
 ├── web/                                # HTML 模板及本地 CSS/JavaScript
-├── SVN_Sync_Tool.spec                  # 现代 GUI 的 Windows PyInstaller 配置
+├── SVN_Sync_Tool.spec                  # Windows 单文件 exe 的 PyInstaller 配置
+├── SVN_Sync_Tool_macos.spec            # macOS .app 应用包的 PyInstaller 配置
+├── qt_assets/                          # Qt 样式表引用的图标资源（下拉箭头等）
 ├── tests/                              # 核心、安全门与职责边界回归测试
 ├── outputs/                            # 预编译成品（纳入版本库）
 │   ├── SVN_Sync_Tool.exe               #   Windows 可执行文件
-│   └── SVN_Sync_Tool-macos-arm64.zip   #   macOS 历史应用包（不再更新）
+│   └── SVN_Sync_Tool.app.zip           #   macOS 应用包（解压即用）
 ├── README.assets/                      # README 截图
 └── README.md                           # 本文档
 ```

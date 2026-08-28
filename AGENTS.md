@@ -86,7 +86,6 @@ python3 -m unittest discover -s tests -v
   `outputs/SVN_Sync_Tool.app.zip` 提交（`.app` 是目录，直接入库会让仓库快速膨胀；
   `ditto` 能保留可执行位与符号链接）；
 - `dist/`、`build/`、`.venv*/`、`outputs/*.app/` 是本地构建内容，不提交；
-- `outputs/SVN_Sync_Tool-macos-arm64.zip` 是历史产物，不再更新或删除；
 - 确实未更新某个产物时，必须在交付说明中写明原因。
 
 两份 spec 不可混用：`SVN_Sync_Tool.spec` 是 Windows 单文件 exe（binaries/datas 内联进
