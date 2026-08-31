@@ -415,6 +415,7 @@ const standardState = {
   task: null,
   pollTimer: null,
   pollFailures: 0,
+  resultUrls: [],
 };
 
 const standardElements = {
@@ -455,6 +456,9 @@ const standardElements = {
   resultMessage: document.querySelector("#standardResultMessage"),
   resultRevision: document.querySelector("#standardResultRevision"),
   resultUrls: document.querySelector("#standardResultUrls"),
+  resultUrlHead: document.querySelector("#standardResultUrlHead"),
+  resultUrlCount: document.querySelector("#standardResultUrlCount"),
+  copyUrlsButton: document.querySelector("#standardCopyUrlsButton"),
   log: document.querySelector("#standardTaskLog"),
   dialog: document.querySelector("#standardCommitDialog"),
   dialogSvnUrl: document.querySelector("#dialogSvnUrl"),
@@ -919,6 +923,8 @@ function renderStandardResult(task) {
   standardElements.result.hidden = false;
   standardElements.resultRevision.hidden = true;
   standardElements.resultUrls.replaceChildren();
+  standardElements.resultUrlHead.hidden = true;
+  standardState.resultUrls = [];
   const cleanupStatus = task.cleanup?.status || "pending";
   const cleanupText = cleanupStatus === "cleaned"
     ? "临时工作副本和独立认证配置已清理。"
@@ -934,11 +940,17 @@ function renderStandardResult(task) {
       standardElements.resultRevision.textContent = `Revision r${task.result.revision}`;
       standardElements.resultRevision.hidden = false;
     }
-    (task.result?.urls || []).forEach((url) => {
+    const urls = task.result?.urls || [];
+    standardState.resultUrls = urls;
+    urls.forEach((url) => {
       const line = document.createElement("p");
       line.textContent = url;
       standardElements.resultUrls.append(line);
     });
+    if (urls.length) {
+      standardElements.resultUrlCount.textContent = `本次提交 ${urls.length} 个文件`;
+      standardElements.resultUrlHead.hidden = false;
+    }
   } else if (task.status === "no_changes") {
     standardElements.result.dataset.kind = "success";
     standardElements.resultMark.textContent = "✓";
@@ -1093,6 +1105,25 @@ standardElements.form.addEventListener("reset", (event) => {
 });
 standardElements.fileList.addEventListener("input", updateStandardCounters);
 standardElements.coverAllConfirm.addEventListener("change", clearStandardErrors);
+standardElements.copyUrlsButton.addEventListener("click", async () => {
+  const text = standardState.resultUrls.join("\n");
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+    showNotice(`已复制 ${standardState.resultUrls.length} 个文件路径。`, "success");
+  } catch (_error) {
+    // 非 HTTPS 或未授权时 clipboard API 不可用，退回选中文本再复制
+    const range = document.createRange();
+    range.selectNodeContents(standardElements.resultUrls);
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    const copied = document.execCommand("copy");
+    selection.removeAllRanges();
+    showNotice(copied ? `已复制 ${standardState.resultUrls.length} 个文件路径。` : "复制失败，请手工选择后复制。",
+               copied ? "success" : "error");
+  }
+});
 standardElements.commitMessage.addEventListener("input", updateStandardCounters);
 standardElements.sourceProfile.addEventListener("change", updateSelectedProfileDetail);
 standardElements.sampleButton.addEventListener("click", () => {

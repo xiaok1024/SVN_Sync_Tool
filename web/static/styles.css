@@ -1316,6 +1316,7 @@ select:focus-visible {
 }
 
 .result-revision,
+.result-url-head,
 .result-url-list {
   grid-column: 2;
 }
@@ -1328,6 +1329,16 @@ select:focus-visible {
   padding: 7px 10px;
   font-family: var(--mono);
   font-weight: 750;
+}
+
+.result-url-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: -4px;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .result-url-list {
