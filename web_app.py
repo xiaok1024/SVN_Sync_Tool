@@ -304,12 +304,14 @@ def _set_session_cookie(response, token, secure):
 @app.post("/api/v1/auth/register")
 async def register(request: Request):
     payload = await _read_json(request, RegisterRequest)
-    return await run_in_threadpool(
+    profile = await run_in_threadpool(
         request.app.state.auth.register,
         username=payload.username,
         password=payload.password,
         display_name=payload.display_name,
     )
+    # 与其余接口保持同一响应外形：前端统一以 ok 判定成败。
+    return {"ok": True, "user": profile}
 
 
 @app.post("/api/v1/auth/login")

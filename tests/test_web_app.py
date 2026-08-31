@@ -318,6 +318,32 @@ class WebAppApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
         self.assertEqual(response.json()["error"]["code"], "invalid_field")
 
+    def test_every_successful_response_carries_ok_true(self):
+        """前端以 ok 判定成败；漏掉它会把成功的 200 报成失败。"""
+        client = TestClient(app)
+        calls = [
+            ("register", lambda: client.post(
+                "/api/v1/auth/register",
+                json={"username": "okshape", "password": "correct-horse"})),
+            ("login", lambda: client.post(
+                "/api/v1/auth/login",
+                json={"username": "okshape", "password": "correct-horse"})),
+            ("me", lambda: client.get("/api/v1/auth/me")),
+            ("save-svn", lambda: client.put(
+                "/api/v1/auth/svn-credentials",
+                json={"svn_username": "svc", "svn_password": "pw"})),
+            ("source-profiles", lambda: client.get(
+                "/api/v1/standard-files/source-profiles")),
+            ("sort", lambda: client.post(
+                "/api/v1/revision-paths/sort", json={"text": "a(V1)"})),
+            ("clear-svn", lambda: client.delete("/api/v1/auth/svn-credentials")),
+            ("logout", lambda: client.post("/api/v1/auth/logout")),
+        ]
+        for label, call in calls:
+            response = call()
+            self.assertEqual(response.status_code, 200, label)
+            self.assertIs(response.json().get("ok"), True, "%s 响应缺少 ok=true" % label)
+
     def test_static_route_cannot_read_repository_files(self):
         response = self.client.get("/static/%2e%2e/README.md")
         self.assertEqual(response.status_code, 404)
