@@ -36,6 +36,28 @@ WEB_ROOT = PROJECT_ROOT / "web"
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 
 
+class NormalizeHostHeader:
+    """把 Host 头统一转小写后再交给 TrustedHostMiddleware。
+
+    主机名本身大小写不敏感（RFC 3986），但 Starlette 的 TrustedHostMiddleware
+    是逐字比较，而可信列表是小写的。某些客户端会原样发送用户输入的大小写
+    （本机真实主机名就是 LZR-MBP-M5.local），不归一化会被误拒为 400。
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            headers = []
+            for key, value in scope["headers"]:
+                if key == b"host":
+                    value = value.lower()
+                headers.append((key, value))
+            scope = dict(scope, headers=headers)
+        await self.app(scope, receive, send)
+
+
 def _allowed_hosts():
     configured = os.environ.get("SVN_SYNC_WEB_ALLOWED_HOSTS", "")
     hosts = {
@@ -194,6 +216,8 @@ app.add_middleware(
     TrustedHostMiddleware,
     allowed_hosts=_allowed_hosts(),
 )
+# 后加入者位于更外层：先归一化 Host，再交给上面的可信 Host 校验
+app.add_middleware(NormalizeHostHeader)
 app.mount("/static", StaticFiles(directory=WEB_ROOT / "static"), name="static")
 templates = Jinja2Templates(directory=WEB_ROOT / "templates")
 

@@ -150,6 +150,13 @@ class WebAppApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
         self.assertNotIn("script", response.text)
 
+    def test_host_header_matching_is_case_insensitive(self):
+        """主机名大小写不敏感；真实主机名常带大写，不能因此被拒。"""
+        for host in ("lzr-mac-mini.local:8765", "LZR-MAC-MINI.local:8765",
+                     "LZR-Mac-Mini.LOCAL:8765", "LOCALHOST"):
+            response = self.client.get("/api/health", headers={"host": host})
+            self.assertEqual(response.status_code, 200, host)
+
     def test_untrusted_host_is_rejected(self):
         response = self.client.get("/", headers={"host": "untrusted.example"})
         self.assertEqual(response.status_code, 400)
