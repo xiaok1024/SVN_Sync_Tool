@@ -14,6 +14,8 @@ from unittest import mock
 
 from svn_standard_file_core import iter_standard_file_lines, parse_file_input
 from web_standard_service import (
+    DEFAULT_HISTORICAL_UNC_PREFIX,
+    DEFAULT_STANDARD_UNC_PREFIX,
     SourceProfile,
     StandardJobManager,
     StandardWebError,
@@ -46,10 +48,16 @@ class StandardWebParsingTest(unittest.TestCase):
             config = Path(root, "e9-paths.json")
             config.write_text(json.dumps({"secrets.root": str(secrets_root)}), encoding="utf-8")
             profiles = load_source_profiles({"E9_PATHS_FILE": str(config)})
-            self.assertEqual(len(profiles), 1)
-            self.assertEqual(
-                profiles[0].smb_credentials_file, os.path.realpath(credentials))
-            self.assertTrue(profiles[0].available)
+            # 现在会同时产出标准共享与历史文件共享两个来源
+            by_id = {profile.profile_id: profile for profile in profiles}
+            self.assertEqual(set(by_id), {"default", "historical"})
+            for profile in profiles:
+                self.assertEqual(
+                    profile.smb_credentials_file, os.path.realpath(credentials))
+                self.assertTrue(profile.available)
+            self.assertTrue(by_id["default"].allows_cover_all)
+            self.assertFalse(by_id["historical"].allows_cover_all)
+            self.assertIn("192.168.7.108", by_id["historical"].unc_prefix)
 
     def test_repository_relative_path_maps_checkout_root_and_keeps_spaces(self):
         root = "https://svn.example.com/svn/Y示例客户/ecology"
@@ -110,6 +118,59 @@ class StandardWebParsingTest(unittest.TestCase):
                     parse_customer_standard_path(invalid, prefix)
 
 
+class HistoricalShareRulesTest(unittest.TestCase):
+    """历史文件共享（\\192.168.7.108）与标准共享（\\192.168.7.215）的差异。"""
+
+    def _profile(self, prefix):
+        return SourceProfile("p", "来源", standard_path="", unc_prefix=prefix)
+
+    def test_only_the_standard_share_may_cover_all(self):
+        self.assertTrue(self._profile(DEFAULT_STANDARD_UNC_PREFIX).allows_cover_all)
+        self.assertFalse(self._profile(DEFAULT_HISTORICAL_UNC_PREFIX).allows_cover_all)
+        # 任何其他共享同样不允许
+        self.assertFalse(self._profile(r"\\192.168.7.9\ECOLOGY_customer").allows_cover_all)
+
+    def test_prefix_comparison_ignores_case_slash_and_trailing_separator(self):
+        for variant in (r"\\192.168.7.215\ecology_customer",
+                        "//192.168.7.215/ECOLOGY_customer",
+                        r"\\192.168.7.215\ECOLOGY_customer" + "\\"):
+            with self.subTest(variant=variant):
+                self.assertTrue(self._profile(variant).allows_cover_all)
+
+    def test_historical_path_accepts_named_third_segment(self):
+        value = DEFAULT_HISTORICAL_UNC_PREFIX + r"\Z\Z中电投资\历史文件\ecology"
+        self.assertEqual(
+            parse_customer_standard_path(
+                value, DEFAULT_HISTORICAL_UNC_PREFIX, require_qc_segment=False),
+            "Z/Z中电投资/历史文件/ecology")
+
+    def test_standard_share_still_requires_a_qc_segment(self):
+        value = DEFAULT_STANDARD_UNC_PREFIX + r"\Z\Z中电投资\历史文件\ecology"
+        with self.assertRaisesRegex(StandardWebError, "QC 编号"):
+            parse_customer_standard_path(
+                value, DEFAULT_STANDARD_UNC_PREFIX, require_qc_segment=True)
+
+    def test_historical_path_still_rejects_traversal_and_wrong_shape(self):
+        prefix = DEFAULT_HISTORICAL_UNC_PREFIX
+        for invalid in (
+                prefix + r"\Z\客户\..\ecology",
+                prefix + r"\Z\客户\历史文件\other",
+                prefix + r"\Z\客户\历史文件\ecology\src",
+                prefix + r"\Z\客户\ecology",
+                r"\\192.168.7.215\ECOLOGY_customer\Z\客户\历史文件\ecology"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(StandardWebError):
+                    parse_customer_standard_path(invalid, prefix, require_qc_segment=False)
+
+    def test_public_dict_exposes_the_cover_all_policy(self):
+        standard = self._profile(DEFAULT_STANDARD_UNC_PREFIX).public_dict()
+        historical = self._profile(DEFAULT_HISTORICAL_UNC_PREFIX).public_dict()
+        self.assertTrue(standard["allows_cover_all"])
+        self.assertFalse(historical["allows_cover_all"])
+        self.assertIn("QC编号", standard["path_hint"])
+        self.assertNotIn("QC编号", historical["path_hint"])
+
+
 class WebSvnCredentialIsolationTest(unittest.TestCase):
     def test_password_uses_stdin_and_never_enters_argv_or_config_files(self):
         with tempfile.TemporaryDirectory() as root:
@@ -150,6 +211,34 @@ class StandardJobSafetyTest(unittest.TestCase):
                         cover_all_confirmed=False,
                         commit_message="QC123456 标准文件",
                     )
+                self.assertFalse(manager.jobs)
+            finally:
+                manager.stop()
+
+    def test_historical_share_rejects_empty_file_list_end_to_end(self):
+        """非标准共享即便勾了确认，也不能靠空清单覆盖全部交集。"""
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as source:
+            Path(source, "ecology").mkdir()
+            manager = StandardJobManager(
+                profiles=[SourceProfile(
+                    "historical", "历史文件共享", standard_path=source,
+                    unc_prefix=DEFAULT_HISTORICAL_UNC_PREFIX)],
+                temp_root=root, min_free_bytes=0,
+                max_root_bytes=1024 * 1024 * 1024, require_password_stdin=False)
+            try:
+                with self.assertRaises(StandardWebError) as caught:
+                    manager.create_job(
+                        svn_url="https://svn.example.com/svn/customer/ecology",
+                        username="user", password="password",
+                        profile_id="historical",
+                        customer_standard_path=(
+                            DEFAULT_HISTORICAL_UNC_PREFIX
+                            + r"\Z\Z中电投资\历史文件\ecology"),
+                        file_list="",
+                        cover_all_confirmed=True,   # 勾了也不放行
+                        commit_message="QC123456 历史文件",
+                    )
+                self.assertEqual(caught.exception.code, "file_list_required")
                 self.assertFalse(manager.jobs)
             finally:
                 manager.stop()

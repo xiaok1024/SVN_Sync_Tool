@@ -543,10 +543,17 @@ async function standardRequest(url, { method = "GET", payload = null, token = nu
 
 function updateStandardCounters() {
   const lineCount = standardElements.fileList.value.split(/\r?\n/).filter((line) => line.trim()).length;
-  const coverAll = lineCount === 0;
-  standardElements.fileCount.textContent = coverAll ? "空清单 · 全部交集模式" : `${lineCount} 行 · 指定清单模式`;
-  standardElements.coverAllConfirmWrap.hidden = !coverAll;
-  if (!coverAll) standardElements.coverAllConfirm.checked = false;
+  const emptyList = lineCount === 0;
+  const allowsCoverAll = selectedProfileAllowsCoverAll();
+  if (!emptyList) {
+    standardElements.fileCount.textContent = `${lineCount} 行 · 指定清单模式`;
+  } else {
+    standardElements.fileCount.textContent = allowsCoverAll
+      ? "空清单 · 全部交集模式" : "该来源必须填写文件清单";
+  }
+  // 只有标准文件共享支持空清单；其他来源连确认框都不显示
+  standardElements.coverAllConfirmWrap.hidden = !(emptyList && allowsCoverAll);
+  if (!emptyList || !allowsCoverAll) standardElements.coverAllConfirm.checked = false;
   standardElements.messageCount.textContent = `${standardElements.commitMessage.value.length} / 500`;
 }
 
@@ -640,6 +647,12 @@ function validateStandardForm() {
     showStandardError("SVN 检出根必须是完整的 http 或 https 地址。", standardElements.svnUrl);
     return false;
   }
+  if (!standardElements.fileList.value.trim() && !selectedProfileAllowsCoverAll()) {
+    showStandardError(
+      "该来源必须提供文件清单；只有标准文件共享支持清单留空覆盖全部交集。",
+      standardElements.fileList);
+    return false;
+  }
   if (!standardElements.fileList.value.trim() && !standardElements.coverAllConfirm.checked) {
     showStandardError("清单为空时，请确认只覆盖 SVN 与标准目录同时存在的全部文件。", standardElements.coverAllConfirm);
     return false;
@@ -669,6 +682,8 @@ async function loadStandardProfiles() {
       option.textContent = profile.label;
       option.dataset.detail = profile.priority;
       option.dataset.uncPrefix = profile.unc_prefix || "";
+      option.dataset.allowsCoverAll = profile.allows_cover_all ? "1" : "";
+      option.dataset.pathHint = profile.path_hint || "";
       standardElements.sourceProfile.append(option);
     });
     standardState.profilesReady = true;
@@ -685,11 +700,24 @@ async function loadStandardProfiles() {
   }
 }
 
+/** 当前所选来源是否允许「清单留空 = 覆盖全部交集」。 */
+function selectedProfileAllowsCoverAll() {
+  return Boolean(
+    standardElements.sourceProfile.selectedOptions[0]?.dataset.allowsCoverAll);
+}
+
 function updateSelectedProfileDetail() {
   const option = standardElements.sourceProfile.selectedOptions[0];
-  standardElements.sourceProfileDetail.textContent = option?.dataset.detail
-    ? `${option.dataset.detail}；允许的共享根：${option.dataset.uncPrefix || "由服务器配置"}。`
-    : "网页只显示配置名称，不暴露服务器真实目录。";
+  if (option?.dataset.detail) {
+    const hint = option.dataset.pathHint ? `；目录格式：${option.dataset.pathHint}` : "";
+    standardElements.sourceProfileDetail.textContent =
+      `${option.dataset.detail}；允许的共享根：${option.dataset.uncPrefix || "由服务器配置"}${hint}。`;
+  } else {
+    standardElements.sourceProfileDetail.textContent =
+      "网页只显示配置名称，不暴露服务器真实目录。";
+  }
+  // 切换来源会改变清单是否可留空，计数与提示需要同步刷新
+  updateStandardCounters();
 }
 
 function saveStandardTaskSession() {
@@ -1386,7 +1414,6 @@ pathElements.downloadButton.addEventListener("click", downloadPathResult);
 
 selectTool(toolFromHash(window.location.hash));
 updateStandardCounters();
-loadStandardProfiles();
 restoreStandardTaskSession();
 updatePathRevisionCount();
 
@@ -1450,12 +1477,15 @@ function selectAuthTab(which) {
 }
 
 function applyUser(user) {
+  const wasSignedIn = Boolean(authState.user);
   authState.user = user;
   const signedIn = Boolean(user);
   authElements.gate.hidden = signedIn;
   authElements.accountArea.hidden = !signedIn;
   document.body.classList.toggle("is-gated", !signedIn);
   if (signedIn) {
+    // 来源列表需要登录才能读取，因此在登录成功后（含刷新页面时的会话恢复）再拉取
+    if (!wasSignedIn) loadStandardProfiles();
     authElements.accountName.textContent = user.display_name || user.username;
     authElements.svnButton.textContent = user.has_svn_credentials
       ? "我的 SVN 账号" : "我的 SVN 账号 · 待设置";

@@ -56,10 +56,19 @@ SVN_WC_FILE_OVERHEAD = 64 * 1024
 ACTIVE_STATES = {"queued", "preparing", "preview_ready", "commit_queued", "committing"}
 TERMINAL_STATES = {"committed", "no_changes", "failed", "expired", "cancelled", "commit_unknown"}
 DEFAULT_STANDARD_UNC_PREFIX = r"\\192.168.7.215\ECOLOGY_customer"
+DEFAULT_HISTORICAL_UNC_PREFIX = r"\\192.168.7.108\ECOLOGY_customer"
 
 
 class StandardWebError(WebSvnError):
     """标准文件任务的业务错误；结构与其他 Web SVN 功能保持一致。"""
+
+
+def _same_unc_prefix(left, right):
+    """比较两个 UNC 前缀：统一 NFC、斜杠方向、大小写与结尾反斜杠。"""
+    def norm(value):
+        text = unicodedata.normalize("NFC", str(value or "").strip().strip('"'))
+        return text.replace("/", "\\").rstrip("\\").lower()
+    return bool(norm(left)) and norm(left) == norm(right)
 
 
 @dataclass(frozen=True)
@@ -70,6 +79,24 @@ class SourceProfile:
     historical_path: str = ""
     unc_prefix: str = DEFAULT_STANDARD_UNC_PREFIX
     smb_credentials_file: str = ""
+
+    @property
+    def is_standard_share(self):
+        """是否为固定标准共享根（\\192.168.7.215）。
+
+        两条策略都由前缀推导而非配置项决定，避免有人在 JSON 里把非标准
+        共享错配成可以覆盖全部交集。
+        """
+        return _same_unc_prefix(self.unc_prefix, DEFAULT_STANDARD_UNC_PREFIX)
+
+    @property
+    def allows_cover_all(self):
+        """只有标准共享根允许「清单留空 = 覆盖全部交集」。
+
+        其他来源（如历史文件共享）内容不受标准化管控，必须逐个列出文件，
+        否则可能把大量非预期文件覆盖进客户仓库。
+        """
+        return self.is_standard_share
 
     @property
     def available(self):
@@ -87,7 +114,13 @@ class SourceProfile:
             "has_historical": False,
             "accepts_customer_path": bool(self.unc_prefix),
             "unc_prefix": self.unc_prefix,
-            "priority": "固定标准共享根；每个任务选择客户 QC 的 ecology 目录",
+            "allows_cover_all": self.allows_cover_all,
+            "path_hint": ("固定共享根\\分组\\客户\\QC编号\\ecology"
+                          if self.is_standard_share
+                          else "固定共享根\\分组\\客户\\目录\\ecology"),
+            "priority": ("固定标准共享根；每个任务选择客户 QC 的 ecology 目录"
+                         if self.is_standard_share
+                         else "历史文件共享根；必须提供文件清单，不支持覆盖全部交集"),
         }
 
 
@@ -169,6 +202,22 @@ def load_source_profiles(environ=None):
                 default_unc_prefix,
                 default_credentials_file,
             ))
+        # 历史文件共享：另一台服务器，内容不受标准化管控，必须逐个列文件
+        historical_path = _configured_path(env.get("SVN_SYNC_WEB_HISTORICAL_PATH"))
+        historical_prefix = str(env.get(
+            "SVN_SYNC_WEB_HISTORICAL_UNC_PREFIX", DEFAULT_HISTORICAL_UNC_PREFIX) or "").strip()
+        if historical_path or default_credentials_file:
+            profiles.append(SourceProfile(
+                "historical",
+                str(env.get("SVN_SYNC_WEB_HISTORICAL_LABEL", "E9 历史文件共享") or "").strip()
+                or "E9 历史文件共享",
+                historical_path,
+                "",
+                historical_prefix,
+                _configured_path(
+                    env.get("SVN_SYNC_WEB_HISTORICAL_SMB_CREDENTIALS_FILE")
+                    or default_credentials_file),
+            ))
     if len({profile.profile_id for profile in profiles}) != len(profiles):
         raise ValueError("来源 Profile id 不能重复")
     return profiles
@@ -244,8 +293,15 @@ def parse_web_file_list(file_list, _svn_url=None):
     return unique
 
 
-def parse_customer_standard_path(value, unc_prefix=DEFAULT_STANDARD_UNC_PREFIX):
-    """验证固定共享根下的 ``分组/客户/QC/ecology`` 目录并返回安全后缀。"""
+def parse_customer_standard_path(value, unc_prefix=DEFAULT_STANDARD_UNC_PREFIX,
+                                 require_qc_segment=True):
+    """验证固定共享根下的四段目录并返回安全后缀。
+
+    标准共享根要求第三段是 ``QC<数字>``；历史文件共享的第三段是普通目录名
+    （如 ``历史文件``），因此由调用方通过 ``require_qc_segment`` 指定。
+    两者都强制四段、以 ``ecology`` 结尾，并拒绝空段、``.``/``..`` 与含
+    ``%``、``:`` 的段，防止越出固定共享根。
+    """
     text = unicodedata.normalize("NFC", str(value or "").strip().strip('"'))
     prefix = unicodedata.normalize("NFC", str(unc_prefix or "").strip()).rstrip("\\/")
     if (not text or len(text.encode("utf-8")) > 2048
@@ -262,11 +318,15 @@ def parse_customer_standard_path(value, unc_prefix=DEFAULT_STANDARD_UNC_PREFIX):
     parts = suffix.split("\\")
     if (len(parts) != 4 or any(part in {"", ".", ".."} for part in parts)
             or any("%" in part or ":" in part for part in parts)
-            or not re.fullmatch(r"QC\d+", parts[2], flags=re.I)
             or parts[3].lower() != "ecology"):
         raise StandardWebError(
             "invalid_customer_path",
-            "客户标准文件路径格式应为 固定共享根\\分组\\客户\\QC编号\\ecology")
+            "客户目录格式应为 固定共享根\\分组\\客户\\%s\\ecology"
+            % ("QC编号" if require_qc_segment else "目录"))
+    if require_qc_segment and not re.fullmatch(r"QC\d+", parts[2], flags=re.I):
+        raise StandardWebError(
+            "invalid_customer_path",
+            "标准文件共享的第三段必须是 QC 编号，例如 QC123456")
     return "/".join(parts)
 
 
@@ -755,10 +815,16 @@ class StandardJobManager:
                 or any(ord(char) < 32 for char in message)):
             raise StandardWebError("invalid_commit_message", "提交说明不能为空且最多 500 个字符")
         source_relative = (
-            parse_customer_standard_path(customer_standard_path, profile.unc_prefix)
+            parse_customer_standard_path(
+                customer_standard_path, profile.unc_prefix,
+                require_qc_segment=profile.is_standard_share)
             if str(customer_standard_path or "").strip() else ".")
         relative_paths = parse_web_file_list(file_list)
         selection_mode = "listed" if relative_paths else "intersection"
+        if selection_mode == "intersection" and not profile.allows_cover_all:
+            raise StandardWebError(
+                "file_list_required",
+                "该来源必须提供文件清单；只有标准文件共享支持清单留空覆盖全部交集")
         if selection_mode == "intersection" and cover_all_confirmed is not True:
             raise StandardWebError(
                 "cover_all_confirmation_required",
