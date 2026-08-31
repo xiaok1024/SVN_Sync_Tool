@@ -218,7 +218,9 @@ class StandardJobSafetyTest(unittest.TestCase):
                 self.assertNotIn("private-user", snapshot)
                 self.assertNotIn("private-password", snapshot)
                 self.assertNotIn(source, snapshot)
-                self.assertIn("[LZR-WEB:%s]" % task_id, snapshot)
+                # 提交说明原样保留，不再追加内部标记
+                self.assertIn("QC123456 标准文件", snapshot)
+                self.assertNotIn("LZR-WEB", snapshot)
                 profiles = json.dumps(manager.public_profiles(), ensure_ascii=False)
                 self.assertNotIn(source, profiles)
             finally:
@@ -965,6 +967,7 @@ class StandardJobLocalRepositoryIntegrationTest(unittest.TestCase):
                 engine.release_credentials()
 
     def test_sparse_preview_exact_commit_and_immediate_cleanup(self):
+        COMMIT_MESSAGE = "QC123456 Web 标准文件集成测试"
         with tempfile.TemporaryDirectory() as root:
             repo = Path(root, "repo")
             seed = Path(root, "seed")
@@ -1028,7 +1031,7 @@ class StandardJobLocalRepositoryIntegrationTest(unittest.TestCase):
                     password="local-test-password",
                     profile_id="default",
                     file_list="src/现有 File.txt\nsrc/%2e%2e/Percent.bin",
-                    commit_message="QC123456 Web 标准文件集成测试",
+                    commit_message=COMMIT_MESSAGE,
                 )
                 job_id = created["task"]["id"]
                 token = created["task"]["access_token"]
@@ -1060,7 +1063,9 @@ class StandardJobLocalRepositoryIntegrationTest(unittest.TestCase):
                     ["svn", "log", "--xml", "-r", str(result["result"]["revision"]), repo_url],
                     check=True, capture_output=True, text=True,
                 )
-                self.assertIn("[LZR-WEB:%s]" % job_id, log_result.stdout)
+                # 落到 SVN 日志里的提交说明必须与输入逐字一致，不含任何附加标记
+                self.assertIn("<msg>%s</msg>" % COMMIT_MESSAGE, log_result.stdout)
+                self.assertNotIn("LZR-WEB", log_result.stdout)
 
                 verify = Path(root, "verify")
                 subprocess.run(["svn", "checkout", repo_url + "/trunk", str(verify)],

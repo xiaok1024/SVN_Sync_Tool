@@ -769,7 +769,6 @@ class StandardJobManager:
         access_token = secrets.token_urlsafe(32)
         created_at = time.time()
         job_dir = self.temp_root / job_id
-        commit_message_with_marker = "%s [LZR-WEB:%s]" % (message, job_id)
         job = StandardJob(
             job_id=job_id,
             access_token_hash=_token_hash(access_token),
@@ -782,7 +781,7 @@ class StandardJobManager:
             source_relative=source_relative,
             selection_mode=selection_mode,
             relative_paths=relative_paths,
-            commit_message=commit_message_with_marker,
+            commit_message=message,
             job_dir=job_dir,
             wc_dir=job_dir / "wc",
             config_dir=job_dir / "svn-config",
@@ -1314,7 +1313,7 @@ class StandardJobManager:
                     job.progress = 100
                     job.error = {
                         "code": "commit_unknown" if commit_started else "commit_timeout",
-                        "message": "SVN 提交已启动但返回超时，请勿重复提交；请在仓库日志中核验本次提交说明。"
+                        "message": "SVN 提交已启动但返回超时，请勿重复提交；请按本次提交说明在仓库日志中核验。"
                         if commit_started else self._safe_error_message(job, exc),
                     }
                     job.finished_at = time.time()
