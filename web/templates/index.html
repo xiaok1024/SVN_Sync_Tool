@@ -20,9 +20,16 @@
           <small>Upgrade Toolbox</small>
         </span>
       </a>
-      <div class="service-state" aria-label="当前为本机预览">
-        <span class="state-dot" aria-hidden="true"></span>
-        本机预览
+      <div class="header-right">
+        <div class="service-state" aria-label="当前为本机预览">
+          <span class="state-dot" aria-hidden="true"></span>
+          本机预览
+        </div>
+        <div class="account-area" id="accountArea" hidden>
+          <button class="text-button" id="svnAccountButton" type="button">我的 SVN 账号</button>
+          <span class="account-name" id="accountName"></span>
+          <button class="text-button" id="logoutButton" type="button">退出</button>
+        </div>
       </div>
     </div>
   </header>
@@ -75,17 +82,11 @@
               <input class="text-input" id="pathSvnUrl" type="url" inputmode="url" autocapitalize="none" autocomplete="off" spellcheck="false" placeholder="http://10.1.3.12/svn/S客户开发">
               <p class="input-help">支持中文路径。请填写<strong>仓库根地址</strong>：<code>svn log</code> 返回的是仓库绝对路径，生成的 URL 由该地址直接拼接；填子目录会重复一段路径。</p>
 
-              <div class="credential-grid">
-                <div>
-                  <label class="field-label" for="pathSvnUsername">SVN 账号</label>
-                  <input class="text-input" id="pathSvnUsername" type="text" autocomplete="off" autocapitalize="none" spellcheck="false">
-                </div>
-                <div>
-                  <label class="field-label" for="pathSvnPassword">SVN 密码</label>
-                  <input class="text-input" id="pathSvnPassword" type="password" autocomplete="new-password">
-                </div>
-              </div>
-              <p class="credential-note"><strong>两者都留空</strong>即使用运行本服务这台机器上已缓存的 SVN 认证（只读查询，不会写入仓库）；填写时两者必须同时填，凭据只用于本次查询，不写入浏览器存储、服务器日志或 SVN 认证缓存。</p>
+              <label class="checkbox-row">
+                <input type="checkbox" id="pathUseHostCache">
+                <span>改用本机 SVN 缓存认证（只读查询，不使用我的账号）</span>
+              </label>
+              <p class="credential-note">默认使用<strong>你账号里保存的 SVN 凭据</strong>查询，无需在此填写。可在右上角「我的 SVN 账号」中维护。</p>
             </fieldset>
 
             <fieldset class="standard-form-section">
@@ -213,17 +214,7 @@
               <input class="text-input" id="standardSvnUrl" type="url" inputmode="url" autocapitalize="none" autocomplete="off" spellcheck="false" placeholder="https://svn.example.com/svn/customer/ecology">
               <p class="input-help">填写与清单相对路径对应的检出根；一次任务只能使用一个仓库。</p>
 
-              <div class="credential-grid">
-                <div>
-                  <label class="field-label" for="standardSvnUsername">SVN 账号</label>
-                  <input class="text-input" id="standardSvnUsername" type="text" autocomplete="off" autocapitalize="none" spellcheck="false">
-                </div>
-                <div>
-                  <label class="field-label" for="standardSvnPassword">SVN 密码</label>
-                  <input class="text-input" id="standardSvnPassword" type="password" autocomplete="new-password">
-                </div>
-              </div>
-              <p class="credential-note">账号和密码仅用于本次任务，不进入浏览器存储、服务器日志或 SVN 认证缓存。</p>
+              <p class="credential-note">本次提交将使用<strong>你账号里保存的 SVN 凭据</strong>，commit 归属于该账号。可在右上角「我的 SVN 账号」中维护。</p>
             </fieldset>
 
             <fieldset class="standard-form-section">
@@ -468,6 +459,79 @@
       <span>Web preview · v{{ app_version }}</span>
     </footer>
   </main>
+
+  <!-- 登录门：未登录时覆盖整个界面；服务端已对每个接口独立校验会话，
+       这一层只是界面引导，不作为安全边界。 -->
+  <div class="gate" id="authGate" hidden>
+    <div class="gate-card">
+      <div class="gate-brand">
+        <span class="brand-symbol" aria-hidden="true"><span></span></span>
+        <div>
+          <strong>升级工具中心</strong>
+          <small>请先登录后使用</small>
+        </div>
+      </div>
+
+      <div class="gate-tabs" role="tablist">
+        <button class="gate-tab" id="tabLogin" type="button" role="tab" aria-selected="true">登录</button>
+        <button class="gate-tab" id="tabRegister" type="button" role="tab" aria-selected="false">注册</button>
+      </div>
+
+      <p class="form-error" id="authError" hidden tabindex="-1"></p>
+
+      <form id="loginForm" autocomplete="on">
+        <label class="field-label" for="loginUsername">账号</label>
+        <input class="text-input" id="loginUsername" name="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+        <label class="field-label" for="loginPassword">登录密码</label>
+        <input class="text-input" id="loginPassword" name="password" type="password" autocomplete="current-password" required>
+        <button class="button button-primary gate-submit" id="loginSubmit" type="submit">
+          <span class="button-label" data-default="登录">登录</span>
+        </button>
+      </form>
+
+      <form id="registerForm" autocomplete="on" hidden>
+        <label class="field-label" for="registerUsername">账号</label>
+        <input class="text-input" id="registerUsername" name="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+        <p class="input-help">2-32 位，字母或数字开头，可含下划线、点、连字符。</p>
+        <label class="field-label" for="registerDisplayName">显示名称（可选）</label>
+        <input class="text-input" id="registerDisplayName" type="text" autocomplete="nickname">
+        <label class="field-label" for="registerPassword">登录密码</label>
+        <input class="text-input" id="registerPassword" name="password" type="password" autocomplete="new-password" required>
+        <p class="input-help">至少 8 位。此密码只用于登录本站，与 SVN 密码是两回事。</p>
+        <button class="button button-primary gate-submit" id="registerSubmit" type="submit">
+          <span class="button-label" data-default="注册并登录">注册并登录</span>
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <!-- 我的 SVN 账号 -->
+  <div class="gate" id="svnDialog" hidden>
+    <div class="gate-card">
+      <h2 class="dialog-title">我的 SVN 账号</h2>
+      <p class="input-help">保存后，版本查询与标准文件提交都会使用这组凭据，提交记录归属于该 SVN 账号。</p>
+      <p class="credential-note credential-note-warn">服务端以<strong>明文</strong>保存该密码（<code>svn</code> 需要真实密码，无法只存哈希）。文件位于服务器上仅属主可读的目录，但请知悉这一点。</p>
+
+      <p class="form-error" id="svnDialogError" hidden tabindex="-1"></p>
+      <p class="dialog-status" id="svnDialogStatus"></p>
+
+      <form id="svnCredentialForm">
+        <label class="field-label" for="svnAccountUsername">SVN 账号</label>
+        <input class="text-input" id="svnAccountUsername" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" required>
+        <label class="field-label" for="svnAccountPassword">SVN 密码</label>
+        <input class="text-input" id="svnAccountPassword" type="password" autocomplete="new-password" required>
+        <p class="input-help">出于安全考虑，已保存的密码不会回显；重新填写即覆盖。</p>
+        <div class="dialog-actions">
+          <button class="button button-primary" id="svnSaveButton" type="submit">
+            <span class="button-label" data-default="保存">保存</span>
+          </button>
+          <button class="button button-secondary" id="svnClearButton" type="button">清除已保存</button>
+          <button class="button button-secondary" id="svnCloseButton" type="button">关闭</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
 
   <dialog class="commit-dialog" id="standardCommitDialog" aria-labelledby="standardCommitDialogTitle">
     <form method="dialog">

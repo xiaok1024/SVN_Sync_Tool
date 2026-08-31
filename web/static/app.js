@@ -156,12 +156,13 @@ function httpFallbackMessage(status) {
   return `处理失败（HTTP ${status}），请稍后重试。`;
 }
 
-async function postJson(url, payload) {
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
+async function requestJson(method, url, payload) {
+  const init = { method, headers: { Accept: "application/json" } };
+  if (payload !== null && payload !== undefined) {
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(payload);
+  }
+  const response = await fetch(url, init);
   let data;
   try {
     data = await response.json();
@@ -171,9 +172,18 @@ async function postJson(url, payload) {
       : httpFallbackMessage(response.status));
   }
   if (!response.ok || !data.ok) {
+    // 会话过期或未登录：任何接口都可能返回，统一退回登录门。
+    if (response.status === 401 && data?.error?.code === "login_required"
+        && typeof applyUser === "function") {
+      applyUser(null);
+    }
     throw new Error(data?.error?.message || httpFallbackMessage(response.status));
   }
   return data;
+}
+
+function postJson(url, payload) {
+  return requestJson("POST", url, payload);
 }
 
 function plainTextFromHtml(html) {
@@ -415,8 +425,6 @@ const standardElements = {
   errorSummary: document.querySelector("#standardErrorSummary"),
   profileAlert: document.querySelector("#sourceProfileAlert"),
   svnUrl: document.querySelector("#standardSvnUrl"),
-  username: document.querySelector("#standardSvnUsername"),
-  password: document.querySelector("#standardSvnPassword"),
   sourceProfile: document.querySelector("#standardSourceProfile"),
   sourceProfileDetail: document.querySelector("#standardSourceProfileDetail"),
   customerPath: document.querySelector("#standardCustomerPath"),
@@ -524,6 +532,9 @@ async function standardRequest(url, { method = "GET", payload = null, token = nu
     throw standardApiError("服务返回了无法识别的响应");
   }
   if (!response.ok || !data.ok) {
+    if (response.status === 401 && data?.error?.code === "login_required") {
+      applyUser(null);
+    }
     throw standardApiError(
       data?.error?.message || httpFallbackMessage(response.status), data?.error?.code);
   }
@@ -573,8 +584,6 @@ function setStandardStatus(title, detail, { active = false, kind = "idle" } = {}
 function setStandardFormLocked(locked) {
   [
     standardElements.svnUrl,
-    standardElements.username,
-    standardElements.password,
     standardElements.sourceProfile,
     standardElements.customerPath,
     standardElements.fileList,
@@ -592,8 +601,6 @@ function clearStandardErrors() {
   standardElements.errorSummary.textContent = "";
   [
     standardElements.svnUrl,
-    standardElements.username,
-    standardElements.password,
     standardElements.sourceProfile,
     standardElements.customerPath,
     standardElements.fileList,
@@ -616,8 +623,6 @@ function validateStandardForm() {
   clearStandardErrors();
   const checks = [
     [standardElements.svnUrl, "请填写客户 SVN 检出根。"],
-    [standardElements.username, "请填写本次提交使用的 SVN 账号。"],
-    [standardElements.password, "请填写本次提交使用的 SVN 密码。"],
     [standardElements.sourceProfile, "请选择可用的标准文件来源。"],
     [standardElements.customerPath, "请填写客户标准文件 ecology 目录。"],
     [standardElements.commitMessage, "请填写 SVN 提交说明。"],
@@ -716,12 +721,8 @@ function restoreStandardTaskSession() {
 async function createStandardTask(event) {
   event.preventDefault();
   if (!validateStandardForm()) return;
-  const username = standardElements.username.value;
-  const password = standardElements.password.value;
   const payload = {
     svn_url: standardElements.svnUrl.value.trim(),
-    svn_username: username,
-    svn_password: password,
     source_profile_id: standardElements.sourceProfile.value,
     customer_standard_path: standardElements.customerPath.value.trim(),
     file_list: standardElements.fileList.value,
@@ -749,8 +750,6 @@ async function createStandardTask(event) {
     showStandardError(error.message);
     showNotice(error.message, "error");
   } finally {
-    standardElements.username.value = "";
-    standardElements.password.value = "";
     setButtonBusy(standardElements.createButton, false);
     standardElements.createButton.disabled = Boolean(standardState.taskId) || !standardState.profilesReady;
   }
@@ -1096,8 +1095,7 @@ const pathElements = {
   form: document.querySelector("#pathQueryForm"),
   errorSummary: document.querySelector("#pathErrorSummary"),
   svnUrl: document.querySelector("#pathSvnUrl"),
-  username: document.querySelector("#pathSvnUsername"),
-  password: document.querySelector("#pathSvnPassword"),
+  useHostCache: document.querySelector("#pathUseHostCache"),
   revisionSpec: document.querySelector("#pathRevisionSpec"),
   revisionCount: document.querySelector("#pathRevisionCount"),
   sortMode: document.querySelector("#pathSortMode"),
@@ -1157,8 +1155,7 @@ function setPathBadge(state, label) {
 function clearPathErrors() {
   pathElements.errorSummary.hidden = true;
   pathElements.errorSummary.textContent = "";
-  [pathElements.svnUrl, pathElements.username, pathElements.password,
-    pathElements.revisionSpec, pathElements.sortMode]
+  [pathElements.svnUrl, pathElements.revisionSpec, pathElements.sortMode]
     .forEach((control) => control.removeAttribute("aria-invalid"));
 }
 
@@ -1246,14 +1243,6 @@ function validatePathForm() {
     showPathError(`单次最多查询 ${PATH_MAX_REVISIONS} 个版本，请缩小版本范围。`, pathElements.revisionSpec);
     return false;
   }
-  const hasUser = Boolean(pathElements.username.value.trim());
-  const hasPassword = Boolean(pathElements.password.value);
-  if (hasUser !== hasPassword) {
-    showPathError(
-      "请同时填写 SVN 账号和密码；两者都留空则使用本机 SVN 缓存认证。",
-      hasUser ? pathElements.password : pathElements.username);
-    return false;
-  }
   return true;
 }
 
@@ -1276,16 +1265,15 @@ async function runPathQuery(event) {
   try {
     const data = await postJson("/api/v1/revision-paths/query", {
       svn_url: pathElements.svnUrl.value.trim(),
-      svn_username: pathElements.username.value,
-      svn_password: pathElements.password.value,
       revision_spec: pathElements.revisionSpec.value,
       sort: pathElements.sortMode.value,
+      use_host_cache: pathElements.useHostCache.checked,
     });
     if (revision !== pathState.revision) return;
     applyPathResult(data, (result) => (
       `共 ${result.stats.file_count} 个文件，命中 ${result.stats.matched_revisions.length} / `
       + `${result.stats.revision_count} 个版本（${PATH_SORT_LABELS[result.sort]}，`
-      + `${result.auth_mode === "host-cache" ? "本机缓存认证" : "本次填写的账号"}）。`
+      + `${result.auth_mode === "host-cache" ? "本机缓存认证" : "我的 SVN 账号"}）。`
     ));
     if (!data.stats.file_count) {
       setPathBadge("warning", "无变更文件");
@@ -1303,7 +1291,6 @@ async function runPathQuery(event) {
     showPathError(error.message);
     showNotice(error.message, "error");
   } finally {
-    pathElements.password.value = "";
     setButtonBusy(pathElements.queryButton, false);
     pathElements.sortButton.disabled = false;
   }
@@ -1402,3 +1389,221 @@ updateStandardCounters();
 loadStandardProfiles();
 restoreStandardTaskSession();
 updatePathRevisionCount();
+
+/* ── 账号与会话 ───────────────────────────────────────────────
+   登录门只是界面引导：服务端对每个接口都独立校验会话，绕过这层
+   拿不到任何数据。 */
+
+const authState = { user: null };
+
+const authElements = {
+  gate: document.querySelector("#authGate"),
+  error: document.querySelector("#authError"),
+  tabLogin: document.querySelector("#tabLogin"),
+  tabRegister: document.querySelector("#tabRegister"),
+  loginForm: document.querySelector("#loginForm"),
+  loginUsername: document.querySelector("#loginUsername"),
+  loginPassword: document.querySelector("#loginPassword"),
+  loginSubmit: document.querySelector("#loginSubmit"),
+  registerForm: document.querySelector("#registerForm"),
+  registerUsername: document.querySelector("#registerUsername"),
+  registerDisplayName: document.querySelector("#registerDisplayName"),
+  registerPassword: document.querySelector("#registerPassword"),
+  registerSubmit: document.querySelector("#registerSubmit"),
+  accountArea: document.querySelector("#accountArea"),
+  accountName: document.querySelector("#accountName"),
+  logoutButton: document.querySelector("#logoutButton"),
+  svnButton: document.querySelector("#svnAccountButton"),
+};
+
+const svnDialogElements = {
+  dialog: document.querySelector("#svnDialog"),
+  error: document.querySelector("#svnDialogError"),
+  status: document.querySelector("#svnDialogStatus"),
+  form: document.querySelector("#svnCredentialForm"),
+  username: document.querySelector("#svnAccountUsername"),
+  password: document.querySelector("#svnAccountPassword"),
+  saveButton: document.querySelector("#svnSaveButton"),
+  clearButton: document.querySelector("#svnClearButton"),
+  closeButton: document.querySelector("#svnCloseButton"),
+};
+
+function showAuthError(message, control) {
+  authElements.error.textContent = message;
+  authElements.error.hidden = false;
+  if (control) control.focus(); else authElements.error.focus();
+}
+
+function clearAuthError() {
+  authElements.error.hidden = true;
+  authElements.error.textContent = "";
+}
+
+function selectAuthTab(which) {
+  const login = which === "login";
+  authElements.tabLogin.setAttribute("aria-selected", String(login));
+  authElements.tabRegister.setAttribute("aria-selected", String(!login));
+  authElements.loginForm.hidden = !login;
+  authElements.registerForm.hidden = login;
+  clearAuthError();
+  (login ? authElements.loginUsername : authElements.registerUsername).focus();
+}
+
+function applyUser(user) {
+  authState.user = user;
+  const signedIn = Boolean(user);
+  authElements.gate.hidden = signedIn;
+  authElements.accountArea.hidden = !signedIn;
+  document.body.classList.toggle("is-gated", !signedIn);
+  if (signedIn) {
+    authElements.accountName.textContent = user.display_name || user.username;
+    authElements.svnButton.textContent = user.has_svn_credentials
+      ? "我的 SVN 账号" : "我的 SVN 账号 · 待设置";
+    authElements.svnButton.classList.toggle("needs-attention", !user.has_svn_credentials);
+  } else {
+    selectAuthTab("login");
+  }
+}
+
+async function refreshSession() {
+  try {
+    const response = await fetch("/api/v1/auth/me", { headers: { Accept: "application/json" } });
+    const data = await response.json();
+    applyUser(data.authenticated ? data.user : null);
+  } catch (_error) {
+    applyUser(null);
+  }
+}
+
+async function submitLogin(event) {
+  event.preventDefault();
+  clearAuthError();
+  if (!authElements.loginUsername.value.trim()) {
+    showAuthError("请填写账号。", authElements.loginUsername);
+    return;
+  }
+  setButtonBusy(authElements.loginSubmit, true, "登录中…");
+  try {
+    const data = await postJson("/api/v1/auth/login", {
+      username: authElements.loginUsername.value,
+      password: authElements.loginPassword.value,
+    });
+    authElements.loginPassword.value = "";
+    applyUser(data.user);
+    showNotice(`欢迎回来，${data.user.display_name}。`, "success");
+    if (!data.user.has_svn_credentials) openSvnDialog();
+  } catch (error) {
+    showAuthError(error.message, authElements.loginPassword);
+  } finally {
+    setButtonBusy(authElements.loginSubmit, false);
+  }
+}
+
+async function submitRegister(event) {
+  event.preventDefault();
+  clearAuthError();
+  if (authElements.registerPassword.value.length < 8) {
+    showAuthError("登录密码至少 8 位。", authElements.registerPassword);
+    return;
+  }
+  setButtonBusy(authElements.registerSubmit, true, "注册中…");
+  try {
+    await postJson("/api/v1/auth/register", {
+      username: authElements.registerUsername.value,
+      password: authElements.registerPassword.value,
+      display_name: authElements.registerDisplayName.value,
+    });
+    // 注册接口不建会话，随即用同一组凭据登录，省去二次输入。
+    const data = await postJson("/api/v1/auth/login", {
+      username: authElements.registerUsername.value,
+      password: authElements.registerPassword.value,
+    });
+    authElements.registerPassword.value = "";
+    applyUser(data.user);
+    showNotice("注册成功，请先设置你的 SVN 账号。", "success");
+    openSvnDialog();
+  } catch (error) {
+    showAuthError(error.message, authElements.registerUsername);
+  } finally {
+    setButtonBusy(authElements.registerSubmit, false);
+  }
+}
+
+async function submitLogout() {
+  try {
+    await postJson("/api/v1/auth/logout", {});
+  } catch (_error) {
+    // 登出失败也按已登出处理：本地状态清掉，重新拉一次会话即可。
+  }
+  applyUser(null);
+  showNotice("已退出登录。", "success");
+}
+
+function openSvnDialog() {
+  svnDialogElements.error.hidden = true;
+  svnDialogElements.dialog.hidden = false;
+  const user = authState.user;
+  svnDialogElements.username.value = user?.svn_username || "";
+  svnDialogElements.password.value = "";
+  svnDialogElements.status.textContent = user?.has_svn_credentials
+    ? `已保存 SVN 账号：${user.svn_username}` : "尚未保存 SVN 账号。";
+  svnDialogElements.username.focus();
+}
+
+function closeSvnDialog() {
+  svnDialogElements.dialog.hidden = true;
+  svnDialogElements.password.value = "";
+}
+
+async function submitSvnCredentials(event) {
+  event.preventDefault();
+  svnDialogElements.error.hidden = true;
+  if (!svnDialogElements.username.value.trim() || !svnDialogElements.password.value) {
+    svnDialogElements.error.textContent = "SVN 账号和密码都需要填写。";
+    svnDialogElements.error.hidden = false;
+    return;
+  }
+  setButtonBusy(svnDialogElements.saveButton, true, "保存中…");
+  try {
+    const data = await requestJson("PUT", "/api/v1/auth/svn-credentials", {
+      svn_username: svnDialogElements.username.value,
+      svn_password: svnDialogElements.password.value,
+    });
+    applyUser(data.user);
+    closeSvnDialog();
+    showNotice("SVN 账号已保存。", "success");
+  } catch (error) {
+    svnDialogElements.error.textContent = error.message;
+    svnDialogElements.error.hidden = false;
+  } finally {
+    setButtonBusy(svnDialogElements.saveButton, false);
+  }
+}
+
+async function clearSvnCredentials() {
+  if (!window.confirm("确定清除已保存的 SVN 账号密码？之后需要重新填写才能查询或提交。")) return;
+  try {
+    const data = await requestJson("DELETE", "/api/v1/auth/svn-credentials", null);
+    applyUser(data.user);
+    openSvnDialog();
+    showNotice("已清除保存的 SVN 账号。", "success");
+  } catch (error) {
+    svnDialogElements.error.textContent = error.message;
+    svnDialogElements.error.hidden = false;
+  }
+}
+
+authElements.tabLogin.addEventListener("click", () => selectAuthTab("login"));
+authElements.tabRegister.addEventListener("click", () => selectAuthTab("register"));
+authElements.loginForm.addEventListener("submit", submitLogin);
+authElements.registerForm.addEventListener("submit", submitRegister);
+authElements.logoutButton.addEventListener("click", submitLogout);
+authElements.svnButton.addEventListener("click", openSvnDialog);
+svnDialogElements.form.addEventListener("submit", submitSvnCredentials);
+svnDialogElements.clearButton.addEventListener("click", clearSvnCredentials);
+svnDialogElements.closeButton.addEventListener("click", closeSvnDialog);
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !svnDialogElements.dialog.hidden) closeSvnDialog();
+});
+
+refreshSession();

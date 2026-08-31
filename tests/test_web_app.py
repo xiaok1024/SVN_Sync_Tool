@@ -27,7 +27,18 @@ SAMPLE_HTML = (
 class WebAppApiTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        # 全站需登录：业务用例统一使用已登录且已保存 SVN 凭据的客户端。
         cls.client = TestClient(app)
+        cls.client.post("/api/v1/auth/register",
+                        json={"username": "apitester", "password": "correct-horse"})
+        cls.client.post("/api/v1/auth/login",
+                        json={"username": "apitester", "password": "correct-horse"})
+        cls.client.put("/api/v1/auth/svn-credentials",
+                       json={"svn_username": "svc", "svn_password": "svc-password"})
+
+    @staticmethod
+    def anonymous_client():
+        return TestClient(app)
 
     def test_index_has_brand_and_security_headers(self):
         response = self.client.get("/")
@@ -54,13 +65,11 @@ class WebAppApiTest(unittest.TestCase):
         self.assertNotIn("historical_path", response.text)
 
     def test_standard_task_rejects_unconfigured_source_without_echoing_password(self):
-        password = "do-not-echo-this-password"
+        password = "svc-password"
         response = self.client.post(
             "/api/v1/standard-files/tasks",
             json={
                 "svn_url": "https://svn.example.com/svn/customer/ecology",
-                "svn_username": "demo-user",
-                "svn_password": password,
                 "source_profile_id": "missing",
                 "customer_standard_path": r"\\192.168.7.215\ECOLOGY_customer\Y\示例客户\QC123456\ecology",
                 "file_list": "src/A.java",
@@ -77,8 +86,6 @@ class WebAppApiTest(unittest.TestCase):
             "/api/v1/standard-files/tasks",
             json={
                 "svn_url": "https://svn.example.com/svn/customer/ecology",
-                "svn_username": "demo-user",
-                "svn_password": "demo-password",
                 "source_profile_id": "missing",
                 "customer_standard_path": r"\\192.168.7.215\ECOLOGY_customer\Y\示例客户\QC123456\ecology",
                 "file_list": "src/A.java",
@@ -154,7 +161,7 @@ class WebAppApiTest(unittest.TestCase):
         self.assertTrue(response.json()["ok"])
 
     def test_cross_site_write_request_is_rejected(self):
-        response = self.client.post(
+        response = self.anonymous_client().post(
             "/api/v1/upgrade-list/extract",
             json={"html": "test"},
             headers={"origin": "http://untrusted.example"},
@@ -179,20 +186,17 @@ class WebAppApiTest(unittest.TestCase):
         self.assertTrue(payload["text"].startswith("http://svn.example.com/svn/R/a/Alpha.java(V189)"))
 
     def test_revision_path_query_validates_input_without_echoing_password(self):
-        password = "do-not-echo-this-password"
         response = self.client.post(
             "/api/v1/revision-paths/query",
             json={
                 "svn_url": "https://svn.example.com/svn/customer",
-                "svn_username": "demo-user",
-                "svn_password": password,
                 "revision_spec": "not-a-revision",
                 "sort": "rev",
             },
         )
         self.assertEqual(response.status_code, 422)
         self.assertEqual(response.json()["error"]["code"], "invalid_revision_spec")
-        self.assertNotIn(password, response.text)
+        self.assertNotIn("svc-password", response.text)
 
     def test_revision_path_query_rejects_arbitrary_extra_fields(self):
         response = self.client.post(
@@ -208,8 +212,9 @@ class WebAppApiTest(unittest.TestCase):
         self.assertEqual(response.json()["error"]["code"], "invalid_field")
 
     def test_revision_path_endpoints_reject_cross_site_writes(self):
+        client = self.anonymous_client()
         for path in ("/api/v1/revision-paths/query", "/api/v1/revision-paths/sort"):
-            response = self.client.post(
+            response = client.post(
                 path,
                 json={"svn_url": "https://svn.example.com/svn/R",
                       "revision_spec": "1", "sort": "rev", "text": "a(V1)"},
@@ -221,6 +226,97 @@ class WebAppApiTest(unittest.TestCase):
         response = self.client.get("/static/app.js")
         self.assertEqual(response.status_code, 200)
         self.assertIn("no-cache", response.headers["cache-control"])
+
+    def test_business_routes_reject_anonymous_callers(self):
+        """全站登录：未带会话时业务接口一律 401。"""
+        client = self.anonymous_client()
+        cases = [
+            ("post", "/api/v1/upgrade-list/extract", {"html": "x"}),
+            ("post", "/api/v1/upgrade-list/generate", {"list_text": "x", "format": "md"}),
+            ("post", "/api/v1/revision-paths/query",
+             {"svn_url": "https://svn.example.com/svn/R", "revision_spec": "1"}),
+            ("post", "/api/v1/revision-paths/sort", {"text": "a(V1)"}),
+            ("get", "/api/v1/standard-files/source-profiles", None),
+        ]
+        for method, path, payload in cases:
+            call = getattr(client, method)
+            response = call(path, json=payload) if payload is not None else call(path)
+            self.assertEqual(response.status_code, 401, path)
+            self.assertEqual(response.json()["error"]["code"], "login_required", path)
+
+    def test_register_login_flow_and_session_cookie_attributes(self):
+        client = TestClient(app)
+        registered = client.post(
+            "/api/v1/auth/register",
+            json={"username": "flowuser", "password": "correct-horse", "display_name": "流程"},
+        )
+        self.assertEqual(registered.status_code, 200)
+        self.assertNotIn("correct-horse", registered.text)
+
+        # 注册本身不建会话
+        self.assertFalse(client.get("/api/v1/auth/me").json()["authenticated"])
+
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"username": "flowuser", "password": "correct-horse"})
+        self.assertEqual(login.status_code, 200)
+        raw_cookie = login.headers.get("set-cookie", "").lower()
+        self.assertIn("httponly", raw_cookie)
+        self.assertIn("samesite=strict", raw_cookie)
+
+        me = client.get("/api/v1/auth/me").json()
+        self.assertTrue(me["authenticated"])
+        self.assertEqual(me["user"]["username"], "flowuser")
+        self.assertFalse(me["user"]["has_svn_credentials"])
+
+        client.post("/api/v1/auth/logout")
+        self.assertFalse(client.get("/api/v1/auth/me").json()["authenticated"])
+
+    def test_svn_credentials_are_stored_and_never_returned(self):
+        client = TestClient(app)
+        client.post("/api/v1/auth/register",
+                    json={"username": "creduser", "password": "correct-horse"})
+        client.post("/api/v1/auth/login",
+                    json={"username": "creduser", "password": "correct-horse"})
+
+        saved = client.put(
+            "/api/v1/auth/svn-credentials",
+            json={"svn_username": "svc", "svn_password": "svn-secret-value"})
+        self.assertEqual(saved.status_code, 200)
+        self.assertNotIn("svn-secret-value", saved.text)
+        self.assertTrue(saved.json()["user"]["has_svn_credentials"])
+        self.assertEqual(saved.json()["user"]["svn_username"], "svc")
+
+        # /me 同样不得回传密码
+        self.assertNotIn("svn-secret-value", client.get("/api/v1/auth/me").text)
+
+        cleared = client.delete("/api/v1/auth/svn-credentials")
+        self.assertFalse(cleared.json()["user"]["has_svn_credentials"])
+
+    def test_svn_action_requires_saved_credentials_first(self):
+        client = TestClient(app)
+        client.post("/api/v1/auth/register",
+                    json={"username": "nocreds", "password": "correct-horse"})
+        client.post("/api/v1/auth/login",
+                    json={"username": "nocreds", "password": "correct-horse"})
+        response = client.post(
+            "/api/v1/revision-paths/query",
+            json={"svn_url": "https://svn.example.com/svn/R", "revision_spec": "1"})
+        self.assertEqual(response.status_code, 428)
+        self.assertEqual(response.json()["error"]["code"], "svn_credentials_missing")
+
+    def test_browser_cannot_smuggle_svn_credentials_into_a_task(self):
+        client = TestClient(app)
+        client.post("/api/v1/auth/register",
+                    json={"username": "smuggler", "password": "correct-horse"})
+        client.post("/api/v1/auth/login",
+                    json={"username": "smuggler", "password": "correct-horse"})
+        response = client.post(
+            "/api/v1/revision-paths/query",
+            json={"svn_url": "https://svn.example.com/svn/R", "revision_spec": "1",
+                  "svn_username": "someone-else", "svn_password": "their-password"})
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["error"]["code"], "invalid_field")
 
     def test_static_route_cannot_read_repository_files(self):
         response = self.client.get("/static/%2e%2e/README.md")

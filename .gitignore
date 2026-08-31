@@ -26,3 +26,9 @@ Desktop.ini
 dist/
 README.assets/
 outputs/*.app/
+
+# Web 账号存储：含明文 SVN 密码，默认在仓库外（~/.config/svn_sync_tool/），
+# 这里再兜一层，防止有人把 SVN_SYNC_WEB_USER_STORE 指到仓库内
+web_users.json
+web_users.json.tmp
+*web_users*.json

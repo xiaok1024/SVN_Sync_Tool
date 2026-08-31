@@ -1788,3 +1788,142 @@ select:focus-visible {
     animation-iteration-count: 1 !important;
   }
 }
+
+/* ── 登录门与账号 ─────────────────────────────────────────── */
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.account-area {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.account-name {
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.text-button.needs-attention {
+  border-color: var(--warning);
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
+/* 登录门覆盖全屏；服务端仍对每个接口独立校验，这里只是界面引导 */
+.gate {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(17, 26, 46, 0.55);
+  backdrop-filter: blur(3px);
+  overflow-y: auto;
+}
+
+.gate-card {
+  width: 100%;
+  max-width: 420px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: 0 24px 60px rgba(17, 26, 46, 0.28);
+  padding: 28px;
+}
+
+.gate-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.gate-brand strong {
+  display: block;
+  font-size: 16px;
+}
+
+.gate-brand small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.gate-tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 18px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--surface-soft);
+  padding: 4px;
+}
+
+.gate-tab {
+  flex: 1;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  padding: 8px 10px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.gate-tab[aria-selected="true"] {
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: 0 1px 3px rgba(19, 33, 68, 0.12);
+}
+
+.gate-submit {
+  width: 100%;
+  margin-top: 18px;
+  justify-content: center;
+}
+
+.dialog-title {
+  margin: 0 0 6px;
+  font-size: 17px;
+}
+
+.dialog-status {
+  margin: 10px 0 14px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.dialog-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.credential-note-warn {
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
+.credential-note-warn::before { color: var(--warning); }
+
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 2px;
+  color: var(--ink);
+  font-size: 13px;
+}
+
+/* 未登录时禁止背景滚动 */
+body.is-gated { overflow: hidden; }

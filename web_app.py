@@ -19,6 +19,12 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from web_auth_service import (
+    SESSION_COOKIE,
+    SESSION_TTL_SECONDS,
+    AuthError,
+    AuthService,
+)
 from web_upgrade_service import UpgradeWebError, extract_upgrade_list, generate_upgrade_markdown
 from web_path_service import PathQueryService, PathWebError, sort_revision_path_text
 from web_standard_service import StandardJobManager, StandardWebError
@@ -51,12 +57,39 @@ class GenerateRequest(BaseModel):
     format: str
 
 
+class RegisterRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    username: str
+    password: str
+    display_name: str = ""
+
+
+class LoginRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    username: str
+    password: str
+
+
+class ChangePasswordRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    current_password: str
+    new_password: str
+
+
+class SvnCredentialRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    svn_username: str
+    svn_password: str
+
+
 class StandardJobRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     svn_url: str
-    svn_username: str
-    svn_password: str
     source_profile_id: str
     customer_standard_path: str
     file_list: str
@@ -68,10 +101,9 @@ class RevisionPathQueryRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     svn_url: str
-    svn_username: str = ""
-    svn_password: str = ""
     revision_spec: str
     sort: str = "rev"
+    use_host_cache: bool = False
 
 
 class RevisionPathSortRequest(BaseModel):
@@ -130,6 +162,7 @@ async def _read_json(request, model_type):
 
 
 PATH_QUERY_SERVICE = PathQueryService.from_environment()
+AUTH_SERVICE = AuthService.from_environment()
 
 try:
     STANDARD_JOB_MANAGER = StandardJobManager.from_environment()
@@ -156,6 +189,7 @@ app = FastAPI(
 )
 app.state.standard_jobs = STANDARD_JOB_MANAGER
 app.state.path_queries = PATH_QUERY_SERVICE
+app.state.auth = AUTH_SERVICE
 app.add_middleware(
     TrustedHostMiddleware,
     allowed_hosts=_allowed_hosts(),
@@ -206,6 +240,7 @@ async def handle_upgrade_error(_request, exc):
 
 @app.exception_handler(StandardWebError)
 @app.exception_handler(PathWebError)
+@app.exception_handler(AuthError)
 async def handle_svn_web_error(_request, exc):
     return _error_response(exc.status_code, exc.code, exc.message)
 
@@ -242,26 +277,138 @@ async def health():
     }
 
 
+def current_user(request):
+    """返回当前会话对应的账号；未登录抛 401。
+
+    全站功能都要求登录：既是使用者的明确要求，也让后续执行 SVN 时
+    能确定该用谁的凭据。
+    """
+    username = request.app.state.auth.resolve_session(
+        request.cookies.get(SESSION_COOKIE, ""))
+    if not username:
+        raise AuthError("login_required", "请先登录", 401)
+    return username
+
+
+def _set_session_cookie(response, token, secure):
+    response.set_cookie(
+        SESSION_COOKIE, token,
+        max_age=SESSION_TTL_SECONDS,
+        httponly=True,
+        samesite="strict",
+        secure=secure,
+        path="/",
+    )
+
+
+@app.post("/api/v1/auth/register")
+async def register(request: Request):
+    payload = await _read_json(request, RegisterRequest)
+    return await run_in_threadpool(
+        request.app.state.auth.register,
+        username=payload.username,
+        password=payload.password,
+        display_name=payload.display_name,
+    )
+
+
+@app.post("/api/v1/auth/login")
+async def login(request: Request):
+    payload = await _read_json(request, LoginRequest)
+    auth = request.app.state.auth
+    username = await run_in_threadpool(
+        auth.authenticate, username=payload.username, password=payload.password)
+    token = auth.create_session(username)
+    profile = await run_in_threadpool(auth.public_profile, username)
+    response = JSONResponse({"ok": True, "user": profile})
+    _set_session_cookie(response, token, request.url.scheme == "https")
+    return response
+
+
+@app.post("/api/v1/auth/logout")
+async def logout(request: Request):
+    request.app.state.auth.destroy_session(request.cookies.get(SESSION_COOKIE, ""))
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return response
+
+
+@app.get("/api/v1/auth/me")
+async def whoami(request: Request):
+    """未登录不算错误，返回 authenticated=false 供前端决定显示登录页。"""
+    username = request.app.state.auth.resolve_session(
+        request.cookies.get(SESSION_COOKIE, ""))
+    if not username:
+        return {"ok": True, "authenticated": False, "user": None}
+    profile = await run_in_threadpool(request.app.state.auth.public_profile, username)
+    return {"ok": True, "authenticated": True, "user": profile}
+
+
+@app.post("/api/v1/auth/password")
+async def change_password(request: Request):
+    username = current_user(request)
+    payload = await _read_json(request, ChangePasswordRequest)
+    await run_in_threadpool(
+        request.app.state.auth.change_password, username,
+        current_password=payload.current_password,
+        new_password=payload.new_password,
+    )
+    # 改密会吊销全部会话，当前浏览器也需要重新登录。
+    response = JSONResponse({"ok": True, "reauth_required": True})
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return response
+
+
+@app.put("/api/v1/auth/svn-credentials")
+async def save_svn_credentials(request: Request):
+    username = current_user(request)
+    payload = await _read_json(request, SvnCredentialRequest)
+    await run_in_threadpool(
+        request.app.state.auth.set_svn_credentials, username,
+        svn_username=payload.svn_username,
+        svn_password=payload.svn_password,
+    )
+    profile = await run_in_threadpool(request.app.state.auth.public_profile, username)
+    return {"ok": True, "user": profile}
+
+
+@app.delete("/api/v1/auth/svn-credentials")
+async def delete_svn_credentials(request: Request):
+    username = current_user(request)
+    await run_in_threadpool(request.app.state.auth.clear_svn_credentials, username)
+    profile = await run_in_threadpool(request.app.state.auth.public_profile, username)
+    return {"ok": True, "user": profile}
+
+
 @app.post("/api/v1/upgrade-list/extract")
 async def extract(request: Request):
+    current_user(request)
     payload = await _read_json(request, ExtractRequest)
     return await run_in_threadpool(extract_upgrade_list, payload.html)
 
 
 @app.post("/api/v1/upgrade-list/generate")
 async def generate(request: Request):
+    current_user(request)
     payload = await _read_json(request, GenerateRequest)
     return await run_in_threadpool(generate_upgrade_markdown, payload.list_text, payload.format)
 
 
 @app.post("/api/v1/revision-paths/query")
 async def query_revision_paths_endpoint(request: Request):
+    username = current_user(request)
     payload = await _read_json(request, RevisionPathQueryRequest)
+    # 只读查询允许显式改用本机 SVN 缓存认证；否则一律使用登录人保存的凭据。
+    if payload.use_host_cache:
+        svn_user, svn_pass = "", ""
+    else:
+        svn_user, svn_pass = await run_in_threadpool(
+            request.app.state.auth.get_svn_credentials, username)
     return await run_in_threadpool(
         request.app.state.path_queries.query,
         svn_url=payload.svn_url,
-        username=payload.svn_username,
-        password=payload.svn_password,
+        username=svn_user,
+        password=svn_pass,
         revision_spec=payload.revision_spec,
         sort=payload.sort,
     )
@@ -269,6 +416,7 @@ async def query_revision_paths_endpoint(request: Request):
 
 @app.post("/api/v1/revision-paths/sort")
 async def sort_revision_paths_endpoint(request: Request):
+    current_user(request)
     payload = await _read_json(request, RevisionPathSortRequest)
     return await run_in_threadpool(sort_revision_path_text, payload.text, payload.sort)
 
@@ -282,20 +430,25 @@ def _job_token(request):
 
 @app.get("/api/v1/standard-files/source-profiles")
 async def standard_source_profiles(request: Request):
+    current_user(request)
     return request.app.state.standard_jobs.public_profiles()
 
 
 @app.post("/api/v1/standard-files/tasks", status_code=202)
 async def create_standard_task(request: Request):
+    username = current_user(request)
     payload = await _read_json(request, StandardJobRequest)
     if not payload.customer_standard_path.strip():
         raise StandardWebError(
             "invalid_customer_path", "请填写客户标准文件 ecology 目录")
+    # 提交动作一律用当前登录人保存的 SVN 账号，确保 commit 归属正确。
+    svn_user, svn_pass = await run_in_threadpool(
+        request.app.state.auth.get_svn_credentials, username)
     return await run_in_threadpool(
         request.app.state.standard_jobs.create_job,
         svn_url=payload.svn_url,
-        username=payload.svn_username,
-        password=payload.svn_password,
+        username=svn_user,
+        password=svn_pass,
         profile_id=payload.source_profile_id,
         customer_standard_path=payload.customer_standard_path,
         file_list=payload.file_list,
@@ -306,12 +459,14 @@ async def create_standard_task(request: Request):
 
 @app.get("/api/v1/standard-files/tasks/{job_id}")
 async def get_standard_task(request: Request, job_id: str):
+    current_user(request)
     return await run_in_threadpool(
         request.app.state.standard_jobs.snapshot, job_id, _job_token(request))
 
 
 @app.post("/api/v1/standard-files/tasks/{job_id}/commit", status_code=202)
 async def commit_standard_task(request: Request, job_id: str):
+    current_user(request)
     token = _job_token(request)
     payload = await _read_json(request, StandardCommitRequest)
     return await run_in_threadpool(
@@ -325,5 +480,6 @@ async def commit_standard_task(request: Request, job_id: str):
 
 @app.delete("/api/v1/standard-files/tasks/{job_id}")
 async def cancel_standard_task(request: Request, job_id: str):
+    current_user(request)
     return await run_in_threadpool(
         request.app.state.standard_jobs.cancel, job_id, _job_token(request))
