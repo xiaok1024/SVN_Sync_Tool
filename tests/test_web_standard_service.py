@@ -59,6 +59,17 @@ class StandardWebParsingTest(unittest.TestCase):
             self.assertFalse(by_id["historical"].allows_cover_all)
             self.assertIn("192.168.7.108", by_id["historical"].unc_prefix)
 
+    def test_profile_loading_survives_a_shallow_install_path(self):
+        """部署到 /opt/<服务名> 这类浅路径时不能因父级不足而崩在导入阶段。"""
+        import web_standard_service as module
+        with tempfile.TemporaryDirectory() as shallow:
+            fake = Path(shallow, "svn-sync-tool")
+            fake.mkdir()
+            with mock.patch.object(module, "__file__", str(fake / "web_standard_service.py")):
+                # 不显式配置任何凭据来源，强制走目录推导的兜底分支
+                self.assertEqual(
+                    module._discover_smb_credentials_file({}, allow_workspace_default=True), "")
+
     def test_repository_relative_path_maps_checkout_root_and_keeps_spaces(self):
         root = "https://svn.example.com/svn/Y示例客户/ecology"
         relative, local = parse_file_input(

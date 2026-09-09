@@ -16,7 +16,6 @@ import shutil
 import tempfile
 import threading
 import time
-import tomllib
 import urllib.parse
 import unicodedata
 import uuid
@@ -25,6 +24,11 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
+
+try:  # tomllib 是 Python 3.11+ 的标准库；3.10（如 Ubuntu 22.04）回退到 tomli
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - 取决于运行时 Python 版本
+    import tomli as tomllib
 
 from svn_standard_file_core import StandardFileService
 from svn_sync_core import SyncEngine, redact_sensitive_text
@@ -144,11 +148,15 @@ def _discover_smb_credentials_file(env, allow_workspace_default=False):
     config_value = str(env.get("E9_PATHS_FILE", "") or "").strip()
     config_path = Path(config_value).expanduser() if config_value else None
     if config_path is None and allow_workspace_default:
+        # 这个兜底只在开发机的固定目录布局下成立（.../ecology/tooling/e9/本项目）。
+        # 部署到 /opt/svn-sync-tool 之类的浅路径时父级不够深，此处必须容错，
+        # 否则模块导入阶段就会 IndexError，整个服务起不来。
         project_root = Path(__file__).resolve().parent
-        config_path = (
-            project_root.parents[2] / "workspaces" / "e9" / "ecology-9-dev"
-            / ".ai-data" / "local" / "e9-paths.json"
-        )
+        if len(project_root.parents) >= 3:
+            config_path = (
+                project_root.parents[2] / "workspaces" / "e9" / "ecology-9-dev"
+                / ".ai-data" / "local" / "e9-paths.json"
+            )
     if not config_path or not config_path.is_file():
         return ""
     try:

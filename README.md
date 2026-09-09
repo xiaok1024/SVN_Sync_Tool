@@ -171,6 +171,39 @@ export SVN_SYNC_WEB_SOURCE_PROFILES='[
 
 随后访问：`http://127.0.0.1:8765/`
 
+### 部署到 Linux 常驻运行（推荐）
+
+Web 服务日常跑在 Linux 主机上：常年开机、静态 IP、不依赖某台 Mac 是否开着。
+
+```bash
+# 服务器一次性准备（Ubuntu 22.04）
+apt-get install -y subversion cifs-utils python3.10-venv
+mkdir -p /opt/svn-sync-tool
+cd /opt/svn-sync-tool && python3 -m venv .venv-web
+.venv-web/bin/python -m pip install -r requirements-web.txt
+
+# 之后每次从开发机同步（只推源码，约 200 KB）
+./deploy-linux.sh            # 同步并重启服务
+./deploy-linux.sh --test     # 同步后在服务器上跑测试，不重启
+./deploy-linux.sh --deps     # requirements-web.txt 变了时，顺带重装依赖
+```
+
+systemd 单元 `/etc/systemd/system/svn-sync-web.service` 以 root 运行，`Restart=always`
+并已 `enable` 开机自启；日志走 journald（`journalctl -u svn-sync-web -f`）。
+
+几点 Linux 特有的注意：
+
+- **Python 3.10 需要 `tomli`**：`tomllib` 是 3.11+ 的标准库，`requirements-web.txt` 里带了
+  条件依赖 `tomli ; python_version < "3.11"`，代码按需回退，无需手工处理。
+- **可信 Host 显式写静态 IP**：`--lan` 会从主机名反查 IP，但那依赖 `/etc/hosts`
+  的写法（Ubuntu 默认可能把主机名指向 `127.0.1.1`，那样局域网访问会被判为
+  非法 Host）。systemd 单元里用 `SVN_SYNC_WEB_ALLOWED_HOSTS` 直接钉死静态 IP，
+  `--lan` 的自动探测结果会与之合并。
+- **SMB 共享要预先挂好**：`svn_sync_core` 的自动挂载只实现了 macOS（`mount_smbfs`）
+  和 Windows（UNC 直连）。Linux 上需用 `mount.cifs` 事先挂载，再把
+  `SVN_SYNC_WEB_STANDARD_PATH` / `SVN_SYNC_WEB_HISTORICAL_PATH` 指向挂载点——
+  服务命中本地路径分支后完全不会走那段平台代码。
+
 需要让可信局域网内的用户访问时，使用显式局域网模式：
 
 ```bash
