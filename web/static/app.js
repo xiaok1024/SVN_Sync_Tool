@@ -1178,7 +1178,6 @@ const pathElements = {
   form: document.querySelector("#pathQueryForm"),
   errorSummary: document.querySelector("#pathErrorSummary"),
   svnUrl: document.querySelector("#pathSvnUrl"),
-  useHostCache: document.querySelector("#pathUseHostCache"),
   revisionSpec: document.querySelector("#pathRevisionSpec"),
   revisionCount: document.querySelector("#pathRevisionCount"),
   sortMode: document.querySelector("#pathSortMode"),
@@ -1350,7 +1349,6 @@ async function runPathQuery(event) {
       svn_url: pathElements.svnUrl.value.trim(),
       revision_spec: pathElements.revisionSpec.value,
       sort: pathElements.sortMode.value,
-      use_host_cache: pathElements.useHostCache.checked,
     });
     if (revision !== pathState.revision) return;
     applyPathResult(data, (result) => (

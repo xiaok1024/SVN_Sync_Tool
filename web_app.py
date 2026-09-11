@@ -125,7 +125,6 @@ class RevisionPathQueryRequest(BaseModel):
     svn_url: str
     revision_spec: str
     sort: str = "rev"
-    use_host_cache: bool = False
 
 
 class RevisionPathSortRequest(BaseModel):
@@ -441,12 +440,9 @@ async def generate(request: Request):
 async def query_revision_paths_endpoint(request: Request):
     username = current_user(request)
     payload = await _read_json(request, RevisionPathQueryRequest)
-    # 只读查询允许显式改用本机 SVN 缓存认证；否则一律使用登录人保存的凭据。
-    if payload.use_host_cache:
-        svn_user, svn_pass = "", ""
-    else:
-        svn_user, svn_pass = await run_in_threadpool(
-            request.app.state.auth.get_svn_credentials, username)
+    # 一律使用登录人保存的 SVN 凭据，查询结果与提交归属保持同一账号。
+    svn_user, svn_pass = await run_in_threadpool(
+        request.app.state.auth.get_svn_credentials, username)
     return await run_in_threadpool(
         request.app.state.path_queries.query,
         svn_url=payload.svn_url,
