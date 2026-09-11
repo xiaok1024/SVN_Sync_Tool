@@ -3,6 +3,8 @@
 #
 # 只推送源码（约 200 KB），不含 .git、venv、outputs 下的 exe/app.zip——
 # 服务器用不到那些，而且仓库历史里的二进制会让 git clone 极慢且易断。
+# 用 rsync --delete：本地删掉的模块在服务器上也会删掉，不留僵尸 .py；
+# 排除项在接收端同样受保护（.venv-web 等不会被 --delete 清掉）。
 #
 # 用法：
 #   ./deploy-linux.sh              # 同步 + 重启
@@ -27,20 +29,15 @@ for arg in "$@"; do
 done
 
 cd "$(dirname "$0")"
-bundle="$(mktemp -t svn-sync-deploy.XXXXXX).tar.gz"
-trap 'rm -f "$bundle"' EXIT
 
-# COPYFILE_DISABLE=1 避免 macOS 的 ._ 副产品混进包里
-COPYFILE_DISABLE=1 tar czf "$bundle" \
-    --exclude='./.git' --exclude='./.venv*' --exclude='./dist' --exclude='./build' \
-    --exclude='./outputs' --exclude='./.idea' --exclude='__pycache__' \
-    --exclude='.DS_Store' --exclude='./README.assets' --exclude='./qt_assets' \
-    .
-echo "源码包 $(du -h "$bundle" | cut -f1) → ${SSH_HOST}:${REMOTE_DIR}"
-
-scp -q "${SSH_OPTS[@]}" "$bundle" "${SSH_HOST}:/tmp/svn-sync-deploy.tar.gz"
-ssh "${SSH_OPTS[@]}" "$SSH_HOST" \
-    "mkdir -p '$REMOTE_DIR' && tar xzf /tmp/svn-sync-deploy.tar.gz -C '$REMOTE_DIR' && rm -f /tmp/svn-sync-deploy.tar.gz"
+EXCLUDES=(
+    --exclude='/.git' --exclude='/.venv*' --exclude='/dist' --exclude='/build'
+    --exclude='/outputs' --exclude='/.idea' --exclude='__pycache__' --exclude='*.pyc'
+    --exclude='.DS_Store' --exclude='._*' --exclude='/README.assets' --exclude='/qt_assets'
+)
+echo "同步源码 → ${SSH_HOST}:${REMOTE_DIR}"
+ssh "${SSH_OPTS[@]}" "$SSH_HOST" "mkdir -p '$REMOTE_DIR'"
+rsync -a --delete "${EXCLUDES[@]}" -e "ssh ${SSH_OPTS[*]}" ./ "${SSH_HOST}:${REMOTE_DIR}/"
 
 if [ "$reinstall_deps" -eq 1 ]; then
     echo "重装依赖…"
@@ -50,8 +47,9 @@ fi
 
 if [ "$run_tests" -eq 1 ]; then
     echo "在服务器上运行测试…"
+    # pipefail：unittest 失败时不能被 tail 的退出码掩盖成"成功"
     ssh "${SSH_OPTS[@]}" "$SSH_HOST" \
-        "cd '$REMOTE_DIR' && SVN_SYNC_WEB_USER_STORE=/tmp/lzr-deploy-test-users.json .venv-web/bin/python -m unittest discover -s tests 2>&1 | tail -5"
+        "set -o pipefail; cd '$REMOTE_DIR' && .venv-web/bin/python -m unittest discover -s tests 2>&1 | tail -5"
     exit 0
 fi
 

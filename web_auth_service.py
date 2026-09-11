@@ -9,7 +9,10 @@
 - **登录密码仍然做哈希**（``hashlib.scrypt``，标准库）。它不需要还原成明文，
   没有理由存明文，也就不必引入额外的加密依赖。
 
-会话保存在内存中：服务重启即全部失效，需要重新登录。
+会话是 HMAC 签名令牌，密钥保存在账号库同目录的 ``session-secret``（首次启动自动生成），
+服务端不保存会话表，重启不掉线。吊销靠账号记录里的 ``session_epoch``：改密、后台重置或
+删除账号时递增，已签发的令牌立即失效；因为写在同一个 JSON 里，命令行工具的操作对运行中的
+服务同样生效，不需要重启。
 """
 
 from __future__ import annotations
@@ -34,7 +37,10 @@ MAX_PASSWORD_LENGTH = 256
 MAX_DISPLAY_NAME = 32
 MAX_USERS = 200
 SESSION_TTL_SECONDS = 12 * 60 * 60
+# 滑动续期：令牌用掉一半寿命后，下一次请求签发新令牌并重新下发 cookie
+SESSION_RENEW_AFTER_SECONDS = SESSION_TTL_SECONDS // 2
 SESSION_COOKIE = "lzr_session"
+SESSION_SECRET_ENV = "SVN_SYNC_WEB_SESSION_SECRET_FILE"
 # scrypt 参数：n=2**15 时单次校验约几十毫秒，足以拖慢离线爆破且不影响交互。
 _SCRYPT_N = 2 ** 15
 _SCRYPT_R = 8
@@ -50,6 +56,10 @@ class AuthError(WebSvnError):
 
 def _now():
     return int(time.time())
+
+
+def _token_hash(token):
+    return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
 
 
 def hash_password(password):
@@ -117,19 +127,43 @@ class AuthService:
     原子落盘，避免并发写坏文件。
     """
 
-    def __init__(self, store_path=None):
+    def __init__(self, store_path=None, secret_path=None):
         self.store_path = Path(store_path or default_store_path()).expanduser()
+        self.secret_path = Path(
+            secret_path or self.store_path.with_name("session-secret")).expanduser()
         self._lock = threading.RLock()
-        self._sessions = {}
+        # 主动退出的令牌在到期前记入拒绝名单；重启后清空——那时浏览器早已删掉该 cookie
+        self._revoked = {}
         self.store_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if not self.store_path.exists():
             self._write({"version": 1, "users": {}})
         self._harden_permissions()
+        self._secret = self._load_or_create_secret()
 
     @classmethod
     def from_environment(cls, environ=None):
         env = environ if environ is not None else os.environ
-        return cls(store_path=env.get("SVN_SYNC_WEB_USER_STORE") or None)
+        return cls(store_path=env.get("SVN_SYNC_WEB_USER_STORE") or None,
+                   secret_path=env.get(SESSION_SECRET_ENV) or None)
+
+    def _load_or_create_secret(self):
+        """签名密钥：首次随机生成并落盘，之后复用，会话才能跨重启保持。"""
+        try:
+            raw = self.secret_path.read_text(encoding="ascii").strip()
+            if len(raw) >= 64:
+                return bytes.fromhex(raw)
+        except (OSError, ValueError, UnicodeDecodeError):
+            pass
+        secret = secrets.token_bytes(32)
+        self.secret_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temp = self.secret_path.with_name(self.secret_path.name + ".tmp")
+        temp.write_text(secret.hex() + "\n", encoding="ascii")
+        try:
+            temp.chmod(0o600)
+        except OSError:
+            pass
+        os.replace(temp, self.secret_path)
+        return secret
 
     # ── 存储 ────────────────────────────────────────────────
 
@@ -181,6 +215,7 @@ class AuthService:
                 "display_name": clean_display,
                 "password_hash": hash_password(clean_password),
                 "created_at": _now(),
+                "session_epoch": 0,
                 "svn_username": "",
                 "svn_password": "",
             }
@@ -270,45 +305,115 @@ class AuthService:
         }
 
     # ── 会话 ────────────────────────────────────────────────
+    #
+    # 令牌 = base64url(载荷 JSON) + "." + base64url(HMAC-SHA256)。载荷含账号、签发/到期时间
+    # 和签发时账号的 session_epoch。服务端不存会话表，重启不掉线；吊销靠 epoch 递增。
 
-    def create_session(self, username):
-        token = secrets.token_urlsafe(32)
+    @staticmethod
+    def _b64encode(raw):
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+    @staticmethod
+    def _b64decode(text):
+        return base64.urlsafe_b64decode((text + "=" * (-len(text) % 4)).encode("ascii"))
+
+    def _sign(self, body):
+        return self._b64encode(
+            hmac.new(self._secret, body.encode("ascii"), hashlib.sha256).digest())
+
+    def _issue(self, username, epoch, ttl_seconds):
+        now = _now()
+        payload = {"u": username, "e": int(epoch), "iat": now, "exp": now + int(ttl_seconds)}
+        body = self._b64encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+        return body + "." + self._sign(body)
+
+    def _decode(self, token):
+        """验签并解析令牌；任何异常都返回 ``None``，不泄露失败原因。"""
+        text = str(token or "")
+        if not text or "." not in text or len(text) > 1024:
+            return None
+        body, signature = text.rsplit(".", 1)
+        if not hmac.compare_digest(self._sign(body), signature):
+            return None
+        try:
+            payload = json.loads(self._b64decode(body).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return None
+        if (not isinstance(payload, dict) or not isinstance(payload.get("u"), str)
+                or not all(isinstance(payload.get(key), int) for key in ("e", "iat", "exp"))):
+            return None
+        return payload
+
+    def _epoch_of(self, username):
         with self._lock:
-            self._sessions[token] = {
-                "username": username, "expires_at": _now() + SESSION_TTL_SECONDS}
-        return token
+            record = self._read()["users"].get(username)
+        if record is None:
+            return None
+        return int(record.get("session_epoch", 0) or 0)
+
+    def create_session(self, username, ttl_seconds=SESSION_TTL_SECONDS):
+        epoch = self._epoch_of(username)
+        if epoch is None:
+            raise AuthError("user_not_found", "账号不存在", 404)
+        return self._issue(username, epoch, ttl_seconds)
 
     def resolve_session(self, token):
-        """返回会话对应的账号；无效或过期返回 ``None``。"""
-        if not token:
+        """返回会话对应的账号；无效、过期、已退出、已吊销或账号已删除都返回 ``None``。"""
+        payload = self._decode(token)
+        if payload is None or payload["exp"] <= _now():
             return None
         with self._lock:
-            session = self._sessions.get(token)
-            if session is None:
+            self._prune_revoked()
+            if _token_hash(token) in self._revoked:
                 return None
-            if session["expires_at"] <= _now():
-                self._sessions.pop(token, None)
-                return None
-            # 滑动续期：持续使用不会在操作中途掉线。
-            session["expires_at"] = _now() + SESSION_TTL_SECONDS
-            return session["username"]
+        if self._epoch_of(payload["u"]) != payload["e"]:
+            return None
+        return payload["u"]
+
+    def renew_session(self, token):
+        """滑动续期：令牌已用掉一半寿命时签发新令牌，否则返回 ``None``。
+
+        调用方拿到新令牌后重新下发 cookie。持续使用不会在操作中途掉线，
+        不再使用则在 ``SESSION_TTL_SECONDS`` 后自然过期。
+        """
+        payload = self._decode(token)
+        if payload is None or _now() - payload["iat"] < SESSION_RENEW_AFTER_SECONDS:
+            return None
+        username = self.resolve_session(token)
+        if not username:
+            return None
+        return self._issue(username, payload["e"], SESSION_TTL_SECONDS)
 
     def destroy_session(self, token):
+        payload = self._decode(token)
+        if payload is None:
+            return
         with self._lock:
-            self._sessions.pop(token, None)
+            self._prune_revoked()
+            self._revoked[_token_hash(token)] = payload["exp"]
 
     def revoke_all_sessions(self, username):
+        """递增账号的 session_epoch，使该账号已签发的全部令牌失效。
+
+        写在账号库里，因此命令行工具重置密码后，运行中的服务在下一次请求就会
+        拒绝旧会话，不需要重启。
+        """
         with self._lock:
-            for token in [t for t, s in self._sessions.items()
-                          if s["username"] == username]:
-                self._sessions.pop(token, None)
+            data = self._read()
+            record = data["users"].get(username)
+            if record is None:
+                return
+            record["session_epoch"] = int(record.get("session_epoch", 0) or 0) + 1
+            self._write(data)
+
+    def _prune_revoked(self):
+        now = _now()
+        for key in [key for key, expires in self._revoked.items() if expires <= now]:
+            self._revoked.pop(key, None)
 
     def purge_expired_sessions(self):
-        now = _now()
         with self._lock:
-            for token in [t for t, s in self._sessions.items()
-                          if s["expires_at"] <= now]:
-                self._sessions.pop(token, None)
+            self._prune_revoked()
 
     def user_count(self):
         with self._lock:
@@ -326,6 +431,8 @@ __all__ = [
     "AuthError",
     "AuthService",
     "SESSION_COOKIE",
+    "SESSION_RENEW_AFTER_SECONDS",
+    "SESSION_SECRET_ENV",
     "SESSION_TTL_SECONDS",
     "default_store_path",
     "hash_password",

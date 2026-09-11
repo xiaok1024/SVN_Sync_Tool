@@ -5,12 +5,16 @@ import json
 import os
 import stat
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import web_auth_service
 from web_auth_service import (
     MIN_PASSWORD_LENGTH,
     SESSION_COOKIE,
+    SESSION_TTL_SECONDS,
     AuthError,
     AuthService,
     hash_password,
@@ -131,12 +135,53 @@ class AuthServiceTest(unittest.TestCase):
         self.auth.destroy_session(token)
         self.assertIsNone(self.auth.resolve_session(token))
 
-    def test_expired_session_is_rejected_and_purged(self):
+    def test_expired_session_is_rejected(self):
+        self._register()
+        token = self.auth.create_session("demo", ttl_seconds=-1)
+        self.assertIsNone(self.auth.resolve_session(token))
+
+    def test_session_survives_restart_and_cross_process_revocation(self):
+        """令牌靠账号库同目录的密钥验签：重启（新实例）不掉线；
+        另一个进程（命令行工具）吊销后，运行中的实例下一次请求即拒绝。"""
         self._register()
         token = self.auth.create_session("demo")
-        self.auth._sessions[token]["expires_at"] = 0
+        restarted = AuthService(store_path=self.store)
+        self.assertEqual(restarted.resolve_session(token), "demo")
+        restarted.revoke_all_sessions("demo")
         self.assertIsNone(self.auth.resolve_session(token))
-        self.assertNotIn(token, self.auth._sessions)
+        self.assertEqual(self.auth.resolve_session(self.auth.create_session("demo")), "demo")
+
+    def test_tampered_or_foreign_token_is_rejected(self):
+        self._register()
+        token = self.auth.create_session("demo")
+        body, signature = token.rsplit(".", 1)
+        self.assertIsNone(self.auth.resolve_session(body + "." + signature[:-2] + "AA"))
+        forged_body = self.auth._b64encode(b'{"u":"demo","e":0,"iat":1,"exp":9999999999}')
+        self.assertIsNone(self.auth.resolve_session(forged_body + "." + signature))
+        other = AuthService(store_path=Path(self.temp.name, "other", "web_users.json"))
+        other.register(username="demo", password="correct-horse")
+        self.assertIsNone(other.resolve_session(token), "不同密钥签发的令牌互不承认")
+        self.assertEqual(stat.S_IMODE(os.stat(self.auth.secret_path).st_mode), 0o600)
+
+    def test_session_is_renewed_only_after_half_of_its_lifetime(self):
+        self._register()
+        token = self.auth.create_session("demo")
+        self.assertIsNone(self.auth.renew_session(token), "刚签发的令牌不续期")
+        later = int(time.time()) + SESSION_TTL_SECONDS * 2 // 3
+        with mock.patch.object(web_auth_service, "_now", return_value=later):
+            renewed = self.auth.renew_session(token)
+        self.assertIsNotNone(renewed)
+        self.assertNotEqual(renewed, token)
+        self.assertEqual(self.auth.resolve_session(renewed), "demo")
+
+    def test_deleted_account_invalidates_its_sessions(self):
+        self._register()
+        token = self.auth.create_session("demo")
+        with self.auth._lock:
+            data = self.auth._read()
+            data["users"].pop("demo")
+            self.auth._write(data)
+        self.assertIsNone(self.auth.resolve_session(token))
 
     def test_change_password_revokes_every_session(self):
         self._register()

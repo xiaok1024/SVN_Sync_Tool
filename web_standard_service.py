@@ -168,7 +168,7 @@ class SourceProfile:
         if self.standard_path and os.path.isdir(self.standard_path):
             return True
         if self.mount_root and any(
-                os.path.isdir(self.local_root_for(prefix)) for prefix in self.unc_prefixes):
+                _mount_ready(self.local_root_for(prefix)) for prefix in self.unc_prefixes):
             return True
         return bool(self.unc_prefix and self.smb_credentials_file
                     and os.path.isfile(self.smb_credentials_file))
@@ -200,6 +200,24 @@ def _configured_path(value):
     if not os.path.isabs(text):
         raise ValueError("Web 标准文件来源必须配置为绝对路径")
     return os.path.realpath(text)
+
+
+def _mount_ready(path):
+    """挂载槽位是否真的可用。
+
+    CIFS 掉线后挂载点目录仍然存在，只是空的；单看 isdir 会把「共享断开」误报成
+    「客户目录不存在」。是挂载点、或目录非空才算就绪（测试用的临时目录不是挂载点，
+    靠后一条判断）。
+    """
+    if not path or not os.path.isdir(path):
+        return False
+    if os.path.ismount(path):
+        return True
+    try:
+        with os.scandir(path) as entries:
+            return any(True for _ in entries)
+    except OSError:
+        return False
 
 
 def _discover_smb_credentials_file(env, allow_workspace_default=False):
@@ -824,6 +842,11 @@ class StandardJobManager:
         # 多共享时按命中的共享根取各自挂载点；单共享沿用 standard_path。
         prefix = unc_prefix or profile.unc_prefix
         local_root = profile.local_root_for(prefix)
+        if profile.mount_root:
+            # Linux 部署：共享由 systemd 预先挂好，服务不自行挂载；掉线要明确报出来
+            if _mount_ready(local_root):
+                return Path(local_root).resolve(strict=True)
+            raise RuntimeError("服务端共享 %s 当前未挂载或已断开" % prefix)
         if local_root and os.path.isdir(local_root):
             return Path(local_root).resolve(strict=True)
         with self._source_mount_lock:
@@ -922,6 +945,12 @@ class StandardJobManager:
         else:
             matched_prefix = profile.unc_prefix
             source_relative = "."
+        if profile.mount_root and not _mount_ready(profile.local_root_for(matched_prefix)):
+            # 建任务时就拒绝，而不是等后台检出后再以「目录不存在」失败
+            raise StandardWebError(
+                "source_share_unmounted",
+                "服务端共享 %s 当前未挂载或已断开，请稍后再试；持续出现请联系维护者"
+                % matched_prefix, 503)
         relative_paths = parse_web_file_list(file_list)
         selection_mode = "listed" if relative_paths else "intersection"
         if selection_mode == "intersection" and not profile.allows_cover_all:

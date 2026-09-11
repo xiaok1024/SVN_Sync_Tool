@@ -5,8 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+# 保持 active 是为了让 ExecStop 在关机时卸载；定期补挂由 svn-sync-mounts-heal.service 负责
 RemainAfterExit=yes
-# 脚本对已挂载的共享会跳过，重复执行安全
 ExecStart=/usr/local/sbin/svn-sync-mount-shares.sh
 ExecStop=/usr/local/sbin/svn-sync-mount-shares.sh --umount
 # 部分共享挂不上时不阻断 Web 服务：版本路径与升级清单两个功能不依赖共享

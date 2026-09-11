@@ -9,6 +9,9 @@
 重置登录密码**不影响**该账号已保存的 SVN 凭据：两者是独立字段，
 SVN 密码按明文单独保存（svn 命令需要真实密码）。
 
+重置或删除会递增账号库里的 ``session_epoch``；运行中的 Web 服务每次请求都会核对它，
+所以该账号在所有浏览器上的登录会立即失效，不需要重启服务。
+
 用法：
     python3 manage_web_users.py list
     python3 manage_web_users.py reset-password <账号>
@@ -72,7 +75,8 @@ def command_reset_password(args):
         data["users"][args.username]["password_hash"] = hash_password(first)
         auth._write(data)
     auth.revoke_all_sessions(args.username)
-    print("已重置 %s 的登录密码；该账号的既有会话已全部失效。" % args.username)
+    print("已重置 %s 的登录密码；该账号在所有浏览器上的登录已失效（运行中的服务即时生效）。"
+          % args.username)
     print("已保存的 SVN 凭据不受影响。")
     return 0
 

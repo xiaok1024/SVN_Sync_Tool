@@ -1464,6 +1464,14 @@ updateStandardCounters();
 restoreStandardTaskSession();
 updatePathRevisionCount();
 
+// 右上角连接状态：HTTPS 才算加密；本机 http 调试时如实标为未加密
+(() => {
+  const secure = window.location.protocol === "https:";
+  const text = document.querySelector("#serviceStateText");
+  if (text) text.textContent = secure ? "HTTPS 加密连接" : "未加密连接";
+  document.querySelector("#serviceState")?.setAttribute("data-secure", String(secure));
+})();
+
 /* ── 账号与会话 ───────────────────────────────────────────────
    登录门只是界面引导：服务端对每个接口都独立校验会话，绕过这层
    拿不到任何数据。 */

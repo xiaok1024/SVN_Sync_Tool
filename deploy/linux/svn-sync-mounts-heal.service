@@ -1,0 +1,12 @@
+[Unit]
+Description=补挂掉线的 E9 共享（由 svn-sync-mounts.timer 定期触发）
+# 与 svn-sync-mounts.service 分开的原因：那个单元是 oneshot + RemainAfterExit，
+# 挂好后一直处于 active，timer 对 active 的单元做 start 是空操作，脚本根本不会跑。
+# 本单元不保持 active，每次触发都真正执行一遍；脚本对已挂载的共享会跳过。
+After=network-online.target svn-sync-mounts.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/svn-sync-mount-shares.sh
+SuccessExitStatus=0 1
+TimeoutStartSec=180

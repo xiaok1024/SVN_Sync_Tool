@@ -5,6 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="本地升级工具中心：版本号路径生成、SVN 标准文件提交、升级清单提取。">
   <title>升级工具中心</title>
+  <link rel="icon" href="{{ url_for('static', path='/favicon.svg') }}" type="image/svg+xml">
+  <link rel="icon" href="{{ url_for('static', path='/favicon-32.png') }}" type="image/png" sizes="32x32">
+  <link rel="apple-touch-icon" href="{{ url_for('static', path='/apple-touch-icon.png') }}">
   <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}">
   <script src="{{ url_for('static', path='/app.js') }}" defer></script>
 </head>
@@ -21,9 +24,9 @@
         </span>
       </a>
       <div class="header-right">
-        <div class="service-state" aria-label="当前为本机预览">
+        <div class="service-state" id="serviceState" aria-label="连接状态">
           <span class="state-dot" aria-hidden="true"></span>
-          本机预览
+          <span id="serviceStateText">局域网服务</span>
         </div>
         <div class="account-area" id="accountArea" hidden>
           <button class="text-button" id="svnAccountButton" type="button">我的 SVN 账号</button>
@@ -456,7 +459,7 @@
 
     <footer class="site-footer">
       <span>核心规则与桌面版、终端版保持一致 · SVN 写入始终二次确认</span>
-      <span>Web preview · v{{ app_version }}</span>
+      <span>Web · v{{ app_version }}</span>
     </footer>
   </main>
 

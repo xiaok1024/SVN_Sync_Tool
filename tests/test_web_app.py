@@ -1,17 +1,29 @@
 # -*- coding: utf-8 -*-
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
+# 必须在导入 web_app 之前设置：账号库落到临时目录（绝不能碰真实账号库），
+# 可信 Host 加入 TestClient 的默认主机名。
+_TEST_HOME = tempfile.mkdtemp(prefix="lzr-web-test-")
+os.environ["SVN_SYNC_WEB_USER_STORE"] = os.path.join(_TEST_HOME, "web_users.json")
+# lzr-dev-host.local 模拟 --lan 探测到的真实主机名，用来验证大小写与端口处理
+os.environ["SVN_SYNC_WEB_ALLOWED_HOSTS"] = ",".join(
+    value for value in (
+        os.environ.get("SVN_SYNC_WEB_ALLOWED_HOSTS", ""), "testserver", "lzr-dev-host.local")
+    if value)
 
 try:
     from fastapi.testclient import TestClient
+    import web_app
     from web_app import MAX_REQUEST_BYTES, app
     WEB_AVAILABLE = True
 except ModuleNotFoundError:
     TestClient = None
+    web_app = None
     MAX_REQUEST_BYTES = 2 * 1024 * 1024
     app = None
     WEB_AVAILABLE = False
@@ -51,6 +63,67 @@ class WebAppApiTest(unittest.TestCase):
         self.assertIn("default-src 'self'", response.headers["content-security-policy"])
         self.assertEqual(response.headers["x-frame-options"], "DENY")
         self.assertEqual(response.headers["cache-control"], "no-store")
+
+    def test_allowed_hosts_only_come_from_loopback_and_environment(self):
+        """旧开发机名和测试桩不该写死在生产白名单里。"""
+        hosts = web_app._allowed_hosts()
+        self.assertIn("testserver", hosts, "由测试环境变量注入")
+        self.assertNotIn("lzr-mac-mini.local", hosts)
+        self.assertEqual(
+            {h for h in hosts if h not in {"127.0.0.1", "localhost"}},
+            {h.strip().lower() for h in os.environ["SVN_SYNC_WEB_ALLOWED_HOSTS"].split(",")})
+
+    def test_upgrade_list_requests_reject_unknown_fields(self):
+        for path, payload in (
+                ("/api/v1/upgrade-list/extract", {"html": SAMPLE_HTML, "extra": 1}),
+                ("/api/v1/upgrade-list/generate",
+                 {"list_text": "x", "format": "md", "extra": 1})):
+            response = self.client.post(path, json=payload)
+            self.assertEqual(response.status_code, 422, path)
+            self.assertEqual(response.json()["error"]["code"], "invalid_field", path)
+
+    def test_session_survives_auth_service_restart_and_is_renewed_when_old(self):
+        """会话是签名令牌：换一个 AuthService 实例（模拟服务重启）仍可识别；
+        令牌过半寿命后接口会重新下发 cookie。"""
+        from unittest import mock
+        import web_auth_service
+        from web_auth_service import SESSION_COOKIE, SESSION_TTL_SECONDS, AuthService
+
+        client = TestClient(app)
+        client.post("/api/v1/auth/register",
+                    json={"username": "restartuser", "password": "correct-horse"})
+        client.post("/api/v1/auth/login",
+                    json={"username": "restartuser", "password": "correct-horse"})
+        token = client.cookies.get(SESSION_COOKIE)
+        self.assertTrue(token)
+
+        original = app.state.auth
+        app.state.auth = AuthService(store_path=original.store_path)
+        try:
+            me = client.get("/api/v1/auth/me")
+            self.assertTrue(me.json()["authenticated"])
+            self.assertNotIn("set-cookie", {k.lower() for k in me.headers})
+
+            later = web_auth_service._now() + SESSION_TTL_SECONDS * 2 // 3
+            with mock.patch.object(web_auth_service, "_now", return_value=later):
+                renewed = client.get("/api/v1/auth/me")
+            self.assertTrue(renewed.json()["authenticated"])
+            raw_cookie = renewed.headers.get("set-cookie", "")
+            self.assertIn(SESSION_COOKIE + "=", raw_cookie)
+            self.assertNotIn(token, raw_cookie, "应签发新令牌而不是原样重发")
+        finally:
+            app.state.auth = original
+
+    def test_site_icons_are_declared_and_served(self):
+        page = self.client.get("/").text
+        self.assertIn('rel="icon"', page)
+        self.assertIn("apple-touch-icon", page)
+        for path, prefix in (("/favicon.ico", b"\x00\x00\x01\x00"),
+                             ("/static/favicon.svg", b"<svg"),
+                             ("/static/favicon-32.png", b"\x89PNG")):
+            response = self.anonymous_client().get(path)
+            self.assertEqual(response.status_code, 200, path)
+            self.assertTrue(response.content.startswith(prefix), path)
 
     def test_health_endpoint(self):
         response = self.client.get("/api/health")
@@ -153,8 +226,8 @@ class WebAppApiTest(unittest.TestCase):
 
     def test_host_header_matching_is_case_insensitive(self):
         """主机名大小写不敏感；真实主机名常带大写，不能因此被拒。"""
-        for host in ("lzr-mac-mini.local:8765", "LZR-MAC-MINI.local:8765",
-                     "LZR-Mac-Mini.LOCAL:8765", "LOCALHOST"):
+        for host in ("lzr-dev-host.local:8765", "LZR-DEV-HOST.local:8765",
+                     "LZR-Dev-Host.LOCAL:8765", "LOCALHOST"):
             response = self.client.get("/api/health", headers={"host": host})
             self.assertEqual(response.status_code, 200, host)
 
@@ -162,9 +235,10 @@ class WebAppApiTest(unittest.TestCase):
         response = self.client.get("/", headers={"host": "untrusted.example"})
         self.assertEqual(response.status_code, 400)
 
-    def test_local_mac_mini_hostname_is_allowed(self):
+    def test_environment_configured_hostname_is_allowed_with_port(self):
+        """--lan 探测到的主机名经环境变量注入；带端口的 Host 也要放行。"""
         response = self.client.get(
-            "/api/health", headers={"host": "lzr-mac-mini.local:8765"})
+            "/api/health", headers={"host": "lzr-dev-host.local:8765"})
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["ok"])
 

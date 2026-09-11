@@ -12,7 +12,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -59,22 +59,22 @@ class NormalizeHostHeader:
 
 
 def _allowed_hosts():
+    """可信 Host：本机回环 + 环境变量（``--lan`` 启动时由 svn_sync_web 注入探测结果）。"""
     configured = os.environ.get("SVN_SYNC_WEB_ALLOWED_HOSTS", "")
-    hosts = {
-        "127.0.0.1",
-        "localhost",
-        "lzr-mac-mini.local",
-        "testserver",
-    }
+    hosts = {"127.0.0.1", "localhost"}
     hosts.update(value.strip().lower() for value in configured.split(",") if value.strip())
     return sorted(hosts)
 
 
 class ExtractRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     html: str
 
 
 class GenerateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     list_text: str
     format: str
 
@@ -253,6 +253,13 @@ async def add_security_headers(request, call_next):
     elif request.url.path.startswith("/static/"):
         # 本地工具会频繁改前端；必须每次回源校验，避免页面跑旧 JS/CSS。
         response.headers["Cache-Control"] = "no-cache, must-revalidate"
+    # 会话滑动续期：接口已签发新令牌时重新下发 cookie；接口自己已经写过
+    # 该 cookie（登出、改密的删除动作）则不再覆盖。
+    renewed = getattr(request.state, "renewed_session", None)
+    if renewed and not any(
+            value.startswith(SESSION_COOKIE + "=")
+            for value in response.headers.getlist("set-cookie")):
+        _set_session_cookie(response, renewed, request.url.scheme == "https")
     return response
 
 
@@ -288,6 +295,12 @@ async def index(request: Request):
     )
 
 
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    """老客户端和 Safari 不看 <link rel=icon> 里的 SVG，会直接请求根目录的 ico。"""
+    return FileResponse(WEB_ROOT / "static" / "favicon.ico", media_type="image/x-icon")
+
+
 @app.get("/api/health")
 async def health():
     profiles = app.state.standard_jobs.public_profiles()
@@ -300,14 +313,25 @@ async def health():
     }
 
 
+def _session_user(request):
+    """解析会话 cookie；令牌已过半寿命时顺带续期，由 add_security_headers 下发。"""
+    auth = request.app.state.auth
+    token = request.cookies.get(SESSION_COOKIE, "")
+    username = auth.resolve_session(token)
+    if username:
+        renewed = auth.renew_session(token)
+        if renewed:
+            request.state.renewed_session = renewed
+    return username
+
+
 def current_user(request):
     """返回当前会话对应的账号；未登录抛 401。
 
     全站功能都要求登录：既是使用者的明确要求，也让后续执行 SVN 时
     能确定该用谁的凭据。
     """
-    username = request.app.state.auth.resolve_session(
-        request.cookies.get(SESSION_COOKIE, ""))
+    username = _session_user(request)
     if not username:
         raise AuthError("login_required", "请先登录", 401)
     return username
@@ -361,8 +385,7 @@ async def logout(request: Request):
 @app.get("/api/v1/auth/me")
 async def whoami(request: Request):
     """未登录不算错误，返回 authenticated=false 供前端决定显示登录页。"""
-    username = request.app.state.auth.resolve_session(
-        request.cookies.get(SESSION_COOKIE, ""))
+    username = _session_user(request)
     if not username:
         return {"ok": True, "authenticated": False, "user": None}
     profile = await run_in_threadpool(request.app.state.auth.public_profile, username)

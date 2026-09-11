@@ -246,6 +246,44 @@ class HistoricalShareRulesTest(unittest.TestCase):
             profile.local_root_for(matched),
             "/mnt/ecology/192.168.7.173/ecology-customer2")
 
+    def test_dropped_mount_is_reported_instead_of_missing_customer_directory(self):
+        """CIFS 掉线后挂载点还在但是空的：必须报「共享未挂载」，且不阻塞其他共享。"""
+        from web_standard_service import _mount_ready
+        with tempfile.TemporaryDirectory() as root:
+            ready = Path(root, "192.168.7.108", "ECOLOGY_customer")
+            ready.mkdir(parents=True)
+            (ready / "Z").mkdir()
+            dropped = Path(root, "192.168.7.173", "ecology-customer")
+            dropped.mkdir(parents=True)
+            self.assertTrue(_mount_ready(str(ready)))
+            self.assertFalse(_mount_ready(str(dropped)))
+            self.assertFalse(_mount_ready(str(Path(root, "192.168.7.173", "ecology-customer2"))))
+
+            profile = SourceProfile(
+                "historical", "历史", unc_prefix=DEFAULT_HISTORICAL_UNC_PREFIXES[0],
+                extra_unc_prefixes=DEFAULT_HISTORICAL_UNC_PREFIXES[1:],
+                mount_root=root)
+            self.assertTrue(profile.available, "只要有一个共享在线，来源就可用")
+            manager = StandardJobManager(
+                profiles=[profile], temp_root=Path(root, "jobs"),
+                allow_file_urls=True, require_password_stdin=False)
+            try:
+                with self.assertRaises(StandardWebError) as caught:
+                    manager.create_job(
+                        svn_url="file:///tmp/repo", username="u", password="p",
+                        profile_id="historical", file_list="a.java", commit_message="m",
+                        customer_standard_path=r"\\192.168.7.173\ecology-customer\Z\客户\历史文件\ecology")
+                self.assertEqual(caught.exception.code, "source_share_unmounted")
+                self.assertEqual(caught.exception.status_code, 503)
+                with self.assertRaises(RuntimeError) as runtime:
+                    manager._profile_source_root(profile, DEFAULT_HISTORICAL_UNC_PREFIXES[1])
+                self.assertIn("未挂载", str(runtime.exception))
+                self.assertEqual(
+                    manager._profile_source_root(profile, DEFAULT_HISTORICAL_UNC_PREFIXES[0]),
+                    ready.resolve())
+            finally:
+                manager.stop()
+
     def test_four_segment_shape_holds_across_all_history_hosts(self):
         """三台的层级都是四段以 ecology 结尾，校验规则可以统一。"""
         for prefix, suffix in (

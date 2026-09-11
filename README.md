@@ -197,6 +197,18 @@ cd /opt/svn-sync-tool && python3 -m venv .venv-web
 
 systemd 单元 `/etc/systemd/system/svn-sync-web.service` 以 root 运行，`Restart=always`
 并已 `enable` 开机自启；日志走 journald（`journalctl -u svn-sync-web -f`）。
+`deploy-linux.sh` 用 `rsync --delete` 同步：本地删掉的文件在服务器上同样会删掉，`.venv-web`
+等排除项不受影响。
+
+账号与会话（服务重启不会让大家掉线）：
+
+- 账号库 `/root/.config/svn_sync_tool/web_users.json`（0600），同目录的 `session-secret` 是会话
+  签名密钥，首次启动自动生成；两者都不进 Git。删掉 `session-secret` 等于让所有人重新登录。
+- 会话是签名令牌，服务端不保存会话表，重启、重新部署都不影响已登录的浏览器；持续使用会自动
+  续期，12 小时不用才过期。
+- 忘记登录密码：`.venv-web/bin/python manage_web_users.py reset-password <账号>`（隐藏输入）。
+  重置后该账号在所有浏览器上的登录立即失效，运行中的服务不需要重启；已保存的 SVN 凭据不受影响。
+  `list` 列账号、`delete <账号>` 删账号。
 
 ### HTTPS
 
@@ -243,7 +255,8 @@ svn-sync-tls-setup.sh --renew         # 到期前仅重签服务器证书，CA �
 # 三台历史文件主机共用同一套 [history] 账号，无需按主机拆
 
 cp deploy/linux/svn-sync-mount-shares.sh /usr/local/sbin/ && chmod 700 /usr/local/sbin/svn-sync-mount-shares.sh
-cp deploy/linux/svn-sync-mounts.{service,timer} /etc/systemd/system/
+cp deploy/linux/svn-sync-mounts.service deploy/linux/svn-sync-mounts-heal.service \
+   deploy/linux/svn-sync-mounts.timer /etc/systemd/system/
 systemctl daemon-reload && systemctl enable --now svn-sync-mounts.service svn-sync-mounts.timer
 
 svn-sync-mount-shares.sh --status    # 查看十个共享的挂载状态
@@ -252,9 +265,14 @@ svn-sync-mount-shares.sh --status    # 查看十个共享的挂载状态
 挂载点规则是 `<SVN_SYNC_WEB_MOUNT_ROOT>/<主机>/<共享>`，与 `SourceProfile.local_root_for`
 保持一致——改其中一处必须同步改另一处，否则服务找不到已挂载的共享。
 
-`svn-sync-mounts.timer` 每 10 分钟重跑一次挂载脚本：脚本对已挂载的共享会跳过，
-所以重复执行安全，共享掉线后能自动补回。Web 服务用 `Wants=` 而非 `Requires=`
-依赖它，共享挂不上时版本号路径生成与升级清单提取仍可正常使用。
+`svn-sync-mounts.timer` 每 10 分钟触发一次 **`svn-sync-mounts-heal.service`** 重跑挂载脚本：
+脚本对已挂载的共享会跳过，所以重复执行安全，共享掉线后能自动补回。之所以是独立单元：
+`svn-sync-mounts.service` 为了在关机时卸载而 `RemainAfterExit=yes`、常驻 active，timer 对
+active 单元的 start 是空操作，直接触发它等于什么都不做。Web 服务用 `Wants=` 而非 `Requires=`
+依赖挂载单元，共享挂不上时版本号路径生成与升级清单提取仍可正常使用。
+
+共享掉线时，标准文件提交会在创建任务时直接返回「服务端共享 … 当前未挂载或已断开」（503），
+而不是等后台检出后再报"客户目录不存在"；其他仍在线的共享不受影响。
 
 几点 Linux 特有的注意：
 

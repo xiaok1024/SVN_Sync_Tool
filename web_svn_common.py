@@ -26,8 +26,18 @@ class WebSvnError(Exception):
         self.status_code = status_code
 
 
+_STDIN_SUPPORT_CONFIRMED = False
+
+
 def supports_password_from_stdin():
-    """确认当前 SVN CLI 支持 ``--password-from-stdin``，避免密码进入命令行。"""
+    """确认当前 SVN CLI 支持 ``--password-from-stdin``，避免密码进入命令行。
+
+    只缓存肯定结果：SVN 版本在服务运行期间不会变，确认一次后不必每个请求
+    都起子进程；否定结果（svn 暂缺、超时）不缓存，装好后无需重启即可恢复。
+    """
+    global _STDIN_SUPPORT_CONFIRMED
+    if _STDIN_SUPPORT_CONFIRMED:
+        return True
     try:
         result = subprocess.run(
             [SVN_EXECUTABLE, "help", "checkout", "--verbose"],
@@ -38,7 +48,10 @@ def supports_password_from_stdin():
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
-    return b"--password-from-stdin" in result.stdout
+    supported = b"--password-from-stdin" in result.stdout
+    if supported:
+        _STDIN_SUPPORT_CONFIRMED = True
+    return supported
 
 
 def read_allowed_svn_prefixes(environ):

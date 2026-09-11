@@ -1,7 +1,9 @@
 [Unit]
-Description=定期重挂掉线的 E9 共享（自恢复）
+Description=定期补挂掉线的 E9 共享（自恢复）
 
 [Timer]
+# 触发的是独立的 heal 单元，不是常驻 active 的 svn-sync-mounts.service
+Unit=svn-sync-mounts-heal.service
 OnBootSec=2min
 OnUnitActiveSec=10min
 AccuracySec=30s
