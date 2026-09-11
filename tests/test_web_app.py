@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -420,6 +421,121 @@ class WebSourceSafetyTest(unittest.TestCase):
         source = (root / "svn_sync_web.py").read_text(encoding="utf-8")
         self.assertIn('"0.0.0.0" if args.lan else "127.0.0.1"', source)
         self.assertIn('parser.add_argument(\n        "--lan"', source)
+
+
+class HttpsEntryTest(unittest.TestCase):
+    """HTTPS 入口：参数校验、uvicorn 收到的 TLS 参数、HTTP→HTTPS 跳转监听。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.cert = Path(self.temp.name, "server.crt")
+        self.key = Path(self.temp.name, "server.key")
+        self.ca = Path(self.temp.name, "ca.crt")
+        for path in (self.cert, self.key):
+            path.write_text("-----BEGIN PLACEHOLDER-----\n", encoding="utf-8")
+        self.ca.write_text("-----BEGIN CERTIFICATE-----\nfake-ca\n-----END CERTIFICATE-----\n",
+                           encoding="utf-8")
+
+    def test_cert_and_key_must_be_given_together(self):
+        import svn_sync_web
+        parser = svn_sync_web.build_parser()
+        with self.assertRaises(SystemExit):
+            svn_sync_web.validate_tls_args(parser.parse_args(["--ssl-certfile", str(self.cert)]))
+        with self.assertRaises(SystemExit):
+            svn_sync_web.validate_tls_args(parser.parse_args(["--ssl-keyfile", str(self.key)]))
+        self.assertTrue(svn_sync_web.validate_tls_args(parser.parse_args(
+            ["--ssl-certfile", str(self.cert), "--ssl-keyfile", str(self.key)])))
+        self.assertFalse(svn_sync_web.validate_tls_args(parser.parse_args([])))
+
+    def test_missing_cert_file_is_rejected_before_startup(self):
+        import svn_sync_web
+        args = svn_sync_web.build_parser().parse_args(
+            ["--ssl-certfile", str(Path(self.temp.name, "nope.crt")), "--ssl-keyfile", str(self.key)])
+        with self.assertRaises(SystemExit):
+            svn_sync_web.validate_tls_args(args)
+
+    def test_redirect_port_requires_https_and_distinct_port(self):
+        import svn_sync_web
+        parser = svn_sync_web.build_parser()
+        with self.assertRaises(SystemExit):
+            svn_sync_web.validate_tls_args(parser.parse_args(["--redirect-port", "8081"]))
+        with self.assertRaises(SystemExit):
+            svn_sync_web.validate_tls_args(parser.parse_args([
+                "--port", "8081", "--redirect-port", "8081",
+                "--ssl-certfile", str(self.cert), "--ssl-keyfile", str(self.key)]))
+
+    def test_uvicorn_receives_tls_files(self):
+        import sys
+        import svn_sync_web
+        from unittest import mock
+        fake_uvicorn = mock.Mock()
+        with mock.patch.dict(sys.modules, {"uvicorn": fake_uvicorn}):
+            svn_sync_web.main([
+                "--port", "8443",
+                "--ssl-certfile", str(self.cert), "--ssl-keyfile", str(self.key)])
+        kwargs = fake_uvicorn.run.call_args.kwargs
+        self.assertEqual(kwargs["ssl_certfile"], str(self.cert))
+        self.assertEqual(kwargs["ssl_keyfile"], str(self.key))
+        self.assertEqual(kwargs["port"], 8443)
+        # 未启用 HTTPS 时不得传 TLS 参数（uvicorn 会因 None 以外的空值报错）
+        fake_uvicorn.reset_mock()
+        with mock.patch.dict(sys.modules, {"uvicorn": fake_uvicorn}):
+            svn_sync_web.main(["--port", "8765"])
+        self.assertNotIn("ssl_certfile", fake_uvicorn.run.call_args.kwargs)
+
+    def test_redirect_listener_sends_301_to_https_and_serves_ca(self):
+        import http.client
+        import svn_sync_web
+        server = svn_sync_web.start_https_redirect(
+            "127.0.0.1", 0, 8443, str(self.ca),
+            ["127.0.0.1", "localhost", "192.168.30.178"], "192.168.30.178")
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        port = server.server_address[1]
+
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", "/api/health?x=1", headers={"Host": "192.168.30.178:8081"})
+        response = conn.getresponse()
+        self.assertEqual(response.status, 301)
+        self.assertEqual(response.getheader("Location"),
+                         "https://192.168.30.178:8443/api/health?x=1")
+        response.read()
+
+        # Host 不在可信列表或含非法字符：退回默认主机，不把请求头写进 Location
+        for bad_host in ("evil.example:8081", "a b", "x\ty"):
+            conn.request("GET", "/", headers={"Host": bad_host})
+            response = conn.getresponse()
+            self.assertEqual(response.status, 301, bad_host)
+            self.assertEqual(response.getheader("Location"), "https://192.168.30.178:8443/")
+            response.read()
+
+        # POST 同样跳转，不接受任何内容
+        conn.request("POST", "/api/v1/auth/login", body="{}",
+                     headers={"Host": "192.168.30.178", "Content-Type": "application/json"})
+        response = conn.getresponse()
+        self.assertEqual(response.status, 301)
+        response.read()
+
+        # CA 证书可直接下载，用于首次安装信任
+        conn.request("GET", "/ca.crt", headers={"Host": "192.168.30.178"})
+        response = conn.getresponse()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.getheader("Content-Type"), "application/x-x509-ca-cert")
+        self.assertIn(b"fake-ca", response.read())
+        conn.close()
+
+    def test_session_cookie_is_secure_under_https(self):
+        client = TestClient(app, base_url="https://testserver")
+        client.post("/api/v1/auth/register",
+                    json={"username": "httpsuser", "password": "correct-horse"})
+        login = client.post("/api/v1/auth/login",
+                            json={"username": "httpsuser", "password": "correct-horse"})
+        self.assertEqual(login.status_code, 200)
+        self.assertIn("secure", login.headers.get("set-cookie", "").lower())
+        # 同源 Origin 在 HTTPS 下仍应通过跨站校验
+        ok = client.get("/api/v1/auth/me", headers={"origin": "https://testserver"})
+        self.assertTrue(ok.json()["authenticated"])
 
 
 if __name__ == "__main__":

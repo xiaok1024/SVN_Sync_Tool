@@ -198,6 +198,43 @@ cd /opt/svn-sync-tool && python3 -m venv .venv-web
 systemd 单元 `/etc/systemd/system/svn-sync-web.service` 以 root 运行，`Restart=always`
 并已 `enable` 开机自启；日志走 journald（`journalctl -u svn-sync-web -f`）。
 
+### HTTPS
+
+服务通过 IP 在局域网内访问，走 **私有 CA + 按 IP 签发的服务器证书**：同事把 CA 证书装进
+系统信任一次，之后所有浏览器都不再警告；服务器证书可独立续期，续期后同事无需重装。
+
+```bash
+# 服务器一次性生成（CA 10 年；服务器证书 825 天——Apple/Chrome 对 TLS 证书的上限）
+cp deploy/linux/svn-sync-tls-setup.sh /usr/local/sbin/ && chmod 700 /usr/local/sbin/svn-sync-tls-setup.sh
+svn-sync-tls-setup.sh                 # 生成到 /etc/svn-sync-tool/tls/
+svn-sync-tls-setup.sh --renew         # 到期前仅重签服务器证书，CA 不变
+
+# 单元文件已按 HTTPS 配置：见 deploy/linux/svn-sync-web.service
+```
+
+监听布局：
+
+| 端口 | 协议 | 用途 |
+|------|------|------|
+| **8443** | HTTPS | 正式入口：`https://192.168.30.178:8443/` |
+| 8081 | HTTP | 只做 301 跳转到 8443，旧书签不会断；另在 `/ca.crt` 提供 CA 证书下载 |
+
+同事首次使用需安装 CA（只做一次）：
+
+1. 浏览器打开 `http://192.168.30.178:8081/ca.crt` 下载 `lzr-svn-sync-ca.crt`；
+2. **macOS**：双击导入「钥匙串访问」→ 登录钥匙串 → 找到「LZR SVN Sync Local CA」→ 显示简介 →
+   信任 → 「使用此证书时」选「始终信任」。Chrome / Safari 随即生效；**Firefox** 使用自己的证书库，
+   需在 设置 → 隐私与安全 → 证书 → 查看证书 → 证书颁发机构 → 导入，并勾选「信任由此 CA 标识的网站」；
+3. **Windows**：双击 `.crt` → 安装证书 → 当前用户 → 「将所有的证书都放入下列存储」→
+   浏览 → **受信任的根证书颁发机构**。Edge / Chrome 随即生效；Firefox 同样需单独导入。
+
+安装前可与服务器输出的 CA 指纹核对（`svn-sync-tls-setup.sh` 会打印 SHA-256），避免在首次
+明文下载环节被替换——这是私有 CA 的固有信任起点，内网环境可接受，但请通过聊天工具再发一份指纹。
+
+启用 HTTPS 后浏览器进入安全上下文，`navigator.clipboard` 可用，复制不再依赖降级路径；
+会话 Cookie 带 `Secure`，不会随明文 HTTP 发送。HSTS 未设置：RFC 6797 明确排除 IP 字面量，
+对 IP 访问不生效；8081 的强制跳转已保证所有人落到 HTTPS。
+
 共享挂载（标准文件提交功能需要）：
 
 ```bash
@@ -269,13 +306,13 @@ svn-sync-mount-shares.sh --status    # 查看十个共享的挂载状态
 - 单次最多查询 200 个版本（每个版本都是一次 `svn log`），单次结果最多 20000 个文件；
 - 单版本查询超时 60 秒，整次查询时间上限 240 秒；触发上限会返回已查到的结果，并明确说明有多少个版本没有查询；
 - 同时最多执行 2 次查询，超出返回 429；
-- 认证有两种模式，由是否填写凭据决定，只能二选一（只填一个会直接报错）：
-  - **填写账号和密码**：使用独立 `--config-dir` 且 `--no-auth-cache`，密码经 stdin 传入，查询结束立即删除临时配置目录；
-  - **两者都留空**：复用运行本服务这台机器上已缓存的 SVN 认证（与终端版“留空使用缓存”一致）。这条通道只用于只读查询，服务端用 SVN 子命令白名单硬性拦截，任何写操作（`commit` / `add` / `checkout` / `propset` 等）都会被拒绝并报 `read_only_engine_violation`。需要禁用时设置 `SVN_SYNC_WEB_ALLOW_HOST_SVN_CACHE=0`；
+- 一律使用登录人在「我的 SVN 账号」里保存的凭据：独立 `--config-dir` 且 `--no-auth-cache`，密码经 stdin 传入，查询结束立即删除临时配置目录。未保存凭据时返回 428 并引导去设置，不存在回退到主机缓存的路径；
 - 单个版本查询失败（例如版本不存在、无变更文件）只作为该版本的提示返回，不影响其余版本，错误文本经过凭据脱敏；
 - **地址必须填仓库根**：`svn log` 返回的是仓库绝对路径，生成的 URL 由填入地址直接拼接该路径，填子目录会出现重复路径段。这与 GUI Tab 5、CLI `paths` 的行为一致。
 
-> `--lan` 只适合受信任的内网临时使用。服务仍会校验 Host，并拒绝浏览器跨站写请求，但 HTTP 不加密浏览器到服务端之间的 SVN 密码。另外要注意：开启 `--lan` 后，局域网内任何人都能用**本机缓存认证**执行只读的版本号路径查询；不希望如此时设置 `SVN_SYNC_WEB_ALLOW_HOST_SVN_CACHE=0` 强制要求填写各自的账号。正式长期开放前仍应增加 HTTPS、登录会话和操作审计，不得暴露到公网。
+> `--lan` 只适合受信任的内网使用。服务会校验 Host 并拒绝浏览器跨站写请求；正式对同事开放时
+> 请按「部署到 Linux 常驻运行 → HTTPS」配置证书，否则登录密码与 SVN 密码会在局域网内明文传输。
+> 任何情况下都不得暴露到公网。
 
 Web 专项测试：
 
