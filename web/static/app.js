@@ -760,6 +760,24 @@ function updateSelectedProfileDetail() {
   updateStandardCounters();
 }
 
+/** 去掉从任务描述粘贴来的「标准文件请到 … 下面提取」等说明文字与多余空白。
+ *  词表与服务端 clean_customer_path_text（即桌面版 _clean_share_text）一致，服务端会再做一次。 */
+function cleanCustomerPathText(value) {
+  let text = String(value || "").split(/\s+/).filter(Boolean).join(" ");
+  for (const prefix of ["标准文件请到", "标准文件在", "请到", "文件请到"]) {
+    if (text.startsWith(prefix)) { text = text.slice(prefix.length).trim(); break; }
+  }
+  for (const suffix of ["下面提取", "里提取", "中提取", "提取", "下载"]) {
+    if (text.endsWith(suffix)) { text = text.slice(0, -suffix.length).trim(); break; }
+  }
+  return text.replace(/^"+|"+$/g, "");
+}
+
+function normalizeCustomerPathField() {
+  const cleaned = cleanCustomerPathText(standardElements.customerPath.value);
+  if (cleaned !== standardElements.customerPath.value) standardElements.customerPath.value = cleaned;
+}
+
 function saveStandardTaskSession() {
   if (!standardState.taskId || !standardState.accessToken) return;
   sessionStorage.setItem("lzr-standard-task", JSON.stringify({
@@ -788,6 +806,7 @@ function restoreStandardTaskSession() {
 
 async function createStandardTask(event) {
   event.preventDefault();
+  normalizeCustomerPathField();
   if (!validateStandardForm()) return;
   const payload = {
     svn_url: standardElements.svnUrl.value.trim(),
@@ -1140,6 +1159,9 @@ standardElements.form.addEventListener("reset", (event) => {
   }, 0);
 });
 standardElements.fileList.addEventListener("input", updateStandardCounters);
+// 粘贴任务描述原文后立即清理，用户能看到最终生效的路径
+standardElements.customerPath.addEventListener("paste", () => window.setTimeout(normalizeCustomerPathField, 0));
+standardElements.customerPath.addEventListener("change", normalizeCustomerPathField);
 standardElements.coverAllConfirm.addEventListener("change", clearStandardErrors);
 standardElements.copyUrlsButton.addEventListener("click", async () => {
   const count = standardState.resultUrls.length;

@@ -284,6 +284,18 @@ class HistoricalShareRulesTest(unittest.TestCase):
             finally:
                 manager.stop()
 
+    def test_pasted_task_description_decorations_are_stripped(self):
+        """任务描述原文可直接粘贴：首尾说明词与空行、空格自动去掉，路径本身不动。"""
+        from web_standard_service import clean_customer_path_text
+        path = r"\\192.168.7.215\ECOLOGY_customer\J\J江苏金陵科技集团有限公司新疆\QC5017093\ecology"
+        raw = "\n  标准文件请到" + path + "下面提取  \n\n"
+        self.assertEqual(clean_customer_path_text(raw), path)
+        self.assertEqual(clean_customer_path_text("标准文件请到 " + path + " 下面提取"), path)
+        self.assertEqual(clean_customer_path_text(path), path, "干净输入原样保留")
+        self.assertEqual(
+            parse_customer_standard_path(clean_customer_path_text(raw), DEFAULT_STANDARD_UNC_PREFIX),
+            "J/J江苏金陵科技集团有限公司新疆/QC5017093/ecology")
+
     def test_four_segment_shape_holds_across_all_history_hosts(self):
         """三台的层级都是四段以 ecology 结尾，校验规则可以统一。"""
         for prefix, suffix in (

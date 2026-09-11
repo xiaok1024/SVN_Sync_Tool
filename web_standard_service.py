@@ -388,6 +388,17 @@ def parse_web_file_list(file_list, _svn_url=None):
     return unique
 
 
+def clean_customer_path_text(value):
+    """去掉从任务描述粘贴来的装饰文字，只留路径。
+
+    常见原文形如「标准文件请到\\\\…\\QC5017093\\ecology下面提取」，首尾还可能带空行、
+    空格。只处理首尾的固定说明词与空白，路径本身不动；词表复用桌面版
+    ``SyncEngine._clean_share_text``，两端行为一致。
+    """
+    text = " ".join(str(value or "").split())
+    return SyncEngine._clean_share_text(text).strip().strip('"')
+
+
 def parse_customer_standard_path(value, unc_prefix=DEFAULT_STANDARD_UNC_PREFIX,
                                  require_qc_segment=True):
     """验证固定共享根下的四段目录并返回安全后缀。
@@ -930,7 +941,7 @@ class StandardJobManager:
         if (not message or len(message) > MAX_COMMIT_MESSAGE
                 or any(ord(char) < 32 for char in message)):
             raise StandardWebError("invalid_commit_message", "提交说明不能为空且最多 500 个字符")
-        raw_customer_path = str(customer_standard_path or "").strip()
+        raw_customer_path = clean_customer_path_text(customer_standard_path)
         if raw_customer_path:
             # 白名单只判「主机+共享」，不内置客户落在哪台的映射；
             # 客户与主机的对应由调用方按 customer-env-info.md 填写完整路径。
