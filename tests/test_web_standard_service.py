@@ -173,6 +173,38 @@ class HistoricalShareRulesTest(unittest.TestCase):
                 with self.assertRaises(StandardWebError):
                     parse_customer_standard_path(invalid, prefix, require_qc_segment=False)
 
+    def test_each_share_reads_its_own_credentials_section(self):
+        """两个共享账号可能不同，不能都去读 [standard]。"""
+        with tempfile.TemporaryDirectory() as root:
+            creds = Path(root, "smb.toml")
+            creds.write_text(
+                '[standard]\nusername = "std-user"\npassword = "std-pass"\n'
+                '[history]\nusername = "hist-user"\npassword = "hist-pass"\n',
+                encoding="utf-8")
+            standard = SourceProfile(
+                "default", "标准", unc_prefix=DEFAULT_STANDARD_UNC_PREFIX,
+                smb_credentials_file=str(creds))
+            historical = SourceProfile(
+                "historical", "历史", unc_prefix=DEFAULT_HISTORICAL_UNC_PREFIX,
+                smb_credentials_file=str(creds))
+            self.assertEqual(standard.credentials_sections, ("standard",))
+            self.assertEqual(historical.credentials_sections, ("history", "historical"))
+            read = StandardJobManager._read_smb_credentials
+            self.assertEqual(read(standard), ("std-user", "std-pass"))
+            self.assertEqual(read(historical), ("hist-user", "hist-pass"))
+
+    def test_missing_section_falls_back_to_standard(self):
+        """只配了 [standard] 的旧文件仍然可用。"""
+        with tempfile.TemporaryDirectory() as root:
+            creds = Path(root, "smb.toml")
+            creds.write_text(
+                '[standard]\nusername = "only"\npassword = "one"\n', encoding="utf-8")
+            historical = SourceProfile(
+                "historical", "历史", unc_prefix=DEFAULT_HISTORICAL_UNC_PREFIX,
+                smb_credentials_file=str(creds))
+            self.assertEqual(
+                StandardJobManager._read_smb_credentials(historical), ("only", "one"))
+
     def test_public_dict_exposes_the_cover_all_policy(self):
         standard = self._profile(DEFAULT_STANDARD_UNC_PREFIX).public_dict()
         historical = self._profile(DEFAULT_HISTORICAL_UNC_PREFIX).public_dict()

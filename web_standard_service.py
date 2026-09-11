@@ -94,6 +94,17 @@ class SourceProfile:
         return _same_unc_prefix(self.unc_prefix, DEFAULT_STANDARD_UNC_PREFIX)
 
     @property
+    def credentials_sections(self):
+        """凭据文件中本来源可用的节名，按优先级排列。
+
+        历史共享同时接受 ``[history]``（现有文件采用）与 ``[historical]``，
+        避免两台机器上的文件因命名不同而读不到。
+        """
+        if self.is_standard_share:
+            return ("standard",)
+        return ("history", "historical")
+
+    @property
     def allows_cover_all(self):
         """只有标准共享根允许「清单留空 = 覆盖全部交集」。
 
@@ -729,9 +740,21 @@ class StandardJobManager:
             payload = tomllib.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
             raise RuntimeError("服务端 SMB 凭据配置无法读取") from exc
-        section = payload.get("standard")
+        # 每个来源读自己的节：标准共享读 [standard]，历史共享读 [history]/[historical]。
+        # 早期只有一个共享时这里写死读 standard，两个来源并存后会串账号。
+        section = None
+        for name in profile.credentials_sections:
+            candidate = payload.get(name)
+            if isinstance(candidate, dict):
+                section = candidate
+                break
+        if section is None:
+            # 仅配了 [standard] 的旧文件仍可用
+            section = payload.get("standard")
         if not isinstance(section, dict):
-            raise RuntimeError("服务端 SMB 凭据缺少 standard 配置")
+            raise RuntimeError(
+                "服务端 SMB 凭据缺少 %s 配置"
+                % " 或 ".join(profile.credentials_sections))
         username = str(section.get("username") or "test").strip().strip("`'\" ")
         password = str(section.get("password") or "").strip().strip("`'\" ")
         if not username or not password or any(char in username + password for char in "\r\n\x00"):
