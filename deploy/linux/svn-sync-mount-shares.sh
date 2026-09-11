@@ -29,12 +29,8 @@ SHARES=(
     "history  192.168.7.108 ECOLOGY_customer"
     "history  192.168.7.173 ecology-customer"
     "history  192.168.7.173 ecology-customer2"
-    "history  192.168.7.106 客户升级记录a-e"
-    "history  192.168.7.106 客户升级记录f-i"
-    "history  192.168.7.106 客户升级记录j-n"
-    "history  192.168.7.106 客户升级记录o-s"
-    "history  192.168.7.106 客户升级记录s上海"
-    "history  192.168.7.106 客户升级记录t-z"
+    # 192.168.7.106（客户升级记录*，共享名含中文、需 vers=2.1）暂不支持，
+    # 如需启用：这里补回条目，同时把共享加进 DEFAULT_HISTORICAL_UNC_PREFIXES
 )
 
 mount_point_for() { printf '%s/%s/%s' "$MOUNT_ROOT" "$1" "$2"; }

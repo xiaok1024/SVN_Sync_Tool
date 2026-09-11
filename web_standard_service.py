@@ -72,12 +72,6 @@ DEFAULT_HISTORICAL_UNC_PREFIXES = (
     DEFAULT_HISTORICAL_UNC_PREFIX,                      # Windows
     r"\\192.168.7.173\ecology-customer",               # Samba 4.10.16
     r"\\192.168.7.173\ecology-customer2",
-    r"\\192.168.7.106\客户升级记录a-e",                 # Windows，共享名含中文
-    r"\\192.168.7.106\客户升级记录f-i",
-    r"\\192.168.7.106\客户升级记录j-n",
-    r"\\192.168.7.106\客户升级记录o-s",
-    r"\\192.168.7.106\客户升级记录s上海",
-    r"\\192.168.7.106\客户升级记录t-z",
 )
 
 
