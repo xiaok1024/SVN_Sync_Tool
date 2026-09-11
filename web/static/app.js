@@ -278,16 +278,52 @@ async function generateMarkdown() {
   }
 }
 
+/** 复制纯文本到剪贴板，返回是否成功。
+ *
+ * 只写 text/plain，绝不带样式：办公软件的富文本框会优先取 text/html，
+ * 若降级路径选中的是带背景色的 DOM 节点，粘过去就会带上底色。
+ * 因此降级一律用临时 textarea——它的选区只有纯文本这一种格式。
+ *
+ * 注意 navigator.clipboard 仅在安全上下文（HTTPS 或 localhost）可用；
+ * 本服务常以内网 HTTP 访问，实际几乎总是走降级路径。
+ */
+async function copyPlainText(text) {
+  if (!text) return false;
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (_error) {
+      // 落到下面的 textarea 方案
+    }
+  }
+  const holder = document.createElement("textarea");
+  holder.value = text;
+  // 不用 display:none —— 那样无法选中
+  holder.setAttribute("readonly", "");
+  holder.style.position = "fixed";
+  holder.style.top = "-1000px";
+  holder.style.opacity = "0";
+  document.body.append(holder);
+  const previous = document.activeElement;
+  let copied = false;
+  try {
+    holder.select();
+    holder.setSelectionRange(0, holder.value.length);
+    copied = document.execCommand("copy");
+  } catch (_error) {
+    copied = false;
+  }
+  holder.remove();
+  if (previous && typeof previous.focus === "function") previous.focus();
+  return copied;
+}
+
 async function copyResult() {
   if (!state.result) return;
-  try {
-    await navigator.clipboard.writeText(state.result);
-    showNotice("结果已复制到剪贴板。", "success");
-  } catch (_error) {
-    elements.resultOutput.select();
-    const copied = document.execCommand("copy");
-    showNotice(copied ? "结果已复制到剪贴板。" : "复制失败，请手工复制。", copied ? "success" : "error");
-  }
+  const copied = await copyPlainText(state.result);
+  showNotice(copied ? "结果已复制到剪贴板。" : "复制失败，请手工复制。",
+             copied ? "success" : "error");
 }
 
 function downloadResult() {
@@ -1106,23 +1142,11 @@ standardElements.form.addEventListener("reset", (event) => {
 standardElements.fileList.addEventListener("input", updateStandardCounters);
 standardElements.coverAllConfirm.addEventListener("change", clearStandardErrors);
 standardElements.copyUrlsButton.addEventListener("click", async () => {
-  const text = standardState.resultUrls.join("\n");
-  if (!text) return;
-  try {
-    await navigator.clipboard.writeText(text);
-    showNotice(`已复制 ${standardState.resultUrls.length} 个文件路径。`, "success");
-  } catch (_error) {
-    // 非 HTTPS 或未授权时 clipboard API 不可用，退回选中文本再复制
-    const range = document.createRange();
-    range.selectNodeContents(standardElements.resultUrls);
-    const selection = window.getSelection();
-    selection.removeAllRanges();
-    selection.addRange(range);
-    const copied = document.execCommand("copy");
-    selection.removeAllRanges();
-    showNotice(copied ? `已复制 ${standardState.resultUrls.length} 个文件路径。` : "复制失败，请手工选择后复制。",
-               copied ? "success" : "error");
-  }
+  const count = standardState.resultUrls.length;
+  const copied = await copyPlainText(standardState.resultUrls.join("\n"));
+  if (!count) return;
+  showNotice(copied ? `已复制 ${count} 个文件路径（纯文本）。` : "复制失败，请手工选择后复制。",
+             copied ? "success" : "error");
 });
 standardElements.commitMessage.addEventListener("input", updateStandardCounters);
 standardElements.sourceProfile.addEventListener("change", updateSelectedProfileDetail);
@@ -1386,14 +1410,9 @@ async function runPathSort() {
 async function copyPathResult() {
   const text = pathElements.output.value;
   if (!text.trim()) return;
-  try {
-    await navigator.clipboard.writeText(text);
-    showNotice("文件路径已复制到剪贴板。", "success");
-  } catch (_error) {
-    pathElements.output.select();
-    const copied = document.execCommand("copy");
-    showNotice(copied ? "文件路径已复制到剪贴板。" : "复制失败，请手工复制。", copied ? "success" : "error");
-  }
+  const copied = await copyPlainText(text);
+  showNotice(copied ? "文件路径已复制到剪贴板。" : "复制失败，请手工复制。",
+             copied ? "success" : "error");
 }
 
 function downloadPathResult() {

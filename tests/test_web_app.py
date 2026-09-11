@@ -398,6 +398,23 @@ class WebSourceSafetyTest(unittest.TestCase):
         javascript = (root / "web" / "static" / "app.js").read_text(encoding="utf-8")
         self.assertNotIn("innerHTML", javascript)
 
+    def test_copy_always_produces_plain_text(self):
+        """办公软件的富文本框会优先取 text/html。
+
+        降级复制若选中带样式的 DOM 节点，粘贴过去会带上底色；因此所有复制
+        都必须经 copyPlainText（内部用临时 textarea，选区只有纯文本一种格式）。
+        本服务多以内网 HTTP 访问，navigator.clipboard 不可用，降级路径才是常态。
+        """
+        root = Path(__file__).resolve().parents[1]
+        javascript = (root / "web" / "static" / "app.js").read_text(encoding="utf-8")
+        # 不得再直接选中 DOM 节点来复制
+        self.assertNotIn("selectNodeContents", javascript)
+        # execCommand 只允许出现在统一的辅助函数里
+        self.assertEqual(javascript.count('document.execCommand("copy")'), 1)
+        self.assertIn("async function copyPlainText(text)", javascript)
+        # 三个复制入口都走辅助函数
+        self.assertGreaterEqual(javascript.count("await copyPlainText("), 3)
+
     def test_entry_requires_explicit_lan_mode(self):
         root = Path(__file__).resolve().parents[1]
         source = (root / "svn_sync_web.py").read_text(encoding="utf-8")
