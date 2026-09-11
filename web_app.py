@@ -385,6 +385,23 @@ async def change_password(request: Request):
     return response
 
 
+@app.get("/api/v1/auth/svn-credentials")
+async def read_svn_credentials(request: Request):
+    """回显当前登录人自己保存的 SVN 账号与密码。
+
+    只有这个接口返回密码，且只返回调用者本人的：/me 与保存接口都不含密码，
+    避免每次加载页面都把它传一遍。使用者明确要求弹窗里明文显示。
+    """
+    username = current_user(request)
+    auth = request.app.state.auth
+    profile = await run_in_threadpool(auth.public_profile, username)
+    if not profile["has_svn_credentials"]:
+        return {"ok": True, "svn_username": "", "svn_password": "", "configured": False}
+    svn_user, svn_pass = await run_in_threadpool(auth.get_svn_credentials, username)
+    return {"ok": True, "svn_username": svn_user, "svn_password": svn_pass,
+            "configured": True}
+
+
 @app.put("/api/v1/auth/svn-credentials")
 async def save_svn_credentials(request: Request):
     username = current_user(request)

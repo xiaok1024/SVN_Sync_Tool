@@ -633,7 +633,7 @@ function showStandardError(message, control = null) {
 function validateStandardForm() {
   clearStandardErrors();
   const checks = [
-    [standardElements.svnUrl, "请填写客户 SVN 检出根。"],
+    [standardElements.svnUrl, "请填写客户 SVN 地址。"],
     [standardElements.sourceProfile, "请选择可用的标准文件来源。"],
     [standardElements.customerPath, "请填写客户标准文件 ecology 目录。"],
     [standardElements.commitMessage, "请填写 SVN 提交说明。"],
@@ -648,7 +648,7 @@ function validateStandardForm() {
     const parsed = new URL(standardElements.svnUrl.value.trim());
     if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("scheme");
   } catch (_error) {
-    showStandardError("SVN 检出根必须是完整的 http 或 https 地址。", standardElements.svnUrl);
+    showStandardError("SVN 地址必须是完整的 http 或 https 地址。", standardElements.svnUrl);
     return false;
   }
   if (!standardElements.fileList.value.trim() && !selectedProfileAllowsCoverAll()) {
@@ -774,7 +774,7 @@ async function createStandardTask(event) {
     saveStandardTaskSession();
     setStandardFormLocked(true);
     standardElements.emptyState.hidden = true;
-    setStandardStatus("任务已创建", "正在等待独立临时检出。", { active: true, kind: "active" });
+    setStandardStatus("任务已创建", "正在读取 SVN 上的文件。", { active: true, kind: "active" });
     setStandardStage("checkout");
     showNotice("标准文件任务已创建，正在生成安全预览。", "success");
     scheduleStandardPoll(250);
@@ -865,7 +865,7 @@ function renderStandardPreview(preview, task) {
     return;
   }
   standardState.previewSignature = previewSignature;
-  standardElements.previewRevision.textContent = task.checkout_revision ? `基于 r${task.checkout_revision}` : "版本待确认";
+  standardElements.previewRevision.textContent = task.checkout_revision ? `基于版本 r${task.checkout_revision}` : "版本待确认";
   renderStandardSummary(preview.summary);
   standardElements.previewItems.replaceChildren();
   preview.items.forEach((item) => {
@@ -927,10 +927,10 @@ function renderStandardResult(task) {
   standardState.resultUrls = [];
   const cleanupStatus = task.cleanup?.status || "pending";
   const cleanupText = cleanupStatus === "cleaned"
-    ? "临时工作副本和独立认证配置已清理。"
+    ? "服务器上的临时文件已清理。"
     : (cleanupStatus === "failed"
-      ? "临时目录清理暂未完成，后台会继续安全重试。"
-      : "临时目录正在等待后台清理。");
+      ? "临时文件清理未完成，后台会继续重试。"
+      : "临时文件正在清理中。");
   if (task.status === "committed") {
     standardElements.result.dataset.kind = "success";
     standardElements.resultMark.textContent = "✓";
@@ -961,7 +961,7 @@ function renderStandardResult(task) {
     standardElements.resultMark.textContent = "?";
     standardElements.resultTitle.textContent = "提交结果需要核验";
     const unknownCleanupText = cleanupStatus === "pending"
-      ? "用于核验的临时目录最多保留 1 小时，之后自动清理。"
+      ? "相关文件会保留 1 小时以便你核对，之后自动清理。"
       : cleanupText;
     standardElements.resultMessage.textContent = `${task.error?.message || "请勿重复提交，并在 SVN 日志中核验本次提交说明。"} ${unknownCleanupText}`;
     const markerLine = document.createElement("p");
@@ -972,7 +972,7 @@ function renderStandardResult(task) {
     standardElements.result.dataset.kind = cancelled ? "neutral" : "error";
     standardElements.resultMark.textContent = cancelled ? "×" : "!";
     standardElements.resultTitle.textContent = cancelled ? "任务已取消" : "任务未完成";
-    const baseMessage = task.error?.message || "临时任务已停止，没有再次发起 SVN 提交。";
+    const baseMessage = task.error?.message || "任务已停止，没有向 SVN 提交任何内容。";
     standardElements.resultMessage.textContent = `${baseMessage} ${cleanupText}`;
   }
 }
@@ -986,7 +986,7 @@ function renderStandardTask(task) {
   const detail = task.error?.message || (
     task.status === "preview_ready"
       ? (task.can_commit ? "预览已固定，核对后可进行一次性提交。" : "预览存在阻塞项，当前不能提交。")
-      : "任务在独立临时目录中运行。"
+      : "任务正在服务器上执行。"
   );
   setStandardStatus(task.stage_label, detail, {
     active,
@@ -1061,7 +1061,7 @@ async function cancelStandardTask() {
     );
     standardState.task = data.task;
     renderStandardTask(data.task);
-    showNotice("取消请求已发送，临时目录会安全清理。", "success");
+    showNotice("已取消，服务器上的临时文件会自动清理。", "success");
     schedulePollForStandardTask(data.task, 600);
   } catch (error) {
     showNotice(error.message, "error");
@@ -1484,6 +1484,7 @@ const svnDialogElements = {
   saveButton: document.querySelector("#svnSaveButton"),
   clearButton: document.querySelector("#svnClearButton"),
   closeButton: document.querySelector("#svnCloseButton"),
+  togglePassword: document.querySelector("#svnTogglePassword"),
 };
 
 function showAuthError(message, control) {
@@ -1600,15 +1601,32 @@ async function submitLogout() {
   showNotice("已退出登录。", "success");
 }
 
-function openSvnDialog() {
+async function openSvnDialog() {
   svnDialogElements.error.hidden = true;
   svnDialogElements.dialog.hidden = false;
   const user = authState.user;
   svnDialogElements.username.value = user?.svn_username || "";
   svnDialogElements.password.value = "";
   svnDialogElements.status.textContent = user?.has_svn_credentials
-    ? `已保存 SVN 账号：${user.svn_username}` : "尚未保存 SVN 账号。";
+    ? "正在读取已保存的凭据…" : "尚未保存 SVN 账号。";
   svnDialogElements.username.focus();
+  if (!user?.has_svn_credentials) return;
+  // 密码只由这个专用接口返回，/me 与保存接口都不含它
+  try {
+    const data = await requestJson("GET", "/api/v1/auth/svn-credentials", null);
+    svnDialogElements.username.value = data.svn_username || "";
+    svnDialogElements.password.value = data.svn_password || "";
+    svnDialogElements.status.textContent = "以下为当前已保存的凭据，可直接修改后保存。";
+  } catch (error) {
+    svnDialogElements.status.textContent = "读取已保存凭据失败：" + error.message;
+  }
+}
+
+function toggleSvnPasswordVisibility() {
+  const field = svnDialogElements.password;
+  const hidden = field.type === "password";
+  field.type = hidden ? "text" : "password";
+  svnDialogElements.togglePassword.textContent = hidden ? "隐藏" : "显示";
 }
 
 function closeSvnDialog() {
@@ -1663,6 +1681,7 @@ authElements.svnButton.addEventListener("click", openSvnDialog);
 svnDialogElements.form.addEventListener("submit", submitSvnCredentials);
 svnDialogElements.clearButton.addEventListener("click", clearSvnCredentials);
 svnDialogElements.closeButton.addEventListener("click", closeSvnDialog);
+svnDialogElements.togglePassword.addEventListener("click", toggleSvnPasswordVisibility);
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && !svnDialogElements.dialog.hidden) closeSvnDialog();
 });

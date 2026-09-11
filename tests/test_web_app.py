@@ -279,7 +279,9 @@ class WebAppApiTest(unittest.TestCase):
         client.post("/api/v1/auth/logout")
         self.assertFalse(client.get("/api/v1/auth/me").json()["authenticated"])
 
-    def test_svn_credentials_are_stored_and_never_returned(self):
+    def test_svn_password_only_comes_back_from_the_dedicated_endpoint(self):
+        """弹窗需要明文回显，但仅限本人主动请求的专用接口；
+        /me 与保存接口每次加载页面都会调用，必须不含密码。"""
         client = TestClient(app)
         client.post("/api/v1/auth/register",
                     json={"username": "creduser", "password": "correct-horse"})
@@ -294,11 +296,45 @@ class WebAppApiTest(unittest.TestCase):
         self.assertTrue(saved.json()["user"]["has_svn_credentials"])
         self.assertEqual(saved.json()["user"]["svn_username"], "svc")
 
-        # /me 同样不得回传密码
+        # /me 不得回传密码
         self.assertNotIn("svn-secret-value", client.get("/api/v1/auth/me").text)
+
+        # 专用接口回显本人凭据
+        read = client.get("/api/v1/auth/svn-credentials")
+        self.assertEqual(read.status_code, 200)
+        self.assertEqual(read.json()["svn_username"], "svc")
+        self.assertEqual(read.json()["svn_password"], "svn-secret-value")
+        self.assertTrue(read.json()["configured"])
 
         cleared = client.delete("/api/v1/auth/svn-credentials")
         self.assertFalse(cleared.json()["user"]["has_svn_credentials"])
+        empty = client.get("/api/v1/auth/svn-credentials")
+        self.assertFalse(empty.json()["configured"])
+        self.assertEqual(empty.json()["svn_password"], "")
+
+    def test_svn_password_endpoint_never_leaks_another_users_credentials(self):
+        """只能拿到自己的：会话决定身份，请求体无法指定他人。"""
+        owner = TestClient(app)
+        owner.post("/api/v1/auth/register",
+                   json={"username": "owner1", "password": "correct-horse"})
+        owner.post("/api/v1/auth/login",
+                   json={"username": "owner1", "password": "correct-horse"})
+        owner.put("/api/v1/auth/svn-credentials",
+                  json={"svn_username": "owner-svc", "svn_password": "owner-only-secret"})
+
+        other = TestClient(app)
+        other.post("/api/v1/auth/register",
+                   json={"username": "other1", "password": "correct-horse"})
+        other.post("/api/v1/auth/login",
+                   json={"username": "other1", "password": "correct-horse"})
+        response = other.get("/api/v1/auth/svn-credentials")
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("owner-only-secret", response.text)
+        self.assertFalse(response.json()["configured"])
+
+        # 未登录一律 401
+        anon = TestClient(app).get("/api/v1/auth/svn-credentials")
+        self.assertEqual(anon.status_code, 401)
 
     def test_svn_action_requires_saved_credentials_first(self):
         client = TestClient(app)
