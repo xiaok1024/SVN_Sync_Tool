@@ -120,14 +120,21 @@ Web 版当前包含三个相互隔离的工作区（顺序与页面导航一致�
 - **SVN 标准文件提交**（02）：每个任务先读取客户 SVN 检出根的最新 HEAD，并将其固定为数字 revision；随后创建独立稀疏工作副本、匹配客户标准目录、覆盖并生成 `svn status` 预览。用户二次确认后才精确提交本次路径，成功后立即删除工作副本和独立 SVN 配置。失败、取消或 15 分钟未确认的任务也会清理，后台每 15 秒检查一次到期状态。
 - **升级清单提取**（03）：直接复用 `upgrade_list_core.py`。服务端不读取主机剪贴板、不保存输入和生成结果；主动点击下载时，浏览器才会保存 Markdown。
 
-标准文件工作区支持两个固定来源，都只接受各自共享根下四段、以 `ecology` 结尾的目录，不能填写其他服务器、本机绝对路径或任意共享：
+标准文件工作区按**角色**分两个来源，每个角色有各自的共享白名单。所有共享都只接受四段、以 `ecology` 结尾的目录，不能填写白名单外的服务器、本机绝对路径或任意共享：
 
-| 来源 | 共享根 | 目录格式 | 清单可否留空 |
+| 角色 | 共享根 | 目录格式 | 清单可否留空 |
 |------|--------|----------|--------------|
-| 标准文件共享 | `\\192.168.7.215\ECOLOGY_customer` | `分组\客户\QC编号\ecology` | 可以，勾选确认后覆盖 SVN 与来源的全部交集 |
-| 历史文件共享 | `\\192.168.7.108\ECOLOGY_customer` | `分组\客户\目录\ecology`（如 `Z\Z中电投资\历史文件\ecology`） | **必须提供文件清单** |
+| **标准文件** | `\\192.168.7.215\ECOLOGY_customer` | `分组\客户\QC编号\ecology` | 可以，勾选确认后覆盖 SVN 与来源的全部交集 |
+| **历史文件**（三台主机共九个共享） | `\\192.168.7.108\ECOLOGY_customer`<br>`\\192.168.7.173\ecology-customer`、`ecology-customer2`<br>`\\192.168.7.106\客户升级记录{a-e,f-i,j-n,o-s,s上海,t-z}` | `分组\客户\历史文件\ecology`<br>`.106` 形如 `ECOLOGY_customer\S上海某客户\历史文件\ecology`，同为四段 | **必须提供文件清单** |
 
-只有标准文件共享允许「清单留空 = 覆盖全部交集」：它的内容经过标准化管控，而历史文件共享不受此约束，留空可能把大量非预期文件覆盖进客户仓库。该策略由共享根前缀推导，不能通过配置绕过。历史共享用 `SVN_SYNC_WEB_HISTORICAL_PATH`、`SVN_SYNC_WEB_HISTORICAL_UNC_PREFIX` 和 `SVN_SYNC_WEB_HISTORICAL_LABEL` 配置。SMB 账号由服务端统一管理，浏览器不会接收或返回 SMB 凭据。
+关于这两个来源的几点约定：
+
+- **服务端不内置客户到主机的映射**。某个客户落在哪台历史主机、哪个共享，无法按首字母或任何规律推断，必须由使用者填写完整路径（来源是各任务的 `customer-env-info.md`）。服务只校验「主机+共享在白名单内、路径形状合法」。
+- **只有标准文件共享允许「清单留空 = 覆盖全部交集」**。它是源 KB 到目标 KB 的差异包，内容经过标准化管控；历史文件共享不受此约束，留空可能把大量非预期文件覆盖进客户仓库。该策略由共享根前缀推导，不能通过配置绕过。
+- **凭据按角色分两组**（`[standard]` / `[history]`），三台历史主机共用同一套 history 账号。SMB 账号由服务端统一管理，浏览器不会接收或返回 SMB 凭据。
+- 标准文件共享是**差异包而非完整产品树**：某个类没变化就不在包里，不能据此判断"标准产品没有这个文件"。
+
+配置项：`SVN_SYNC_WEB_MOUNT_ROOT` 指向挂载根（推荐，多共享时按 `<根>/<主机>/<共享>` 推导）；单共享场景仍可用 `SVN_SYNC_WEB_STANDARD_PATH` / `SVN_SYNC_WEB_HISTORICAL_PATH` 直接指定本地路径。
 
 ### 安装独立 Web 环境
 
@@ -191,6 +198,27 @@ cd /opt/svn-sync-tool && python3 -m venv .venv-web
 systemd 单元 `/etc/systemd/system/svn-sync-web.service` 以 root 运行，`Restart=always`
 并已 `enable` 开机自启；日志走 journald（`journalctl -u svn-sync-web -f`）。
 
+共享挂载（标准文件提交功能需要）：
+
+```bash
+# 凭据：按 deploy/linux/smb-credentials.example.toml 填好真实密码后放到
+#   /root/.config/svn_sync_tool/smb-credentials.toml（0600）
+# 三台历史文件主机共用同一套 [history] 账号，无需按主机拆
+
+cp deploy/linux/svn-sync-mount-shares.sh /usr/local/sbin/ && chmod 700 /usr/local/sbin/svn-sync-mount-shares.sh
+cp deploy/linux/svn-sync-mounts.{service,timer} /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now svn-sync-mounts.service svn-sync-mounts.timer
+
+svn-sync-mount-shares.sh --status    # 查看十个共享的挂载状态
+```
+
+挂载点规则是 `<SVN_SYNC_WEB_MOUNT_ROOT>/<主机>/<共享>`，与 `SourceProfile.local_root_for`
+保持一致——改其中一处必须同步改另一处，否则服务找不到已挂载的共享。
+
+`svn-sync-mounts.timer` 每 10 分钟重跑一次挂载脚本：脚本对已挂载的共享会跳过，
+所以重复执行安全，共享掉线后能自动补回。Web 服务用 `Wants=` 而非 `Requires=`
+依赖它，共享挂不上时版本号路径生成与升级清单提取仍可正常使用。
+
 几点 Linux 特有的注意：
 
 - **Python 3.10 需要 `tomli`**：`tomllib` 是 3.11+ 的标准库，`requirements-web.txt` 里带了
@@ -201,8 +229,13 @@ systemd 单元 `/etc/systemd/system/svn-sync-web.service` 以 root 运行，`Res
   `--lan` 的自动探测结果会与之合并。
 - **SMB 共享要预先挂好**：`svn_sync_core` 的自动挂载只实现了 macOS（`mount_smbfs`）
   和 Windows（UNC 直连）。Linux 上需用 `mount.cifs` 事先挂载，再把
-  `SVN_SYNC_WEB_STANDARD_PATH` / `SVN_SYNC_WEB_HISTORICAL_PATH` 指向挂载点——
-  服务命中本地路径分支后完全不会走那段平台代码。
+  `SVN_SYNC_WEB_MOUNT_ROOT` 指向挂载根——服务命中本地路径分支后完全不会走
+  那段平台代码。
+- **SMB 协议版本要能降级**：实测 `192.168.7.106` 的六个共享用 `vers=3.0` 协商失败，
+  降到 `2.1` 才挂上；`.215` / `.108` / `.173` 用 `3.0` 正常。挂载脚本按 3.0 → 2.1
+  依次尝试，不要写死单一版本，也不要降到 1.0。
+- **中文共享名必须带 `iocharset=utf8`**：`.106` 的共享名形如 `客户升级记录s上海`，
+  目录名同样大量使用中文，漏掉这个参数会乱码。
 
 需要让可信局域网内的用户访问时，使用显式局域网模式：
 

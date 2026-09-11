@@ -1,0 +1,17 @@
+[Unit]
+Description=挂载 E9 标准/历史文件 SMB 共享（供 SVN Sync Web 只读访问）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# 脚本对已挂载的共享会跳过，重复执行安全
+ExecStart=/usr/local/sbin/svn-sync-mount-shares.sh
+ExecStop=/usr/local/sbin/svn-sync-mount-shares.sh --umount
+# 部分共享挂不上时不阻断 Web 服务：版本路径与升级清单两个功能不依赖共享
+SuccessExitStatus=0 1
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

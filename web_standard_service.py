@@ -62,6 +62,24 @@ TERMINAL_STATES = {"committed", "no_changes", "failed", "expired", "cancelled", 
 DEFAULT_STANDARD_UNC_PREFIX = r"\\192.168.7.215\ECOLOGY_customer"
 DEFAULT_HISTORICAL_UNC_PREFIX = r"\\192.168.7.108\ECOLOGY_customer"
 
+# 已知共享白名单。服务只校验「主机+共享在名单内」，不内置客户落在哪台的映射——
+# 客户与主机的对应关系来自各任务的 customer-env-info.md，由调用方传完整路径。
+# 三台历史主机共用同一套 history 账号（已实测），因此凭据按角色分两组即可。
+DEFAULT_STANDARD_UNC_PREFIXES = (
+    DEFAULT_STANDARD_UNC_PREFIX,
+)
+DEFAULT_HISTORICAL_UNC_PREFIXES = (
+    DEFAULT_HISTORICAL_UNC_PREFIX,                      # Windows
+    r"\\192.168.7.173\ecology-customer",               # Samba 4.10.16
+    r"\\192.168.7.173\ecology-customer2",
+    r"\\192.168.7.106\客户升级记录a-e",                 # Windows，共享名含中文
+    r"\\192.168.7.106\客户升级记录f-i",
+    r"\\192.168.7.106\客户升级记录j-n",
+    r"\\192.168.7.106\客户升级记录o-s",
+    r"\\192.168.7.106\客户升级记录s上海",
+    r"\\192.168.7.106\客户升级记录t-z",
+)
+
 
 class StandardWebError(WebSvnError):
     """标准文件任务的业务错误；结构与其他 Web SVN 功能保持一致。"""
@@ -82,7 +100,23 @@ class SourceProfile:
     standard_path: str = ""
     historical_path: str = ""
     unc_prefix: str = DEFAULT_STANDARD_UNC_PREFIX
+    # 该角色允许的全部 \\主机\共享；留空时退化为只认 unc_prefix 一个
+    extra_unc_prefixes: tuple = ()
+    # 多共享时的本地挂载根；实际目录为 <mount_root>/<主机>/<共享>
+    mount_root: str = ""
     smb_credentials_file: str = ""
+
+    @property
+    def unc_prefixes(self):
+        """该来源允许的全部共享根，首个为默认展示值。"""
+        seen, result = set(), []
+        for value in (self.unc_prefix, *self.extra_unc_prefixes):
+            text = str(value or "").strip()
+            key = text.replace("/", "\\").rstrip("\\").lower()
+            if text and key not in seen:
+                seen.add(key)
+                result.append(text)
+        return tuple(result)
 
     @property
     def is_standard_share(self):
@@ -92,6 +126,28 @@ class SourceProfile:
         共享错配成可以覆盖全部交集。
         """
         return _same_unc_prefix(self.unc_prefix, DEFAULT_STANDARD_UNC_PREFIX)
+
+    def match_prefix(self, value):
+        """返回 ``value`` 命中的共享根；不在白名单内返回 ``None``。"""
+        normalized = unicodedata.normalize("NFC", str(value or "").strip().strip('"'))
+        normalized = normalized.replace("/", "\\").rstrip("\\").lower()
+        for prefix in self.unc_prefixes:
+            key = unicodedata.normalize("NFC", prefix).replace("/", "\\").rstrip("\\").lower()
+            if normalized == key or normalized.startswith(key + "\\"):
+                return prefix
+        return None
+
+    def local_root_for(self, prefix):
+        """把命中的共享根映射到本地目录。
+
+        配了 mount_root 时按 ``<root>/<主机>/<共享>`` 推导（挂载脚本用同一规则）；
+        否则退回单共享时代的 standard_path。
+        """
+        if self.mount_root:
+            parts = unicodedata.normalize("NFC", prefix).replace("/", "\\").strip("\\").split("\\")
+            if len(parts) >= 2:
+                return os.path.join(self.mount_root, parts[0], parts[1])
+        return self.standard_path
 
     @property
     def credentials_sections(self):
@@ -117,6 +173,9 @@ class SourceProfile:
     def available(self):
         if self.standard_path and os.path.isdir(self.standard_path):
             return True
+        if self.mount_root and any(
+                os.path.isdir(self.local_root_for(prefix)) for prefix in self.unc_prefixes):
+            return True
         return bool(self.unc_prefix and self.smb_credentials_file
                     and os.path.isfile(self.smb_credentials_file))
 
@@ -129,6 +188,7 @@ class SourceProfile:
             "has_historical": False,
             "accepts_customer_path": bool(self.unc_prefix),
             "unc_prefix": self.unc_prefix,
+            "unc_prefixes": list(self.unc_prefixes),
             "allows_cover_all": self.allows_cover_all,
             "path_hint": ("固定共享根\\分组\\客户\\QC编号\\ecology"
                           if self.is_standard_share
@@ -187,6 +247,8 @@ def load_source_profiles(environ=None):
         env.get("SVN_SYNC_WEB_STANDARD_UNC_PREFIX", DEFAULT_STANDARD_UNC_PREFIX) or "").strip()
     default_credentials_file = _discover_smb_credentials_file(
         env, allow_workspace_default=environ is None)
+    # 多共享时的本地挂载根；挂载脚本按 <root>/<主机>/<共享> 落盘，此处规则一致
+    mount_root = _configured_path(env.get("SVN_SYNC_WEB_MOUNT_ROOT"))
     if raw:
         try:
             values = json.loads(raw)
@@ -211,29 +273,31 @@ def load_source_profiles(environ=None):
             ))
     else:
         standard_path = _configured_path(env.get("SVN_SYNC_WEB_STANDARD_PATH"))
-        if standard_path or default_credentials_file:
+        if standard_path or mount_root or default_credentials_file:
             profiles.append(SourceProfile(
-                "default",
-                str(env.get("SVN_SYNC_WEB_SOURCE_LABEL", "E9 标准文件共享") or "").strip()
-                or "E9 标准文件共享",
-                standard_path,
-                "",
-                default_unc_prefix,
-                default_credentials_file,
+                profile_id="default",
+                label=str(env.get("SVN_SYNC_WEB_SOURCE_LABEL", "E9 标准文件共享")
+                          or "").strip() or "E9 标准文件共享",
+                standard_path=standard_path,
+                unc_prefix=default_unc_prefix,
+                mount_root=mount_root,
+                smb_credentials_file=default_credentials_file,
             ))
-        # 历史文件共享：另一台服务器，内容不受标准化管控，必须逐个列文件
+        # 历史文件共享：三台主机共九个共享，内容不受标准化管控，必须逐个列文件
         historical_path = _configured_path(env.get("SVN_SYNC_WEB_HISTORICAL_PATH"))
         historical_prefix = str(env.get(
             "SVN_SYNC_WEB_HISTORICAL_UNC_PREFIX", DEFAULT_HISTORICAL_UNC_PREFIX) or "").strip()
-        if historical_path or default_credentials_file:
+        if historical_path or mount_root or default_credentials_file:
             profiles.append(SourceProfile(
-                "historical",
-                str(env.get("SVN_SYNC_WEB_HISTORICAL_LABEL", "E9 历史文件共享") or "").strip()
-                or "E9 历史文件共享",
-                historical_path,
-                "",
-                historical_prefix,
-                _configured_path(
+                profile_id="historical",
+                label=str(env.get("SVN_SYNC_WEB_HISTORICAL_LABEL", "E9 历史文件共享")
+                          or "").strip() or "E9 历史文件共享",
+                standard_path=historical_path,
+                unc_prefix=historical_prefix,
+                extra_unc_prefixes=tuple(
+                    v for v in DEFAULT_HISTORICAL_UNC_PREFIXES if v != historical_prefix),
+                mount_root=mount_root,
+                smb_credentials_file=_configured_path(
                     env.get("SVN_SYNC_WEB_HISTORICAL_SMB_CREDENTIALS_FILE")
                     or default_credentials_file),
             ))
@@ -329,10 +393,10 @@ def parse_customer_standard_path(value, unc_prefix=DEFAULT_STANDARD_UNC_PREFIX,
     normalized = text.replace("/", "\\").rstrip("\\")
     if not prefix:
         raise StandardWebError("source_profile_unavailable", "服务端未配置标准共享根", 503)
-    prefix_normalized = prefix.replace("/", "\\")
+    prefix_normalized = unicodedata.normalize("NFC", prefix).replace("/", "\\").rstrip("\\")
     if not normalized.lower().startswith(prefix_normalized.lower() + "\\"):
         raise StandardWebError(
-            "customer_path_not_allowed", "客户标准文件路径不在服务端允许的固定共享根下", 403)
+            "customer_path_not_allowed", "客户目录不在服务端允许的共享根下", 403)
     suffix = normalized[len(prefix_normalized):].lstrip("\\")
     parts = suffix.split("\\")
     if (len(parts) != 4 or any(part in {"", ".", ".."} for part in parts)
@@ -360,6 +424,7 @@ class StandardJob:
     password: str | None
     profile_id: str
     source_relative: str
+    source_unc_prefix: str
     selection_mode: str
     relative_paths: list[str]
     commit_message: str
@@ -761,13 +826,16 @@ class StandardJobManager:
             raise RuntimeError("服务端 SMB 凭据配置不完整")
         return username, password
 
-    def _profile_source_root(self, profile):
-        if profile.standard_path and os.path.isdir(profile.standard_path):
-            return Path(profile.standard_path).resolve(strict=True)
+    def _profile_source_root(self, profile, unc_prefix=""):
+        # 多共享时按命中的共享根取各自挂载点；单共享沿用 standard_path。
+        prefix = unc_prefix or profile.unc_prefix
+        local_root = profile.local_root_for(prefix)
+        if local_root and os.path.isdir(local_root):
+            return Path(local_root).resolve(strict=True)
         with self._source_mount_lock:
-            if profile.standard_path and os.path.isdir(profile.standard_path):
-                return Path(profile.standard_path).resolve(strict=True)
-            unc = profile.unc_prefix.replace("/", "\\").lstrip("\\")
+            if local_root and os.path.isdir(local_root):
+                return Path(local_root).resolve(strict=True)
+            unc = prefix.replace("/", "\\").lstrip("\\")
             parts = unc.split("\\")
             if len(parts) != 2 or not all(parts):
                 raise RuntimeError("服务端固定 SMB 共享根配置不正确")
@@ -780,7 +848,7 @@ class StandardJobManager:
             self._source_mount_engine.smb_pass = password
             try:
                 mounted = self._source_mount_engine._mount_smb_macos(
-                    profile.unc_prefix, readonly=True, no_prompt=True)
+                    prefix, readonly=True, no_prompt=True)
             except Exception as exc:
                 raise RuntimeError("无法连接服务端标准文件共享") from exc
             finally:
@@ -791,7 +859,7 @@ class StandardJobManager:
             return Path(mounted).resolve(strict=True)
 
     def _customer_source_path(self, job, profile):
-        root = self._profile_source_root(profile)
+        root = self._profile_source_root(profile, getattr(job, "source_unc_prefix", ""))
         if job.source_relative == ".":
             candidate = root / "ecology" if (root / "ecology").is_dir() else root
         else:
@@ -845,11 +913,21 @@ class StandardJobManager:
         if (not message or len(message) > MAX_COMMIT_MESSAGE
                 or any(ord(char) < 32 for char in message)):
             raise StandardWebError("invalid_commit_message", "提交说明不能为空且最多 500 个字符")
-        source_relative = (
-            parse_customer_standard_path(
-                customer_standard_path, profile.unc_prefix,
+        raw_customer_path = str(customer_standard_path or "").strip()
+        if raw_customer_path:
+            # 白名单只判「主机+共享」，不内置客户落在哪台的映射；
+            # 客户与主机的对应由调用方按 customer-env-info.md 填写完整路径。
+            matched_prefix = profile.match_prefix(raw_customer_path)
+            if not matched_prefix:
+                raise StandardWebError(
+                    "customer_path_not_allowed",
+                    "客户目录不在该来源允许的共享根内", 403)
+            source_relative = parse_customer_standard_path(
+                raw_customer_path, matched_prefix,
                 require_qc_segment=profile.is_standard_share)
-            if str(customer_standard_path or "").strip() else ".")
+        else:
+            matched_prefix = profile.unc_prefix
+            source_relative = "."
         relative_paths = parse_web_file_list(file_list)
         selection_mode = "listed" if relative_paths else "intersection"
         if selection_mode == "intersection" and not profile.allows_cover_all:
@@ -876,6 +954,7 @@ class StandardJobManager:
             password=clean_password,
             profile_id=profile.profile_id,
             source_relative=source_relative,
+            source_unc_prefix=matched_prefix,
             selection_mode=selection_mode,
             relative_paths=relative_paths,
             commit_message=message,

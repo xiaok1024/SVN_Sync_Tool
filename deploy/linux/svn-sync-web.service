@@ -1,0 +1,24 @@
+[Unit]
+Description=LZR 升级工具中心（SVN Sync Web）
+Documentation=https://github.com/xiaok1024/SVN_Sync_Tool
+After=network-online.target svn-sync-mounts.service
+Wants=svn-sync-mounts.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/svn-sync-tool
+# 静态 IP 显式钉死，不依赖 /etc/hosts 的主机名映射；--lan 会在此基础上并入自动探测结果
+Environment=SVN_SYNC_WEB_ALLOWED_HOSTS=192.168.30.178,lzr-ubuntu,127.0.0.1,localhost
+Environment=PYTHONUNBUFFERED=1
+Environment=SVN_SYNC_WEB_MOUNT_ROOT=/mnt/ecology
+Environment=E9_SMB_CREDENTIALS_FILE=/root/.config/svn_sync_tool/smb-credentials.toml
+ExecStart=/opt/svn-sync-tool/.venv-web/bin/python svn_sync_web.py --lan --port 8081
+Restart=always
+RestartSec=3
+# 明文 SVN 凭据落在 /root/.config/svn_sync_tool/，随进程属主
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

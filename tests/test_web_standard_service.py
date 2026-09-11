@@ -15,6 +15,7 @@ from unittest import mock
 from svn_standard_file_core import iter_standard_file_lines, parse_file_input
 from web_standard_service import (
     DEFAULT_HISTORICAL_UNC_PREFIX,
+    DEFAULT_HISTORICAL_UNC_PREFIXES,
     DEFAULT_STANDARD_UNC_PREFIX,
     SourceProfile,
     StandardJobManager,
@@ -204,6 +205,59 @@ class HistoricalShareRulesTest(unittest.TestCase):
                 smb_credentials_file=str(creds))
             self.assertEqual(
                 StandardJobManager._read_smb_credentials(historical), ("only", "one"))
+
+    def test_history_role_covers_all_three_hosts(self):
+        """客户落在哪台主机不可推断，三台九个共享都要放行。"""
+        profile = SourceProfile(
+            "historical", "历史", unc_prefix=DEFAULT_HISTORICAL_UNC_PREFIXES[0],
+            extra_unc_prefixes=DEFAULT_HISTORICAL_UNC_PREFIXES[1:],
+            mount_root="/mnt/ecology")
+        self.assertEqual(len(profile.unc_prefixes), 9)
+        hosts = {p.strip("\\").split("\\")[0] for p in profile.unc_prefixes}
+        self.assertEqual(hosts, {"192.168.7.108", "192.168.7.173", "192.168.7.106"})
+
+    def test_match_prefix_accepts_each_known_share_and_rejects_others(self):
+        profile = SourceProfile(
+            "historical", "历史", unc_prefix=DEFAULT_HISTORICAL_UNC_PREFIXES[0],
+            extra_unc_prefixes=DEFAULT_HISTORICAL_UNC_PREFIXES[1:],
+            mount_root="/mnt/ecology")
+        cases = [
+            (r"\\192.168.7.108\ECOLOGY_customer\Z\Z中电投资\历史文件\ecology", True),
+            (r"\\192.168.7.173\ecology-customer2\Z\客户\历史文件\ecology", True),
+            # 106 的共享名含中文，且客户目录不拆分组首字母
+            (r"\\192.168.7.106\客户升级记录s上海\ECOLOGY_customer\S上海某客户\历史文件\ecology", True),
+            (r"\\192.168.7.99\ECOLOGY_customer\Z\客户\历史文件\ecology", False),
+            (r"\\192.168.7.106\客户升级记录z-z\X\客户\历史文件\ecology", False),
+            (r"\\192.168.7.215\ECOLOGY_customer\Z\客户\QC1\ecology", False),
+        ]
+        for value, allowed in cases:
+            with self.subTest(value=value):
+                self.assertEqual(bool(profile.match_prefix(value)), allowed)
+
+    def test_local_root_follows_the_mount_layout(self):
+        """挂载脚本按 <root>/<主机>/<共享> 落盘，服务必须用同一规则反查。"""
+        profile = SourceProfile(
+            "historical", "历史", unc_prefix=DEFAULT_HISTORICAL_UNC_PREFIXES[0],
+            extra_unc_prefixes=DEFAULT_HISTORICAL_UNC_PREFIXES[1:],
+            mount_root="/mnt/ecology")
+        matched = profile.match_prefix(
+            r"\\192.168.7.106\客户升级记录s上海\ECOLOGY_customer\客户\历史文件\ecology")
+        self.assertEqual(
+            profile.local_root_for(matched),
+            "/mnt/ecology/192.168.7.106/客户升级记录s上海")
+
+    def test_four_segment_shape_holds_across_all_history_hosts(self):
+        """三台的层级都是四段以 ecology 结尾，校验规则可以统一。"""
+        for prefix, suffix in (
+                (r"\\192.168.7.108\ECOLOGY_customer", r"\Z\Z中电投资\历史文件\ecology"),
+                (r"\\192.168.7.173\ecology-customer", r"\Z\客户\历史文件\ecology"),
+                (r"\\192.168.7.106\客户升级记录s上海",
+                 r"\ECOLOGY_customer\S上海某客户\历史文件\ecology")):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(
+                    len(parse_customer_standard_path(
+                        prefix + suffix, prefix, require_qc_segment=False).split("/")),
+                    4)
 
     def test_public_dict_exposes_the_cover_all_policy(self):
         standard = self._profile(DEFAULT_STANDARD_UNC_PREFIX).public_dict()
