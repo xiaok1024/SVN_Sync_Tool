@@ -11,7 +11,6 @@ from pathlib import Path
 from unittest import mock
 
 from svn_path_generator import build_revision_url_rows, query_revision_paths
-from web_svn_common import HostAuthSvnEngine, WebSvnError
 from web_path_service import (
     MAX_REVISIONS,
     PathQueryService,
@@ -135,8 +134,8 @@ class QueryInputSafetyTest(unittest.TestCase):
     def _query(self, **kwargs):
         payload = {
             "svn_url": "https://svn.example.com/svn/customer/ecology",
-            "username": "",
-            "password": "",
+            "username": "demo",
+            "password": "demo-password",
             "revision_spec": "123",
             "sort": "rev",
         }
@@ -158,7 +157,7 @@ class QueryInputSafetyTest(unittest.TestCase):
             require_password_stdin=False,
         )
         with self.assertRaises(PathWebError) as caught:
-            service.query(svn_url="https://other.example.com/svn/R", username="",
+            service.query(svn_url="https://other.example.com/svn/R", username="demo",
                           password="", revision_spec="1", sort="rev")
         self.assertEqual(caught.exception.code, "svn_url_not_allowed")
         self.assertEqual(caught.exception.status_code, 403)
@@ -171,33 +170,14 @@ class QueryInputSafetyTest(unittest.TestCase):
             self._query(username="demo", password="secret\nmore")
         self.assertEqual(password.exception.code, "invalid_password")
 
-    def test_partial_credentials_are_rejected(self):
-        for username, password in (("demo", ""), ("  ", "secret"), ("", "secret")):
+    def test_credentials_must_be_supplied_in_full(self):
+        """查询一律使用登录人的凭据，不再有「留空走主机缓存」这条路。"""
+        for username, password in (("demo", ""), ("  ", "secret"), ("", "secret"), ("", "")):
             with self.assertRaises(PathWebError) as caught:
                 self._query(username=username, password=password)
             self.assertEqual(caught.exception.code, "incomplete_credentials")
 
-    def test_blank_credentials_use_host_auth_cache(self):
-        used = {}
-
-        class RecordingHostEngine(HostAuthSvnEngine):
-            def _run_svn_bytes(self, *args, **kwargs):
-                used["args"] = args
-                return 0, "<log/>"
-
-        service = PathQueryService(
-            temp_root=Path(self.temp.name, "hostcache"),
-            host_engine_factory=RecordingHostEngine,
-            require_password_stdin=False,
-        )
-        result = service.query(svn_url="https://svn.example.com/svn/R", username="",
-                               password="", revision_spec="123", sort="rev")
-        self.assertEqual(result["auth_mode"], "host-cache")
-        self.assertEqual(used["args"][0], "log")
-        # 主机缓存分支不接收凭据，因此不需要（也不应留下）临时配置目录
-        self.assertEqual(list(service.temp_root.iterdir()), [])
-
-    def test_supplied_credentials_stay_isolated_from_host_cache(self):
+    def test_credentials_run_in_an_isolated_config_dir(self):
         seen = {}
 
         class RecordingEngine:
@@ -216,32 +196,12 @@ class QueryInputSafetyTest(unittest.TestCase):
             engine_factory=RecordingEngine,
             require_password_stdin=False,
         )
-        result = service.query(svn_url="https://svn.example.com/svn/R", username="demo",
-                               password="secret", revision_spec="1", sort="rev")
-        self.assertEqual(result["auth_mode"], "supplied")
+        service.query(svn_url="https://svn.example.com/svn/R", username="demo",
+                      password="secret", revision_spec="1", sort="rev")
         self.assertEqual(seen["username"], "demo")
         self.assertIn("query-", str(seen["config_dir"]))
         self.assertTrue(seen["released"])
         self.assertEqual(list(service.temp_root.iterdir()), [])
-
-    def test_host_auth_cache_can_be_disabled_server_side(self):
-        service = PathQueryService(
-            temp_root=Path(self.temp.name, "nohost"),
-            allow_host_auth_cache=False,
-            require_password_stdin=False,
-        )
-        with self.assertRaises(PathWebError) as caught:
-            service.query(svn_url="https://svn.example.com/svn/R", username="",
-                          password="", revision_spec="1", sort="rev")
-        self.assertEqual(caught.exception.code, "host_auth_cache_disabled")
-        self.assertEqual(caught.exception.status_code, 403)
-
-    def test_environment_flag_controls_host_auth_cache(self):
-        self.assertTrue(PathQueryService.from_environment({}).allow_host_auth_cache)
-        for value in ("0", "false", "no", "off", "FALSE"):
-            service = PathQueryService.from_environment(
-                {"SVN_SYNC_WEB_ALLOW_HOST_SVN_CACHE": value})
-            self.assertFalse(service.allow_host_auth_cache, value)
 
     def test_rejects_query_when_svn_cannot_take_password_from_stdin(self):
         service = PathQueryService(
@@ -399,7 +359,7 @@ class QueryAgainstLocalRepositoryTest(unittest.TestCase):
         cls.temp.cleanup()
 
     def test_single_revision_builds_full_urls_with_version_suffix(self):
-        result = self.service.query(svn_url=self.repo_url, username="", password="",
+        result = self.service.query(svn_url=self.repo_url, username="local", password="local",
                                     revision_spec="3", sort="rev")
         self.assertEqual(result["stats"]["file_count"], 1)
         self.assertEqual(result["stats"]["matched_revisions"], [3])
@@ -408,7 +368,7 @@ class QueryAgainstLocalRepositoryTest(unittest.TestCase):
             "%s/trunk/src/weaver/Beta.java(V3)" % self.repo_url)
 
     def test_range_query_decodes_chinese_paths_and_sorts_by_revision(self):
-        result = self.service.query(svn_url=self.repo_url, username="", password="",
+        result = self.service.query(svn_url=self.repo_url, username="local", password="local",
                                     revision_spec="2-3", sort="rev")
         lines = result["text"].splitlines()
         self.assertEqual(result["stats"]["revision_count"], 2)
@@ -419,7 +379,7 @@ class QueryAgainstLocalRepositoryTest(unittest.TestCase):
 
     def test_sort_modes_match_the_shared_pure_logic(self):
         for sort_key in ("rev", "path", "name"):
-            web = self.service.query(svn_url=self.repo_url, username="", password="",
+            web = self.service.query(svn_url=self.repo_url, username="local", password="local",
                                      revision_spec="2,3", sort=sort_key)
             results, errors = query_revision_paths(self.repo_url, "2,3")
             self.assertEqual(errors, [])
@@ -428,41 +388,16 @@ class QueryAgainstLocalRepositoryTest(unittest.TestCase):
             self.assertEqual([row["url"] for row in web["rows"]], expected, sort_key)
 
     def test_missing_revision_is_reported_without_failing_the_query(self):
-        result = self.service.query(svn_url=self.repo_url, username="", password="",
+        result = self.service.query(svn_url=self.repo_url, username="local", password="local",
                                     revision_spec="3,900", sort="rev")
         self.assertEqual(result["stats"]["file_count"], 1)
         self.assertEqual(result["stats"]["error_count"], 1)
         self.assertIn("版本 900", result["errors"][0])
 
     def test_query_leaves_no_temporary_svn_configuration_behind(self):
-        self.service.query(svn_url=self.repo_url, username="", password="",
+        self.service.query(svn_url=self.repo_url, username="local", password="local",
                            revision_spec="2", sort="rev")
         self.assertEqual(list(self.service.temp_root.iterdir()), [])
-
-
-class HostAuthEngineTest(unittest.TestCase):
-    """主机缓存认证通道必须永远无法写入仓库。"""
-
-    def test_write_subcommands_are_refused(self):
-        engine = HostAuthSvnEngine()
-        for subcommand in ("commit", "add", "delete", "propset", "import", "checkout",
-                          "update", "mkdir", "copy", "move", "lock", "unlock"):
-            with self.assertRaises(WebSvnError, msg=subcommand) as caught:
-                engine._run_svn_bytes(subcommand, ".")
-            self.assertEqual(caught.exception.code, "read_only_engine_violation")
-            with self.assertRaises(WebSvnError, msg=subcommand):
-                engine._run_svn(None, subcommand, ".")
-
-    def test_empty_command_is_refused(self):
-        with self.assertRaises(WebSvnError):
-            HostAuthSvnEngine()._run_svn_bytes()
-
-    def test_never_carries_browser_credentials(self):
-        engine = HostAuthSvnEngine()
-        self.assertEqual(engine.svn_user, "")
-        self.assertEqual(engine.svn_pass, "")
-        self.assertFalse(str(engine.svn_config_dir or ""))
-        self.assertFalse(engine.svn_no_auth_cache)
 
 
 if __name__ == "__main__":

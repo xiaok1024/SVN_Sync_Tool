@@ -24,7 +24,6 @@ from svn_path_generator import (
 )
 from svn_sync_core import redact_sensitive_text
 from web_svn_common import (
-    HostAuthSvnEngine,
     WebSvnEngine,
     WebSvnError,
     normalize_svn_url,
@@ -137,8 +136,6 @@ class PathQueryService:
             temp_root=None,
             max_workers=2,
             engine_factory=WebSvnEngine,
-            host_engine_factory=HostAuthSvnEngine,
-            allow_host_auth_cache=True,
             allow_file_urls=False,
             require_password_stdin=True,
             max_revisions=MAX_REVISIONS,
@@ -150,8 +147,6 @@ class PathQueryService:
         self.temp_root = Path(
             temp_root or (Path(tempfile.gettempdir()) / "lzr-svn-path-queries-v1"))
         self.engine_factory = engine_factory
-        self.host_engine_factory = host_engine_factory
-        self.allow_host_auth_cache = allow_host_auth_cache
         self.allow_file_urls = allow_file_urls
         self.require_password_stdin = require_password_stdin
         self.max_revisions = max_revisions
@@ -182,11 +177,7 @@ class PathQueryService:
     @classmethod
     def from_environment(cls, environ=None):
         env = environ if environ is not None else os.environ
-        configured = str(env.get("SVN_SYNC_WEB_ALLOW_HOST_SVN_CACHE", "") or "").strip().lower()
-        return cls(
-            allowed_svn_prefixes=read_allowed_svn_prefixes(env),
-            allow_host_auth_cache=configured not in {"0", "false", "no", "off"},
-        )
+        return cls(allowed_svn_prefixes=read_allowed_svn_prefixes(env))
 
     def query(self, *, svn_url, username, password, revision_spec, sort):
         sort_key = _normalize_sort(sort)
@@ -197,15 +188,9 @@ class PathQueryService:
             username, "username", PathWebError, max_length=256)
         clean_password = validate_svn_credential(
             password, "password", PathWebError, max_length=1024)
-        use_host_cache = not clean_username and not clean_password
-        if not use_host_cache and not (clean_username and clean_password):
+        if not (clean_username and clean_password):
             raise PathWebError(
-                "incomplete_credentials",
-                "请同时填写 SVN 账号和密码；两者都留空则使用本机 SVN 缓存认证")
-        if use_host_cache and not self.allow_host_auth_cache:
-            raise PathWebError(
-                "host_auth_cache_disabled",
-                "服务端已禁用本机缓存认证，请填写 SVN 账号和密码", 403)
+                "incomplete_credentials", "请同时提供 SVN 账号和密码")
         if (clean_password and self.require_password_stdin
                 and not supports_password_from_stdin()):
             raise PathWebError(
@@ -218,22 +203,13 @@ class PathQueryService:
         if not self._slots.acquire(blocking=False):
             raise PathWebError("too_many_queries", "当前查询任务较多，请稍后再试", 429)
         try:
-            if use_host_cache:
-                # 只读查询：不接收凭据，也就没有需要隔离的临时配置目录。
-                engine = self.host_engine_factory()
-                try:
-                    return self._run_query(engine, clean_url, revisions, sort_key, "",
-                                           auth_mode="host-cache")
-                finally:
-                    engine.release_credentials()
             work_dir = Path(tempfile.mkdtemp(prefix="query-", dir=self.temp_root))
             try:
                 engine = self.engine_factory(
                     clean_username, clean_password, work_dir / "svn-config")
                 try:
                     return self._run_query(
-                        engine, clean_url, revisions, sort_key, clean_password,
-                        auth_mode="supplied")
+                        engine, clean_url, revisions, sort_key, clean_password)
                 finally:
                     engine.release_credentials()
             finally:
@@ -241,7 +217,7 @@ class PathQueryService:
         finally:
             self._slots.release()
 
-    def _run_query(self, engine, svn_url, revisions, sort_key, password, auth_mode="supplied"):
+    def _run_query(self, engine, svn_url, revisions, sort_key, password):
         deadline = time.monotonic() + self.time_budget
 
         def runner(args):
@@ -284,7 +260,6 @@ class PathQueryService:
             "ok": True,
             "mode": "query",
             "sort": sort_key,
-            "auth_mode": auth_mode,
             "svn_url": svn_url,
             "requested_revisions": revisions,
             "rows": [{"url": url, "revision": revision, "path": path}

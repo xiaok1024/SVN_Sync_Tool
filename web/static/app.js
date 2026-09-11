@@ -1353,8 +1353,7 @@ async function runPathQuery(event) {
     if (revision !== pathState.revision) return;
     applyPathResult(data, (result) => (
       `共 ${result.stats.file_count} 个文件，命中 ${result.stats.matched_revisions.length} / `
-      + `${result.stats.revision_count} 个版本（${PATH_SORT_LABELS[result.sort]}，`
-      + `${result.auth_mode === "host-cache" ? "本机缓存认证" : "我的 SVN 账号"}）。`
+      + `${result.stats.revision_count} 个版本（${PATH_SORT_LABELS[result.sort]}）。`
     ));
     if (!data.stats.file_count) {
       setPathBadge("warning", "无变更文件");

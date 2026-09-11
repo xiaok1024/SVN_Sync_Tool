@@ -95,44 +95,6 @@ def validate_svn_credential(value, field, error_type=WebSvnError, max_length=102
     return text
 
 
-READ_ONLY_SVN_SUBCOMMANDS = frozenset({
-    "log", "info", "list", "ls", "cat", "proplist", "propget", "blame",
-})
-
-
-class HostAuthSvnEngine(SyncEngine):
-    """只读查询专用：复用主机 ``~/.subversion`` 的缓存认证。
-
-    浏览器不提交任何凭据，服务端也不设置 ``--config-dir``，因此走的是运行该
-    服务的账号自己的 SVN 认证缓存。为保证这条通道永远不可能写入仓库，
-    这里用子命令白名单硬性拦截，新增写操作会直接失败而不是静默放行。
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.svn_user = ""
-        self.svn_pass = ""
-
-    def _assert_read_only(self, args):
-        if not args or str(args[0]) not in READ_ONLY_SVN_SUBCOMMANDS:
-            raise WebSvnError(
-                "read_only_engine_violation",
-                "主机缓存认证通道只允许只读 SVN 命令",
-                500,
-            )
-
-    def _run_svn(self, _log_widget, *args):
-        self._assert_read_only(args)
-        return self._run_svn_bytes(*args, timeout=180)
-
-    def _run_svn_bytes(self, *args, **kwargs):
-        self._assert_read_only(args)
-        return super()._run_svn_bytes(*args, **kwargs)
-
-    def release_credentials(self):
-        pass
-
-
 class WebSvnEngine(SyncEngine):
     """强制使用独立配置、禁用缓存并通过 stdin 传递密码。"""
 
@@ -175,8 +137,6 @@ class WebSvnEngine(SyncEngine):
 
 
 __all__ = [
-    "READ_ONLY_SVN_SUBCOMMANDS",
-    "HostAuthSvnEngine",
     "WebSvnEngine",
     "WebSvnError",
     "normalize_svn_url",
