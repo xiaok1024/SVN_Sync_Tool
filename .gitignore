@@ -32,3 +32,6 @@ outputs/*.app/
 web_users.json
 web_users.json.tmp
 *web_users*.json
+
+# 由 svn-sync-deploy 在服务器上写入的线上版本标记
+.deployed.json

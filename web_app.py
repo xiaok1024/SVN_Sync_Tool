@@ -182,6 +182,20 @@ async def _read_json(request, model_type):
         raise UpgradeWebError("invalid_field", "请求字段缺失或类型不正确") from None
 
 
+def _deploy_info():
+    """线上版本标记，由 svn-sync-deploy 发布时写入；开发机上没有该文件则为空。"""
+    path = os.environ.get("SVN_SYNC_WEB_DEPLOY_INFO") or str(PROJECT_ROOT / ".deployed.json")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {key: str(data.get(key) or "")[:120]
+            for key in ("commit", "short", "subject", "deployed_at", "by")}
+
+
 PATH_QUERY_SERVICE = PathQueryService.from_environment()
 AUTH_SERVICE = AuthService.from_environment()
 
@@ -291,7 +305,7 @@ async def index(request: Request):
     return templates.TemplateResponse(
         request=request,
         name="index.html",
-        context={"app_version": "0.2.0"},
+        context={"app_version": "0.2.0", "deployed": _deploy_info()},
     )
 
 
@@ -310,6 +324,7 @@ async def health():
         "version": "0.2.0",
         "standard_files_configured": any(
             profile["available"] for profile in profiles["profiles"]),
+        "deployed": _deploy_info(),
     }
 
 

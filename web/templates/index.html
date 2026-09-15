@@ -459,7 +459,7 @@
 
     <footer class="site-footer">
       <span>核心规则与桌面版、终端版保持一致 · SVN 写入始终二次确认</span>
-      <span>Web · v{{ app_version }}</span>
+      <span title="{% if deployed.short %}{{ deployed.subject }} · {{ deployed.deployed_at }} · {{ deployed.by }}{% endif %}">Web · v{{ app_version }}{% if deployed.short %} · {{ deployed.short }}{% endif %}</span>
     </footer>
   </main>
 

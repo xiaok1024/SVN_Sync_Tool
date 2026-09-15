@@ -125,6 +125,22 @@ class WebAppApiTest(unittest.TestCase):
             self.assertEqual(response.status_code, 200, path)
             self.assertTrue(response.content.startswith(prefix), path)
 
+    def test_deployed_commit_is_shown_in_health_and_footer(self):
+        """线上版本标记由发布脚本写入；页面与健康接口都要能看到是哪个提交。"""
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as root:
+            marker = Path(root, ".deployed.json")
+            marker.write_text(json.dumps({
+                "commit": "abc1234def", "short": "abc1234", "subject": "示例提交",
+                "deployed_at": "2026-09-15 10:00:00", "by": "tester"}), encoding="utf-8")
+            with mock.patch.dict(os.environ, {"SVN_SYNC_WEB_DEPLOY_INFO": str(marker)}):
+                health = self.client.get("/api/health").json()
+                self.assertEqual(health["deployed"]["short"], "abc1234")
+                self.assertEqual(health["deployed"]["by"], "tester")
+                self.assertIn("abc1234", self.client.get("/").text)
+            with mock.patch.dict(os.environ, {"SVN_SYNC_WEB_DEPLOY_INFO": str(Path(root, "missing"))}):
+                self.assertEqual(self.client.get("/api/health").json()["deployed"], {})
+
     def test_health_endpoint(self):
         response = self.client.get("/api/health")
         self.assertEqual(response.status_code, 200)
