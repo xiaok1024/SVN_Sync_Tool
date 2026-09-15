@@ -197,8 +197,40 @@ cd /opt/svn-sync-tool && python3 -m venv .venv-web
 
 systemd 单元 `/etc/systemd/system/svn-sync-web.service` 以 root 运行，`Restart=always`
 并已 `enable` 开机自启；日志走 journald（`journalctl -u svn-sync-web -f`）。
-`deploy-linux.sh` 用 `rsync --delete` 同步：本地删掉的文件在服务器上同样会删掉，`.venv-web`
-等排除项不受影响。
+`deploy-linux.sh`（不带参数）用 `rsync --delete` 把**本地工作区**同步过去，只用于开发中快速验证；
+正式发布走下面的 `--from-git`。
+
+### 正式发布：服务器只从 GitHub main 取代码
+
+线上必须等于 `main` 上的某个提交，而不是某人工作区里的状态。服务器上的
+`/usr/local/sbin/svn-sync-deploy`（源码在 `deploy/linux/svn-sync-deploy.sh`）负责：
+fetch main → 检出到 `/var/lib/svn-sync-deploy/releases/<commit>` → **在那里跑完整测试** →
+同步到 `/opt/svn-sync-tool` → 重启 → 健康检查；检查失败**自动回滚**到上一版。
+`requirements-web.txt` 变了才会装依赖。线上跑的是哪个提交，看页脚或 `/api/health` 的 `deployed`。
+
+```bash
+./deploy-linux.sh --from-git        # 推送 main 之后，一条命令发布（维护者）
+ssh ubuntu-root svn-sync-deploy --rollback   # 回到上一个成功发布的版本
+```
+
+**同事如何发布**（不需要登录主机）：
+
+1. 同事把自己的 SSH **公钥**（`~/.ssh/id_ed25519.pub` 一整行）发给维护者；
+2. 维护者在服务器上执行 `svn-sync-deploy-grant.sh <名字> '<公钥整行>'`（源码在
+   `deploy/linux/`）。它会创建专用账号 `svn-deploy`（锁定密码、`restrict` + 强制命令），
+   sudoers 只放行发布脚本一条命令——持钥匙的人连上来只能触发一次"发布 main"，
+   看不到主机文件、开不了 shell；`--revoke <名字>` 撤销，`--list` 查看；
+3. 同事推送 `main` 后，在自己电脑上：
+
+   ```bash
+   SVN_SYNC_DEPLOY_HOST=svn-deploy@192.168.30.178 ./deploy-linux.sh --from-git
+   # 或直接：ssh svn-deploy@192.168.30.178
+   ```
+
+   能看到测试、发布、健康检查的完整输出；测试不过线上不动。
+
+信任边界：谁能推 `main` 谁就能上线（服务以 root 运行），这与仓库本身的协作者范围一致；
+发布钥匙泄露也只能触发一次对 `main` 的发布。
 
 账号与会话（服务重启不会让大家掉线）：
 
