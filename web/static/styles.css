@@ -687,6 +687,40 @@ select:focus-visible {
   color: var(--navy);
 }
 
+.summary-filter {
+  cursor: pointer;
+}
+
+.summary-filter span {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.summary-filter input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--primary);
+}
+
+.summary-filter:has(input:not(:checked)) {
+  background: var(--surface);
+  border-style: dashed;
+}
+
+.summary-filter:focus-within {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.color-filter-hint {
+  margin: -6px 0 18px;
+  color: var(--muted-2);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
 .warning-list {
   margin-top: 12px;
 }

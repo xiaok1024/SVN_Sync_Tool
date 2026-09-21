@@ -399,9 +399,10 @@
         <div class="summary-grid" aria-label="提取结果统计">
           <div class="summary-item"><span>QC</span><strong id="qcCount">—</strong></div>
           <div class="summary-item"><span>文件</span><strong id="fileCount">—</strong></div>
-          <div class="summary-item summary-red"><span>红色</span><strong id="redCount">—</strong></div>
-          <div class="summary-item summary-dark"><span>黑色</span><strong id="blackCount">—</strong></div>
+          <label class="summary-item summary-red summary-filter"><span><input type="checkbox" id="includeRed" checked>红色</span><strong id="redCount">—</strong></label>
+          <label class="summary-item summary-dark summary-filter"><span><input type="checkbox" id="includeBlack" checked>黑色</span><strong id="blackCount">—</strong></label>
         </div>
+        <p class="color-filter-hint">仅将勾选颜色的文件生成到 Markdown，原始清单保持完整。</p>
 
         <label class="field-label" for="listInput">可编辑清单</label>
         <textarea

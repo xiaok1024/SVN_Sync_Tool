@@ -46,6 +46,8 @@ const elements = {
   fileCount: document.querySelector("#fileCount"),
   redCount: document.querySelector("#redCount"),
   blackCount: document.querySelector("#blackCount"),
+  includeRed: document.querySelector("#includeRed"),
+  includeBlack: document.querySelector("#includeBlack"),
   formatButtons: Array.from(document.querySelectorAll(".format-option")),
   stages: Array.from(document.querySelectorAll("#upgradeToolView .flow-step")),
 };
@@ -249,12 +251,20 @@ async function generateMarkdown() {
     elements.listInput.focus();
     return;
   }
+  if (!elements.includeRed.checked && !elements.includeBlack.checked) {
+    showNotice("请至少勾选红色或黑色文件。", "warning");
+    elements.includeRed.focus();
+    return;
+  }
   const listRevision = state.listRevision;
+  resetResult("正在生成 Markdown…");
   setButtonBusy(elements.generateButton, true, "正在生成…");
   try {
     const data = await postJson("/api/v1/upgrade-list/generate", {
       list_text: listText,
       format: state.format,
+      include_red: elements.includeRed.checked,
+      include_black: elements.includeBlack.checked,
     });
     if (listRevision !== state.listRevision) return;
     state.filename = data.filename;
@@ -344,6 +354,8 @@ function clearWorkspace() {
   state.sourceRevision += 1;
   state.richHtml = "";
   state.format = "md";
+  elements.includeRed.checked = true;
+  elements.includeBlack.checked = true;
   setSourceValue("");
   setSourceState("empty", "等待粘贴");
   elements.htmlFile.value = "";
@@ -429,6 +441,14 @@ elements.formatButtons.forEach((button) => {
     });
     resetResult("输出格式已切换，请重新生成。");
     setStage(2);
+  });
+});
+
+[elements.includeRed, elements.includeBlack].forEach((checkbox) => {
+  checkbox.addEventListener("change", () => {
+    state.listRevision += 1;
+    resetResult("颜色选择已变化，请重新生成 Markdown。");
+    if (!elements.listInput.disabled) setStage(2);
   });
 });
 

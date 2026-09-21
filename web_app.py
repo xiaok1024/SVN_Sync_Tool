@@ -15,7 +15,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, StrictBool, ValidationError
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -77,6 +77,8 @@ class GenerateRequest(BaseModel):
 
     list_text: str
     format: str
+    include_red: StrictBool = True
+    include_black: StrictBool = True
 
 
 class RegisterRequest(BaseModel):
@@ -471,7 +473,9 @@ async def extract(request: Request):
 async def generate(request: Request):
     current_user(request)
     payload = await _read_json(request, GenerateRequest)
-    return await run_in_threadpool(generate_upgrade_markdown, payload.list_text, payload.format)
+    return await run_in_threadpool(
+        generate_upgrade_markdown, payload.list_text, payload.format,
+        payload.include_red, payload.include_black)
 
 
 @app.post("/api/v1/revision-paths/query")

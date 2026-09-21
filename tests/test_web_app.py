@@ -204,6 +204,31 @@ class WebAppApiTest(unittest.TestCase):
         self.assertIn("浏览器校对生效", generate.json()["content"])
         self.assertEqual(generate.json()["filename"], "customer-upgrade-file-list.md")
 
+    def test_generate_color_selection_is_optional_and_filters_both_formats(self):
+        list_text = (
+            "QC123 颜色筛选 —— 门户\n"
+            "[red] $/customer/src/Red.java(V1)\n"
+            "[black] $/customer/src/Black.java(V2)\n"
+        )
+        for output_format in ("md", "ai-md"):
+            for flags, expected, excluded in (
+                    ({}, ("Red.java", "Black.java"), ()),
+                    ({"include_black": False}, ("Red.java",), ("Black.java",)),
+                    ({"include_red": False}, ("Black.java",), ("Red.java",))):
+                with self.subTest(format=output_format, flags=flags):
+                    response = self.client.post("/api/v1/upgrade-list/generate", json={
+                        "list_text": list_text, "format": output_format, **flags})
+                    self.assertEqual(response.status_code, 200)
+                    for name in expected:
+                        self.assertIn(name, response.json()["content"])
+                    for name in excluded:
+                        self.assertNotIn(name, response.json()["content"])
+        for flags in ({"include_red": False, "include_black": False},
+                      {"include_red": "false"}, {"include_black": None}):
+            response = self.client.post("/api/v1/upgrade-list/generate", json={
+                "list_text": list_text, "format": "md", **flags})
+            self.assertEqual(response.status_code, 422)
+
     def test_non_json_and_malformed_json_have_stable_errors(self):
         unsupported = self.client.post(
             "/api/v1/upgrade-list/extract",

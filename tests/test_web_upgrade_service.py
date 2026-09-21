@@ -101,6 +101,70 @@ class UpgradeWebServiceTest(unittest.TestCase):
         self.assertEqual(ai["filename"], "A客户_测试_名称-upgrade-file-list-ai.md")
         self.assertNotRegex(human["filename"], r'[<>:"/\\|?*]')
 
+    def test_color_filter_applies_before_version_merge_and_duplicate_stats(self):
+        list_text = (
+            "QC123 混合颜色 —— 门户\n"
+            "[red] $/customer/src/Shared.java(V12)\n"
+            "[red] $/customer/src/Shared.java(V12)\n"
+            "[black] $/customer/src/Shared.java(V13)\n"
+            "[black] $/customer/src/Shared.java(V13)\n"
+            "\nQC124 仅黑色 —— 门户\n"
+            "[black] $/customer/src/Black.java(V14)\n"
+        )
+        for output_format in ("md", "ai-md"):
+            with self.subTest(format=output_format):
+                red = service.generate_upgrade_markdown(
+                    list_text, output_format, include_black=False)
+                self.assertIn("Shared.java", red["content"])
+                self.assertIn("V12", red["content"])
+                self.assertNotIn("V13", red["content"])
+                self.assertNotIn("Black.java", red["content"])
+                self.assertNotIn("QC124", red["content"])
+                self.assertEqual(red["stats"]["qc"], 1)
+                self.assertEqual(red["stats"]["unique_files"], 1)
+                black = service.generate_upgrade_markdown(
+                    list_text, output_format, include_red=False)
+                self.assertNotIn("V12", black["content"])
+                self.assertIn("V13", black["content"])
+                self.assertIn("Black.java", black["content"])
+                self.assertEqual(black["stats"]["skip_black_context"], 2)
+
+    def test_color_filter_defaults_preserve_existing_output(self):
+        list_text = service.extract_upgrade_list(SAMPLE_HTML)["list_text"]
+        for output_format in ("md", "ai-md"):
+            self.assertEqual(
+                service.generate_upgrade_markdown(list_text, output_format),
+                service.generate_upgrade_markdown(list_text, output_format, True, True))
+
+    def test_color_filter_empty_selection_and_no_matching_files(self):
+        list_text = "QC123 仅红色 —— 门户\n[red] $/customer/src/A.java(V1)\n"
+        for red, black, code in ((False, False, "no_color_selected"),
+                                 (False, True, "no_matching_files")):
+            with self.subTest(code=code):
+                with self.assertRaises(service.UpgradeWebError) as raised:
+                    service.generate_upgrade_markdown(list_text, "md", red, black)
+                self.assertEqual(raised.exception.code, code)
+
+    def test_color_filter_preserves_unmarked_red_and_selected_customer(self):
+        list_text = (
+            "QC123 多客户 —— 门户\n"
+            "$/red-customer/src/A.java(V1)\n"
+            "[black] $/black-customer/src/B.java(V2)\n"
+            "[black] $/black-customer/src/C.java(V3)\n"
+        )
+        red = service.generate_upgrade_markdown(list_text, "ai-md", include_black=False)
+        self.assertEqual(red["customer"], "red-customer")
+        self.assertEqual(red["warnings"], [])
+        self.assertIn("A.java", red["content"])
+        self.assertNotIn("black-customer", red["content"])
+
+    def test_color_filter_does_not_hide_invalid_input(self):
+        with self.assertRaises(service.UpgradeWebError) as raised:
+            service.generate_upgrade_markdown(
+                "QC123 错误清单 —— 门户\n[red] $/customer/src/A.java(V1)\n"
+                "[black] 无效路径\n", "md", include_black=False)
+        self.assertEqual(raised.exception.code, "invalid_svn_url")
+
     def test_download_filename_has_a_utf8_byte_limit_and_fallback(self):
         long_customer = "客户" * 200
         long_list = (

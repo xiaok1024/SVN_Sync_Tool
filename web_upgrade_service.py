@@ -247,17 +247,36 @@ def extract_upgrade_list(html):
     }
 
 
-def generate_upgrade_markdown(list_text, output_format):
+def generate_upgrade_markdown(list_text, output_format, include_red=True, include_black=True):
     """由用户校对后的清单生成人读或 AI Markdown。"""
     _validate_text(list_text, "升级清单", MAX_LIST_BYTES)
     _validate_list_shape(list_text)
     if output_format not in {"md", "ai-md"}:
         raise UpgradeWebError("invalid_format", "输出格式只支持 md 或 ai-md")
+    if not include_red and not include_black:
+        raise UpgradeWebError("no_color_selected", "请至少勾选红色或黑色文件")
 
     try:
         entries, customer, raw_counter = core.rt_parse_txt(list_text)
     except ValueError as exc:
         raise _safe_parse_error(exc) from None
+
+    if not (include_red and include_black):
+        # 在核心合并同路径的颜色和版本前过滤，避免未选颜色的版本混入结果。
+        selected_colors = {"red"} if include_red else {"black"}
+        blocks = []
+        for block in core.rt_split_blocks(list_text):
+            lines = [line for line in block[1:]
+                     if core.rt_parse_line_marker(line)[0] in selected_colors]
+            if lines:
+                blocks.append("\n".join([block[0], *lines]))
+        list_text = "\n\n".join(blocks)
+        try:
+            entries, customer, raw_counter = core.rt_parse_txt(list_text)
+        except ValueError:
+            # 原清单已完整校验；筛选后解析不到客户表示没有可导出的客户文件。
+            raise UpgradeWebError("no_matching_files", "所选颜色没有可导出的文件") from None
+        entries = [entry for entry in entries if entry.files]
 
     stats = dict(core.rt_collect_stats(entries))
     if output_format == "md":
