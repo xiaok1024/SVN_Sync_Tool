@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -44,6 +45,7 @@ from web_svn_common import (
     read_allowed_svn_prefixes,
     supports_password_from_stdin,
 )
+from web_logging import log_event, exception_fields
 
 
 JOB_ID_RE = re.compile(r"^[a-f0-9]{32}$")
@@ -475,6 +477,10 @@ class StandardJob:
     committed_paths: list[str] = field(default_factory=list)
     error: dict | None = None
     cleanup_status: str = "pending"
+    cleanup_attempts: int = 0
+    actor: str = ""
+    request_id: str = ""
+    last_event_at: float = field(default_factory=time.monotonic, repr=False)
     cancel_requested: bool = False
     finished_at: float | None = None
     events: list[dict] = field(default_factory=list)
@@ -484,6 +490,19 @@ class StandardJob:
         self.events.append({"time": _iso(time.time()), "message": message})
         if len(self.events) > 80:
             del self.events[:-80]
+        now = time.monotonic()
+        self.diagnostic("task_event", message=message,
+                        stage_elapsed_ms=round((now - self.last_event_at) * 1000))
+        self.last_event_at = now
+
+    def diagnostic(self, event, **fields):
+        log_event(event, secrets=(self.password,), job_id=self.job_id,
+                  request_id=self.request_id, actor=self.actor, state=self.state,
+                  stage=self.stage_label, revision=self.revision,
+                  checkout_revision=self.checkout_revision, cleanup_status=self.cleanup_status,
+                  elapsed_ms=round((time.time() - self.created_at) * 1000),
+                  file_count=len(self.relative_paths),
+                  changed_count=self.preview_summary.get("changed", 0), **fields)
 
 
 class StandardJobManager:
@@ -622,7 +641,10 @@ class StandardJobManager:
 
     def _cleanup_loop(self):
         while not self._stop_event.wait(self.cleanup_interval):
-            self.cleanup_expired()
+            try:
+                self.cleanup_expired()
+            except Exception as exc:
+                log_event("cleanup_loop_failed", level=logging.ERROR, **exception_fields(exc))
 
     def _write_marker(self, job_id, job_dir, created_at):
         marker = job_dir / ".lzr-standard-job.json"
@@ -654,18 +676,36 @@ class StandardJobManager:
         return payload.get("schema") == 1 and payload.get("job_id") == job_id
 
     def _delete_job_directory(self, job):
+        if job.cleanup_status == "cleaned" and not job.job_dir.exists():
+            return True
+        job.cleanup_attempts += 1
+        started = time.monotonic()
+        job.diagnostic("cleanup_started", attempt=job.cleanup_attempts)
         if not job.job_dir.exists():
             job.cleanup_status = "cleaned"
+            job.event("服务器临时文件已清理")
+            job.diagnostic("cleanup_succeeded", attempt=job.cleanup_attempts,
+                           duration_ms=round((time.monotonic() - started) * 1000),
+                           reason="already_absent")
             return True
         if not self._safe_job_directory(job.job_id, job.job_dir):
             job.cleanup_status = "failed"
+            job.diagnostic("cleanup_failed", level=logging.ERROR,
+                           attempt=job.cleanup_attempts, reason="unsafe_job_directory")
             return False
         try:
             shutil.rmtree(job.job_dir)
-        except OSError:
+        except OSError as exc:
             job.cleanup_status = "failed"
+            job.diagnostic("cleanup_failed", level=logging.ERROR,
+                           attempt=job.cleanup_attempts,
+                           duration_ms=round((time.monotonic() - started) * 1000),
+                           **exception_fields(exc))
             return False
         job.cleanup_status = "cleaned"
+        job.event("服务器临时文件已清理")
+        job.diagnostic("cleanup_succeeded", attempt=job.cleanup_attempts,
+                       duration_ms=round((time.monotonic() - started) * 1000))
         return True
 
     def _cleanup_orphan_directories(self):
@@ -681,10 +721,16 @@ class StandardJobManager:
                 if not JOB_ID_RE.fullmatch(child.name):
                     continue
                 if self._safe_job_directory(child.name, child):
+                    started = time.monotonic()
+                    log_event("orphan_cleanup_started", job_id=child.name)
                     try:
                         shutil.rmtree(child)
-                    except OSError:
-                        pass
+                    except OSError as exc:
+                        log_event("orphan_cleanup_failed", level=logging.ERROR,
+                                  job_id=child.name, **exception_fields(exc))
+                    else:
+                        log_event("orphan_cleanup_succeeded", job_id=child.name,
+                                  duration_ms=round((time.monotonic() - started) * 1000))
 
     def _clear_credentials(self, job):
         job.password = None
@@ -715,6 +761,8 @@ class StandardJobManager:
             job.can_commit = False
             job.error = {"code": code, "message": self._safe_error_message(job, error)}
             job.finished_at = time.time()
+            job.diagnostic("task_failed", level=logging.ERROR, error_code=code,
+                           **exception_fields(error))
             job.event("任务已停止，临时目录正在清理")
             self._clear_credentials(job)
             self._delete_job_directory(job)
@@ -914,7 +962,7 @@ class StandardJobManager:
 
     def create_job(
             self, *, svn_url, username, password, profile_id, file_list, commit_message,
-            customer_standard_path="", cover_all_confirmed=False):
+            customer_standard_path="", cover_all_confirmed=False, actor="", request_id=""):
         if self.require_password_stdin and not supports_password_from_stdin():
             raise StandardWebError(
                 "svn_password_stdin_unsupported",
@@ -995,8 +1043,9 @@ class StandardJobManager:
             job_dir=job_dir,
             wc_dir=job_dir / "wc",
             config_dir=job_dir / "svn-config",
+            actor=actor or clean_username,
+            request_id=request_id,
         )
-        job.event("任务已创建，等待临时检出")
         with self._jobs_lock:
             live_count = sum(1 for current in self.jobs.values()
                              if current.state in ACTIVE_STATES)
@@ -1021,6 +1070,7 @@ class StandardJobManager:
                 except OSError:
                     pass
                 raise
+        job.event("任务已创建，等待临时检出")
         try:
             self._executor.submit(self._prepare_job, job_id)
         except RuntimeError:
@@ -1527,6 +1577,8 @@ class StandardJobManager:
                         if commit_started else self._safe_error_message(job, exc),
                     }
                     job.finished_at = time.time()
+                    job.diagnostic("commit_uncertain" if commit_started else "commit_timeout",
+                                   level=logging.ERROR, **exception_fields(exc))
                     job.event("提交结果无法确认，系统不会自动重试")
                     self._clear_credentials(job)
             except StandardWebError as exc:
@@ -1545,6 +1597,8 @@ class StandardJobManager:
                             "message": "SVN 提交已启动但结果无法确认，请勿重复提交；请在仓库日志中核验本次提交说明。",
                         }
                         job.finished_at = time.time()
+                        job.diagnostic("commit_uncertain", level=logging.ERROR,
+                                       **exception_fields(exc))
                         job.event("提交结果无法确认，系统不会自动重试")
                         self._clear_credentials(job)
                 else:

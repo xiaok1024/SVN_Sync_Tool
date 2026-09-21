@@ -496,6 +496,7 @@ const standardElements = {
   resetButton: document.querySelector("#resetStandardFormButton"),
   stateBadge: document.querySelector("#standardTaskStateBadge"),
   status: document.querySelector("#standardTaskStatus"),
+  taskReference: document.querySelector("#standardTaskReference"),
   progressBar: document.querySelector("#standardTaskProgressBar"),
   emptyState: document.querySelector("#standardTaskEmptyState"),
   previewSection: document.querySelector("#standardPreviewSection"),
@@ -619,7 +620,7 @@ function updateStandardCounters() {
 
 function setStandardStage(stage) {
   const order = ["form", "checkout", "preview", "commit", "cleanup"];
-  const activeIndex = Math.max(0, order.indexOf(stage));
+  const activeIndex = stage === "done" ? order.length : Math.max(0, order.indexOf(stage));
   standardElements.stages.forEach((item, index) => {
     item.classList.toggle("is-active", index === activeIndex);
     item.classList.toggle("is-complete", index < activeIndex);
@@ -627,6 +628,7 @@ function setStandardStage(stage) {
 }
 
 function stageForTask(task) {
+  if (task.status === "committed" && task.cleanup?.status === "cleaned") return "done";
   if (["queued", "preparing"].includes(task.status)) return "checkout";
   if (task.status === "preview_ready") return "preview";
   if (["commit_queued", "committing"].includes(task.status)) return "commit";
@@ -1053,6 +1055,8 @@ function renderStandardResult(task) {
 }
 
 function renderStandardTask(task) {
+  standardElements.taskReference.hidden = false;
+  standardElements.taskReference.textContent = `任务编号：${task.id}（反馈问题时请提供此编号）`;
   if (task.status !== "preview_ready" && standardElements.dialog.open) {
     standardElements.dialog.close();
   }
@@ -1061,7 +1065,10 @@ function renderStandardTask(task) {
   const detail = task.error?.message || (
     task.status === "preview_ready"
       ? (task.can_commit ? "预览已固定，核对后可进行一次性提交。" : "预览存在阻塞项，当前不能提交。")
-      : "任务正在服务器上执行。"
+      : (active ? "任务正在服务器上执行。"
+        : (task.cleanup?.status === "cleaned" ? "任务已结束，服务器临时文件已清理。"
+          : (task.cleanup?.status === "failed" ? "任务已结束，临时文件清理失败，后台会重试。"
+            : "任务已结束，临时文件等待清理。")))
   );
   setStandardStatus(task.stage_label, detail, {
     active,
@@ -1145,6 +1152,8 @@ async function cancelStandardTask() {
 }
 
 function releaseStandardTaskState() {
+  standardElements.taskReference.hidden = true;
+  standardElements.taskReference.textContent = "";
   window.clearTimeout(standardState.pollTimer);
   standardState.taskId = null;
   standardState.accessToken = null;

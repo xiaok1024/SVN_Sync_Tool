@@ -10,6 +10,7 @@ from pathlib import Path
 # 可信 Host 加入 TestClient 的默认主机名。
 _TEST_HOME = tempfile.mkdtemp(prefix="lzr-web-test-")
 os.environ["SVN_SYNC_WEB_USER_STORE"] = os.path.join(_TEST_HOME, "web_users.json")
+os.environ["SVN_SYNC_WEB_LOG_DIR"] = os.path.join(_TEST_HOME, "logs")
 # lzr-dev-host.local 模拟 --lan 探测到的真实主机名，用来验证大小写与端口处理
 os.environ["SVN_SYNC_WEB_ALLOWED_HOSTS"] = ",".join(
     value for value in (
@@ -38,6 +39,46 @@ SAMPLE_HTML = (
 
 @unittest.skipUnless(WEB_AVAILABLE, "需要 requirements-web.txt 中的 Web 依赖")
 class WebAppApiTest(unittest.TestCase):
+    def test_request_logging_omits_secrets_and_successful_polling(self):
+        from unittest import mock
+        with mock.patch.object(web_app, "log_event") as emit:
+            response = self.client.get("/api/health?token=private-query")
+            self.assertEqual(response.status_code, 200)
+            self.assertRegex(response.headers["x-request-id"], r"^[a-f0-9]{32}$")
+            emit.assert_not_called()
+            response = self.anonymous_client().post(
+                "/api/v1/auth/login?token=private-query",
+                json={"username": "nobody", "password": "private-password"},
+                headers={"x-lzr-job-token": "private-token", "Cookie": "secret=private-cookie"})
+            self.assertEqual(response.status_code, 401)
+            fields = emit.call_args.kwargs
+            self.assertEqual(fields["route"], "/api/v1/auth/login")
+            self.assertEqual(fields["status"], 401)
+            self.assertEqual(fields["request_id"], response.headers["x-request-id"])
+            self.assertNotIn("private-", str(emit.call_args_list))
+
+    def test_unexpected_request_error_logs_location_without_exception_message(self):
+        from unittest import mock
+        route_path = "/api/test-diagnostic-error"
+
+        async def fail():
+            raise RuntimeError("password=private-password Cookie=private-cookie")
+
+        web_app.app.add_api_route(route_path, fail)
+        try:
+            with mock.patch.object(web_app, "log_event") as emit:
+                response = self.client.get(route_path)
+                self.assertEqual(response.status_code, 500)
+                self.assertIn("x-request-id", response.headers)
+                self.assertNotIn("private-", str(emit.call_args_list))
+                failures = [call for call in emit.call_args_list if call.args[0] == "request_failed"]
+                self.assertTrue(failures)
+                self.assertEqual(failures[0].kwargs["error_type"], "RuntimeError")
+                self.assertTrue(failures[0].kwargs["frames"])
+        finally:
+            web_app.app.router.routes[:] = [route for route in web_app.app.router.routes
+                                          if getattr(route, "path", "") != route_path]
+
     @classmethod
     def setUpClass(cls):
         # 全站需登录：业务用例统一使用已登录且已保存 SVN 凭据的客户端。

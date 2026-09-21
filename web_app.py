@@ -6,6 +6,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
+import uuid
 from contextlib import asynccontextmanager
 from json import JSONDecodeError
 from pathlib import Path
@@ -18,6 +20,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, StrictBool, ValidationError
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.routing import Match
 
 from web_auth_service import (
     SESSION_COOKIE,
@@ -27,7 +30,8 @@ from web_auth_service import (
 )
 from web_upgrade_service import UpgradeWebError, extract_upgrade_list, generate_upgrade_markdown
 from web_path_service import PathQueryService, PathWebError, sort_revision_path_text
-from web_standard_service import StandardJobManager, StandardWebError
+from web_standard_service import JOB_ID_RE, StandardJobManager, StandardWebError
+from web_logging import configure_logging, log_event, exception_fields
 
 
 LOGGER = logging.getLogger("svn_sync_web")
@@ -210,11 +214,16 @@ except ValueError as exc:
 
 @asynccontextmanager
 async def lifespan(application):
+    configure_logging(commit=_deploy_info().get("commit", ""))
+    log_event("service_starting")
     application.state.standard_jobs.start()
+    log_event("service_started")
     try:
         yield
     finally:
+        log_event("service_stopping")
         application.state.standard_jobs.stop()
+        log_event("service_stopped")
 
 
 app = FastAPI(
@@ -253,6 +262,34 @@ async def reject_cross_site_requests(request, call_next):
 
 
 @app.middleware("http")
+async def record_request(request, call_next):
+    # 使用服务端生成的编号和路由模板；不落请求头、查询串、body、Cookie 或异常原文。
+    request.state.request_id = uuid.uuid4().hex
+    started = time.monotonic()
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        log_event("request_failed", level=logging.ERROR,
+                  request_id=request.state.request_id, **exception_fields(exc))
+        response = _error_response(500, "internal_error", "处理失败，请稍后重试")
+    # 查询轮询和健康检查成功时保持安静；写请求和失败请求保留记录。
+    if request.method not in {"GET", "HEAD", "OPTIONS"} or response.status_code >= 400:
+        # Host 归一化中间件复制 scope，不能依赖下游回填的 route；仅匹配已注册模板。
+        route = next((getattr(item, "path", "unmatched") for item in request.app.routes
+                      if item.matches(request.scope)[0] != Match.NONE), "unmatched")
+        log_event("request_finished",
+                  level=logging.WARNING if response.status_code >= 400 else logging.INFO,
+                  request_id=request.state.request_id,
+                  actor=getattr(request.state, "actor", ""),
+                  job_id=getattr(request.state, "job_id", ""),
+                  method=request.method, route=route, status=response.status_code,
+                  duration_ms=round((time.monotonic() - started) * 1000),
+                  error_code=getattr(request.state, "error_code", ""))
+    response.headers["X-Request-ID"] = request.state.request_id
+    return response
+
+
+@app.middleware("http")
 async def add_security_headers(request, call_next):
     response = await call_next(request)
     response.headers["Content-Security-Policy"] = (
@@ -281,6 +318,7 @@ async def add_security_headers(request, call_next):
 
 @app.exception_handler(UpgradeWebError)
 async def handle_upgrade_error(_request, exc):
+    _request.state.error_code = exc.code
     return _error_response(exc.status_code, exc.code, exc.message)
 
 
@@ -288,6 +326,7 @@ async def handle_upgrade_error(_request, exc):
 @app.exception_handler(PathWebError)
 @app.exception_handler(AuthError)
 async def handle_svn_web_error(_request, exc):
+    _request.state.error_code = exc.code
     return _error_response(exc.status_code, exc.code, exc.message)
 
 
@@ -298,7 +337,8 @@ async def handle_validation_error(_request, _exc):
 
 @app.exception_handler(Exception)
 async def handle_unknown_error(request, exc):
-    LOGGER.exception("Web request failed: %s %s", request.method, request.url.path, exc_info=exc)
+    log_event("request_failed", level=logging.ERROR,
+              request_id=getattr(request.state, "request_id", ""), **exception_fields(exc))
     return _error_response(500, "internal_error", "处理失败，请稍后重试")
 
 
@@ -351,6 +391,7 @@ def current_user(request):
     username = _session_user(request)
     if not username:
         raise AuthError("login_required", "请先登录", 401)
+    request.state.actor = username
     return username
 
 
@@ -525,7 +566,7 @@ async def create_standard_task(request: Request):
     # 提交动作一律用当前登录人保存的 SVN 账号，确保 commit 归属正确。
     svn_user, svn_pass = await run_in_threadpool(
         request.app.state.auth.get_svn_credentials, username)
-    return await run_in_threadpool(
+    result = await run_in_threadpool(
         request.app.state.standard_jobs.create_job,
         svn_url=payload.svn_url,
         username=svn_user,
@@ -535,12 +576,17 @@ async def create_standard_task(request: Request):
         file_list=payload.file_list,
         cover_all_confirmed=payload.cover_all_confirmed,
         commit_message=payload.commit_message,
+        actor=username,
+        request_id=getattr(request.state, "request_id", ""),
     )
+    request.state.job_id = result["task"]["id"]
+    return result
 
 
 @app.get("/api/v1/standard-files/tasks/{job_id}")
 async def get_standard_task(request: Request, job_id: str):
     current_user(request)
+    request.state.job_id = job_id if JOB_ID_RE.fullmatch(job_id) else ""
     return await run_in_threadpool(
         request.app.state.standard_jobs.snapshot, job_id, _job_token(request))
 
@@ -548,6 +594,7 @@ async def get_standard_task(request: Request, job_id: str):
 @app.post("/api/v1/standard-files/tasks/{job_id}/commit", status_code=202)
 async def commit_standard_task(request: Request, job_id: str):
     current_user(request)
+    request.state.job_id = job_id if JOB_ID_RE.fullmatch(job_id) else ""
     token = _job_token(request)
     payload = await _read_json(request, StandardCommitRequest)
     return await run_in_threadpool(
@@ -562,5 +609,6 @@ async def commit_standard_task(request: Request, job_id: str):
 @app.delete("/api/v1/standard-files/tasks/{job_id}")
 async def cancel_standard_task(request: Request, job_id: str):
     current_user(request)
+    request.state.job_id = job_id if JOB_ID_RE.fullmatch(job_id) else ""
     return await run_in_threadpool(
         request.app.state.standard_jobs.cancel, job_id, _job_token(request))

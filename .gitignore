@@ -35,3 +35,6 @@ web_users.json.tmp
 
 # 由 svn-sync-deploy 在服务器上写入的线上版本标记
 .deployed.json
+
+# Web 诊断日志必须存放在部署目录之外
+web.jsonl*
