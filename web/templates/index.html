@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="本地升级工具中心：版本号路径生成、SVN 标准文件提交、升级清单提取。">
   <title>升级工具中心</title>
-  <link rel="icon" href="{{ url_for('static', path='/favicon.svg') }}" type="image/svg+xml">
-  <link rel="icon" href="{{ url_for('static', path='/favicon-32.png') }}" type="image/png" sizes="32x32">
-  <link rel="apple-touch-icon" href="{{ url_for('static', path='/apple-touch-icon.png') }}">
+  <link rel="icon" href="{{ url_for('static', path='/favicon.svg') }}?v=sync-2" type="image/svg+xml">
+  <link rel="icon" href="{{ url_for('static', path='/favicon-32.png') }}?v=sync-2" type="image/png" sizes="32x32">
+  <link rel="apple-touch-icon" href="{{ url_for('static', path='/apple-touch-icon.png') }}?v=sync-2">
   <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}">
   <script src="{{ url_for('static', path='/app.js') }}" defer></script>
 </head>
@@ -16,7 +16,7 @@
 
   <aside class="sidebar" aria-label="工具与账号">
       <a class="brand" href="/" aria-label="升级工具中心首页">
-        <span class="brand-symbol" aria-hidden="true"><span></span></span>
+        <img class="brand-symbol" src="{{ url_for('static', path='/favicon.svg') }}?v=sync-2" width="34" height="34" alt="">
         <span class="brand-copy">
           <strong>升级工具中心</strong>
           <small>SVN SYNC TOOL</small>
@@ -38,7 +38,7 @@
       </a>
     </nav>
     <div class="sidebar-bottom">
-      <div class="sidebar-caption"><span class="sidebar-monogram">LZR</span><span>升级辅助工具<br><small>Web workspace</small></span></div>
+      <div class="sidebar-caption"><span>Web workspace</span><span aria-hidden="true">·</span><span class="sidebar-monogram">by LZR</span></div>
       <div class="account-area" id="accountArea" hidden>
         <div class="account-identity">
           <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="8" r="3"/><path d="M5 21v-2a7 7 0 0 1 14 0v2"/></svg>
@@ -492,7 +492,7 @@
   <div class="gate auth-gate" id="authGate" role="dialog" aria-modal="true" aria-labelledby="authTitle" hidden>
     <div class="gate-card">
       <div class="gate-brand">
-        <span class="brand-symbol" aria-hidden="true"><span></span></span>
+        <img class="brand-symbol" src="{{ url_for('static', path='/favicon.svg') }}?v=sync-2" width="34" height="34" alt="">
         <div>
           <strong>升级工具中心</strong>
           <small>SVN SYNC TOOL</small>
