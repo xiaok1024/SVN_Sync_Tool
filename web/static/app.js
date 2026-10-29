@@ -529,9 +529,9 @@ const standardElements = {
 
 /** 键的顺序即导航顺序；第一项同时是无 hash 时的默认工具。 */
 const TOOLS = {
-  path: { hash: "#revision-paths", title: "#path-page-title" },
-  standard: { hash: "#svn-standard", title: "#standard-page-title" },
-  upgrade: { hash: "#upgrade-list", title: "#page-title" },
+  path: { hash: "#revision-paths", title: "#path-page-title", name: "版本号路径生成" },
+  standard: { hash: "#svn-standard", title: "#standard-page-title", name: "SVN 标准文件提交" },
+  upgrade: { hash: "#upgrade-list", title: "#page-title", name: "升级清单提取" },
 };
 const DEFAULT_TOOL = Object.keys(TOOLS)[0];
 
@@ -553,6 +553,8 @@ function selectTool(tool, focusTitle = false) {
     }
   });
   const desiredHash = TOOLS[selected].hash;
+  document.querySelector("#currentToolName").textContent = TOOLS[selected].name;
+  document.title = `${TOOLS[selected].name} · 升级工具中心`;
   if (window.location.hash !== desiredHash) history.replaceState(null, "", desiredHash);
   if (focusTitle) {
     document.querySelector(TOOLS[selected].title)?.focus({ preventScroll: true });
@@ -563,7 +565,10 @@ standardElements.toolLinks.forEach((link) => {
   link.addEventListener("click", (event) => {
     event.preventDefault();
     selectTool(link.dataset.toolLink, true);
-    window.scrollTo({ top: 0, behavior: "smooth" });
+    window.scrollTo({
+      top: 0,
+      behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth",
+    });
   });
 });
 
@@ -1429,7 +1434,7 @@ async function runPathQuery(event) {
 
 async function runPathSort() {
   if (!pathElements.output.value.trim()) {
-    showPathError("请先查询，或在下方粘贴已有的 (V版本) 路径。", pathElements.output);
+    showPathError("请先查询，或在结果区粘贴已有的 (V版本) 路径。", pathElements.output);
     return;
   }
   const revision = (pathState.revision += 1);
@@ -1561,6 +1566,16 @@ const svnDialogElements = {
   closeButton: document.querySelector("#svnCloseButton"),
   togglePassword: document.querySelector("#svnTogglePassword"),
 };
+let svnDialogReturnFocus = null;
+
+// 两个覆盖层共用背景隔离，避免键盘进入弹窗后面的表单。
+function syncOverlayState() {
+  const svnOpen = !svnDialogElements.dialog.hidden;
+  const overlayOpen = !authElements.gate.hidden || svnOpen;
+  document.querySelector(".sidebar").inert = overlayOpen;
+  document.querySelector(".main-shell").inert = overlayOpen;
+  authElements.gate.inert = svnOpen;
+}
 
 function showAuthError(message, control) {
   authElements.error.textContent = message;
@@ -1577,6 +1592,9 @@ function selectAuthTab(which) {
   const login = which === "login";
   authElements.tabLogin.setAttribute("aria-selected", String(login));
   authElements.tabRegister.setAttribute("aria-selected", String(!login));
+  authElements.tabLogin.tabIndex = login ? 0 : -1;
+  authElements.tabRegister.tabIndex = login ? -1 : 0;
+  document.querySelector("#authTitle").textContent = login ? "登录工作台" : "创建站点账号";
   authElements.loginForm.hidden = !login;
   authElements.registerForm.hidden = login;
   clearAuthError();
@@ -1590,6 +1608,11 @@ function applyUser(user) {
   authElements.gate.hidden = signedIn;
   authElements.accountArea.hidden = !signedIn;
   document.body.classList.toggle("is-gated", !signedIn);
+  if (!signedIn) {
+    svnDialogElements.dialog.hidden = true;
+    svnDialogElements.password.value = "";
+  }
+  syncOverlayState();
   if (signedIn) {
     // 来源列表需要登录才能读取，因此在登录成功后（含刷新页面时的会话恢复）再拉取
     if (!wasSignedIn) loadStandardProfiles();
@@ -1597,6 +1620,9 @@ function applyUser(user) {
     authElements.svnButton.textContent = user.has_svn_credentials
       ? "我的 SVN 账号" : "我的 SVN 账号 · 待设置";
     authElements.svnButton.classList.toggle("needs-attention", !user.has_svn_credentials);
+    if (!wasSignedIn) {
+      document.querySelector(TOOLS[toolFromHash(window.location.hash)].title)?.focus({ preventScroll: true });
+    }
   } else {
     selectAuthTab("login");
   }
@@ -1678,7 +1704,9 @@ async function submitLogout() {
 
 async function openSvnDialog() {
   svnDialogElements.error.hidden = true;
+  if (svnDialogElements.dialog.hidden) svnDialogReturnFocus = document.activeElement;
   svnDialogElements.dialog.hidden = false;
+  syncOverlayState();
   const user = authState.user;
   svnDialogElements.username.value = user?.svn_username || "";
   svnDialogElements.password.value = "";
@@ -1707,6 +1735,11 @@ function toggleSvnPasswordVisibility() {
 function closeSvnDialog() {
   svnDialogElements.dialog.hidden = true;
   svnDialogElements.password.value = "";
+  syncOverlayState();
+  if (svnDialogReturnFocus?.isConnected && !svnDialogReturnFocus.closest("[hidden], [inert]")) {
+    svnDialogReturnFocus.focus({ preventScroll: true });
+  }
+  svnDialogReturnFocus = null;
 }
 
 async function submitSvnCredentials(event) {
@@ -1749,16 +1782,46 @@ async function clearSvnCredentials() {
 
 authElements.tabLogin.addEventListener("click", () => selectAuthTab("login"));
 authElements.tabRegister.addEventListener("click", () => selectAuthTab("register"));
+[authElements.tabLogin, authElements.tabRegister].forEach((tab) => {
+  tab.addEventListener("keydown", (event) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const login = event.key === "Home" || (event.key !== "End" && tab === authElements.tabRegister);
+    selectAuthTab(login ? "login" : "register");
+    (login ? authElements.tabLogin : authElements.tabRegister).focus();
+  });
+});
 authElements.loginForm.addEventListener("submit", submitLogin);
 authElements.registerForm.addEventListener("submit", submitRegister);
 authElements.logoutButton.addEventListener("click", submitLogout);
 authElements.svnButton.addEventListener("click", openSvnDialog);
+document.querySelectorAll("[data-open-svn-account]").forEach((button) => {
+  button.addEventListener("click", openSvnDialog);
+});
 svnDialogElements.form.addEventListener("submit", submitSvnCredentials);
 svnDialogElements.clearButton.addEventListener("click", clearSvnCredentials);
 svnDialogElements.closeButton.addEventListener("click", closeSvnDialog);
 svnDialogElements.togglePassword.addEventListener("click", toggleSvnPasswordVisibility);
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && !svnDialogElements.dialog.hidden) closeSvnDialog();
+  if (event.key === "Escape" && !svnDialogElements.dialog.hidden) {
+    event.preventDefault();
+    closeSvnDialog();
+    return;
+  }
+  const overlay = !svnDialogElements.dialog.hidden ? svnDialogElements.dialog
+    : !authElements.gate.hidden ? authElements.gate : null;
+  if (event.key !== "Tab" || !overlay) return;
+  const controls = Array.from(overlay.querySelectorAll("button, input, select, textarea, a[href], [tabindex]"))
+    .filter((control) => !control.disabled && control.tabIndex >= 0 && control.getClientRects().length);
+  const first = controls[0];
+  const last = controls[controls.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last?.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first?.focus();
+  }
 });
 
 refreshSession();

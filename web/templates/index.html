@@ -14,54 +14,67 @@
 <body>
   <a class="skip-link" href="#workspace">跳到工作区</a>
 
-  <header class="site-header">
-    <div class="header-inner">
+  <aside class="sidebar" aria-label="工具与账号">
       <a class="brand" href="/" aria-label="升级工具中心首页">
         <span class="brand-symbol" aria-hidden="true"><span></span></span>
         <span class="brand-copy">
           <strong>升级工具中心</strong>
-          <small>Upgrade Toolbox</small>
+          <small>SVN SYNC TOOL</small>
         </span>
       </a>
-      <div class="header-right">
-        <div class="service-state" id="serviceState" aria-label="连接状态">
-          <span class="state-dot" aria-hidden="true"></span>
-          <span id="serviceStateText">局域网服务</span>
-        </div>
-        <div class="account-area" id="accountArea" hidden>
-          <button class="text-button" id="svnAccountButton" type="button">我的 SVN 账号</button>
+    <p class="nav-label">工作空间</p>
+    <nav class="tool-switch" aria-label="工具功能">
+      <a href="#revision-paths" data-tool-link="path" aria-current="page">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="6" cy="5" r="2.5"/><circle cx="6" cy="19" r="2.5"/><circle cx="18" cy="6" r="2.5"/><path d="M6 7.5v9M18 8.5v2A4.5 4.5 0 0 1 13.5 15H6"/></svg>
+        <span class="nav-name">版本号路径生成</span><span class="nav-index">01</span>
+      </a>
+      <a href="#svn-standard" data-tool-link="standard">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M14 3H6a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8zM14 3v5h5M8 14l3 3 5-5"/></svg>
+        <span class="nav-name">SVN 标准文件提交</span><span class="nav-index">02</span>
+      </a>
+      <a href="#upgrade-list" data-tool-link="upgrade">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/></svg>
+        <span class="nav-name">升级清单提取</span><span class="nav-index">03</span>
+      </a>
+    </nav>
+    <div class="sidebar-bottom">
+      <div class="sidebar-caption"><span class="sidebar-monogram">LZR</span><span>升级辅助工具<br><small>Web workspace</small></span></div>
+      <div class="account-area" id="accountArea" hidden>
+        <div class="account-identity">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="8" r="3"/><path d="M5 21v-2a7 7 0 0 1 14 0v2"/></svg>
           <span class="account-name" id="accountName"></span>
           <button class="text-button" id="logoutButton" type="button">退出</button>
         </div>
+        <button class="text-button account-settings" id="svnAccountButton" type="button">我的 SVN 账号</button>
+      </div>
+    </div>
+  </aside>
+
+  <div class="main-shell">
+  <header class="site-header">
+    <div class="header-inner">
+      <div class="breadcrumb"><span>工作空间</span><span aria-hidden="true">/</span><strong id="currentToolName">版本号路径生成</strong></div>
+      <div class="service-state" id="serviceState" aria-label="连接状态">
+        <span class="state-dot" aria-hidden="true"></span>
+        <span id="serviceStateText">正在连接</span>
       </div>
     </div>
   </header>
 
   <main class="site-main" id="workspace">
-    <nav class="tool-switch" aria-label="工具功能">
-      <a href="#revision-paths" data-tool-link="path" aria-current="page">
-        <span>01</span>版本号路径生成
-      </a>
-      <a href="#svn-standard" data-tool-link="standard">
-        <span>02</span>SVN 标准文件提交
-      </a>
-      <a href="#upgrade-list" data-tool-link="upgrade">
-        <span>03</span>升级清单提取
-      </a>
-    </nav>
 
     <section id="pathToolView" data-tool-view="path">
       <section class="intro path-intro" aria-labelledby="path-page-title">
         <div class="intro-copy">
-          <p class="eyebrow">REVISION PATHS · 01</p>
-          <h1 id="path-page-title" tabindex="-1">给一个版本号，拿到完整文件路径。</h1>
-          <p class="intro-description">不用逐行翻 SVN log：查询变更文件并拼好带 <code>(V版本)</code> 的完整 URL，支持三种排序。</p>
+          <p class="eyebrow">REVISION PATHS</p>
+          <h1 id="path-page-title" tabindex="-1">版本号路径生成</h1>
+          <p class="intro-description">查询 SVN 变更文件，生成带 <code>(V版本)</code> 的完整路径。</p>
         </div>
         <div class="local-note">
           <span class="local-note-icon shield-icon" aria-hidden="true"></span>
           <div>
-            <strong>只查不改</strong>
-            <span>只读取版本记录，不会改动 SVN 里的任何文件</span>
+            <strong>只读查询</strong>
+            <span>不修改仓库文件</span>
           </div>
         </div>
       </section>
@@ -70,8 +83,8 @@
         <article class="panel path-form-panel">
           <div class="panel-heading">
             <div>
-              <p class="panel-kicker">QUERY</p>
-              <h2>版本号路径生成</h2>
+              <p class="panel-kicker">01 / INPUT</p>
+              <h2>查询条件</h2>
             </div>
             <span class="readonly-tag">只读</span>
           </div>
@@ -80,20 +93,20 @@
 
           <form id="pathQueryForm" autocomplete="off" novalidate>
             <fieldset class="standard-form-section">
-              <legend>SVN 连接</legend>
+              <legend class="sr-only">仓库</legend>
               <label class="field-label" for="pathSvnUrl">SVN 仓库根地址</label>
-              <input class="text-input" id="pathSvnUrl" type="url" inputmode="url" autocapitalize="none" autocomplete="off" spellcheck="false" placeholder="http://10.1.3.12/svn/S客户开发">
-              <p class="input-help">支持中文路径。请填<strong>仓库最外层地址</strong>——生成的完整 URL 由它直接拼接，填到子目录会多出重复的一段。</p>
+              <input class="text-input" id="pathSvnUrl" type="url" inputmode="url" autocapitalize="none" autocomplete="off" spellcheck="false" placeholder="https://svn.example.com/svn/客户仓库">
+              <p class="input-help">填写仓库根地址，支持中文路径；子目录地址会导致路径重复。</p>
 
-              <p class="credential-note">使用<strong>你账号里保存的 SVN 凭据</strong>查询，无需在此填写。可在右上角「我的 SVN 账号」里查看或修改。</p>
+              <p class="credential-note">使用已保存的 SVN 账号。<button class="text-button" type="button" data-open-svn-account>管理账号 ↗</button></p>
             </fieldset>
 
             <fieldset class="standard-form-section">
-              <legend>版本号</legend>
+              <legend class="sr-only">版本号</legend>
               <label class="field-label" for="pathRevisionSpec">SVN 版本号</label>
-              <input class="text-input" id="pathRevisionSpec" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" placeholder="189-192">
+              <input class="text-input" id="pathRevisionSpec" type="text" autocomplete="off" spellcheck="false" placeholder="例如：189-192, 205">
               <div class="field-footer">
-                <span>单版本 <code>123</code>｜多个 <code>123,456</code> 或 <code>123 456</code>｜区间 <code>123-456</code>｜联合 <code>123,456-789,1000</code></span>
+                <span>逗号或空格分隔，用 <code>-</code> 连接区间。</span>
                 <output id="pathRevisionCount">0 个版本</output>
               </div>
 
@@ -103,7 +116,7 @@
                 <option value="path">按路径排序</option>
                 <option value="name">按文件名排序</option>
               </select>
-              <p class="input-help">切换排序方式后，可直接点「仅排序下方内容」重排已有结果，不会重新查询 SVN。</p>
+              <p class="input-help">已有路径可直接粘贴到结果区，选择「仅排序」即可重排，无需访问 SVN。</p>
             </fieldset>
 
             <div class="panel-actions path-form-actions">
@@ -111,17 +124,18 @@
                 <span class="button-label" data-default="查询并生成">查询并生成</span><span class="button-arrow" aria-hidden="true">→</span>
               </button>
               <button class="button button-secondary" id="pathSortButton" type="button">
-                <span class="button-label" data-default="仅排序下方内容">仅排序下方内容</span>
+                <span class="button-label" data-default="仅排序">仅排序</span>
               </button>
               <button class="button button-secondary" id="pathResetButton" type="reset">清空</button>
             </div>
+            <p class="keyboard-hint"><kbd>⌘</kbd> / <kbd>Ctrl</kbd> + <kbd>Enter</kbd><span>在版本号输入框中快速查询</span></p>
           </form>
         </article>
 
         <article class="panel path-result-panel" aria-labelledby="path-result-title">
           <div class="panel-heading">
             <div>
-              <p class="panel-kicker">OUTPUT</p>
+              <p class="panel-kicker">02 / OUTPUT</p>
               <h2 id="path-result-title" tabindex="-1">文件路径</h2>
             </div>
             <span class="task-status-badge" id="pathStateBadge" data-state="idle">尚未查询</span>
@@ -134,14 +148,21 @@
             <div class="summary-item summary-red"><span>提示</span><strong id="pathErrorCount">—</strong></div>
           </div>
 
-          <label class="field-label" for="pathResultOutput">生成的文件路径</label>
+          <div class="editor-toolbar"><label class="field-label" for="pathResultOutput">生成的文件路径</label><span>纯文本 · 可编辑</span></div>
+          <div class="path-editor-wrap">
           <textarea
             id="pathResultOutput"
             class="editor path-result-output"
             rows="18"
             spellcheck="false"
-            placeholder="查询结果会显示在这里；也可以直接粘贴已有的 (V版本) 路径，然后只做本地排序。"
+            placeholder=" "
           ></textarea>
+          <div class="editor-empty" id="pathEmptyState" aria-hidden="true">
+            <svg viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M20 17v30M44 20v7a10 10 0 0 1-10 10H20"/><circle cx="20" cy="13" r="5"/><circle cx="20" cy="51" r="5"/><circle cx="44" cy="15" r="5"/></svg>
+            <strong>等待生成文件路径</strong>
+            <span>填写仓库与版本号后开始查询<br>也可以在这里粘贴已有路径</span>
+          </div>
+          </div>
 
           <div class="warning-list" id="pathWarningList" aria-live="polite" hidden></div>
 
@@ -159,15 +180,15 @@
     <section id="standardToolView" data-tool-view="standard" hidden>
       <section class="intro standard-intro" aria-labelledby="standard-page-title">
         <div class="intro-copy">
-          <p class="eyebrow">STANDARD FILES · 02</p>
-          <h1 id="standard-page-title" tabindex="-1">在提交之前，看清每一个文件。</h1>
-          <p class="intro-description">基于 SVN 最新版本生成覆盖预览，二次确认后用你自己的账号精确提交本次路径。</p>
+          <p class="eyebrow">STANDARD FILES</p>
+          <h1 id="standard-page-title" tabindex="-1">SVN 标准文件提交</h1>
+          <p class="intro-description">匹配标准文件、预览变更，确认后提交本次路径。</p>
         </div>
         <div class="local-note">
           <span class="local-note-icon shield-icon" aria-hidden="true"></span>
           <div>
-            <strong>用你自己的账号提交</strong>
-            <span>提交记录归属到你本人，确认前不会动 SVN</span>
+            <strong>提交前二次确认</strong>
+            <span>使用你保存的 SVN 账号</span>
           </div>
         </div>
       </section>
@@ -203,7 +224,7 @@
           <div class="inline-error-summary" id="standardErrorSummary" role="alert" tabindex="-1" hidden></div>
           <div class="source-profile-alert" id="sourceProfileAlert" hidden>
             <strong>服务端尚未配置标准文件来源</strong>
-            <span>请先按 README 配置来源 Profile，网页不会接收任意本机目录。</span>
+            <span>请联系管理员配置可用的标准文件来源。</span>
           </div>
 
           <form id="standardTaskForm" autocomplete="off" novalidate>
@@ -211,9 +232,9 @@
               <legend>SVN 连接</legend>
               <label class="field-label" for="standardSvnUrl">客户 SVN 地址</label>
               <input class="text-input" id="standardSvnUrl" type="url" inputmode="url" autocapitalize="none" autocomplete="off" spellcheck="false" placeholder="https://svn.example.com/svn/customer/ecology">
-              <p class="input-help">填到 <code>ecology</code> 那一层，文件清单里的路径就是相对它的；一次只能提交一个仓库。</p>
+              <p class="input-help">地址须以 <code>ecology</code> 目录结尾，一次提交一个仓库。</p>
 
-              <p class="credential-note">将用<strong>你账号里保存的 SVN 凭据</strong>提交，提交记录显示为该账号。可在右上角「我的 SVN 账号」里查看或修改。</p>
+              <p class="credential-note">使用已保存的 SVN 账号提交。<button class="text-button" type="button" data-open-svn-account>管理账号 ↗</button></p>
             </fieldset>
 
             <fieldset class="standard-form-section">
@@ -222,10 +243,10 @@
               <select class="text-input" id="standardSourceProfile" disabled>
                 <option value="">正在读取服务端配置…</option>
               </select>
-              <p class="profile-detail" id="standardSourceProfileDetail">网页只显示配置名称，不暴露服务器真实目录。</p>
+              <p class="profile-detail" id="standardSourceProfileDetail">选择本次使用的标准文件或历史文件来源。</p>
               <label class="field-label" for="standardCustomerPath">客户来源目录</label>
               <input class="text-input" id="standardCustomerPath" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="\\192.168.7.215\ECOLOGY_customer\Y\客户名称\QC123456\ecology">
-              <p class="input-help">粘贴完整的客户 <code>ecology</code> 目录，前缀须与上方所选来源的共享根一致；可直接粘贴任务描述原文（如「标准文件请到 … 下面提取」），说明文字会自动去掉。共享账号由服务器统一管理，网页不会要求填写。</p>
+              <p class="input-help">粘贴所选共享下的客户 <code>ecology</code> 目录。也可粘贴任务描述，系统会自动去掉目录前后的说明文字。</p>
             </fieldset>
 
             <fieldset class="standard-form-section">
@@ -236,7 +257,7 @@
               </div>
               <textarea class="editor standard-file-list" id="standardFileList" rows="11" spellcheck="false" placeholder="每行一个 ecology 下的相对文件路径，例如 src/weaver/example/Demo.java"></textarea>
               <div class="field-footer">
-                <span>只接受相对于 ecology 的文件路径；不接受 URL、$/、颜色标记或绝对路径。</span>
+                <span>每行一个相对路径，不含 URL、$/ 或颜色标记。</span>
                 <output id="standardFileCount">0 行</output>
               </div>
               <label class="cover-all-confirm" id="standardCoverAllConfirmWrap">
@@ -246,7 +267,7 @@
 
               <label class="field-label" for="standardCommitMessage">提交说明</label>
               <input class="text-input" id="standardCommitMessage" type="text" maxlength="500" autocomplete="off" placeholder="例如：QC123456 补充标准文件">
-              <div class="field-footer"><span>使用你账号中保存的 SVN 凭据提交；提交说明将原样写入 SVN。</span><output id="standardMessageCount">0 / 500</output></div>
+              <div class="field-footer"><span>此说明将原样写入 SVN。</span><output id="standardMessageCount">0 / 500</output></div>
             </fieldset>
 
             <div class="panel-actions standard-form-actions">
@@ -323,15 +344,15 @@
     <section id="upgradeToolView" data-tool-view="upgrade" hidden>
     <section class="intro" aria-labelledby="page-title">
       <div class="intro-copy">
-        <p class="eyebrow">UPGRADE LIST · 03</p>
-        <h1 id="page-title" tabindex="-1">把升级清单整理成可交付的 Markdown。</h1>
-        <p class="intro-description">粘贴带颜色富文本，校对红黑标记，一次生成人读与 AI 两份 Markdown。</p>
+        <p class="eyebrow">UPGRADE LIST</p>
+        <h1 id="page-title" tabindex="-1">升级清单提取</h1>
+        <p class="intro-description">提取富文本中的红黑标记，校对后生成 Markdown。</p>
       </div>
       <div class="local-note">
         <span class="local-note-icon" aria-hidden="true"></span>
         <div>
           <strong>内容不保存</strong>
-          <span>粘贴的清单只用于本次生成，用完即丢</span>
+          <span>仅用于本次提取与生成</span>
         </div>
       </div>
     </section>
@@ -460,31 +481,33 @@
     </section>
 
     <footer class="site-footer">
-      <span>核心规则与桌面版、终端版保持一致 · SVN 写入始终二次确认</span>
+      <span>SVN Sync Tool <span aria-hidden="true">/</span> 升级工具中心</span>
       <span title="{% if deployed.short %}{{ deployed.subject }} · {{ deployed.deployed_at }} · {{ deployed.by }}{% endif %}">Web · v{{ app_version }}{% if deployed.short %} · {{ deployed.short }}{% endif %}</span>
     </footer>
   </main>
+  </div>
 
   <!-- 登录门：未登录时覆盖整个界面；服务端已对每个接口独立校验会话，
        这一层只是界面引导，不作为安全边界。 -->
-  <div class="gate" id="authGate" hidden>
+  <div class="gate auth-gate" id="authGate" role="dialog" aria-modal="true" aria-labelledby="authTitle" hidden>
     <div class="gate-card">
       <div class="gate-brand">
         <span class="brand-symbol" aria-hidden="true"><span></span></span>
         <div>
           <strong>升级工具中心</strong>
-          <small>请先登录后使用</small>
+          <small>SVN SYNC TOOL</small>
         </div>
       </div>
+      <div class="auth-intro"><p class="eyebrow">YOUR WORKSPACE</p><h1 id="authTitle">登录工作台</h1><p>查询版本、核对文件、整理升级清单。</p></div>
 
-      <div class="gate-tabs" role="tablist">
-        <button class="gate-tab" id="tabLogin" type="button" role="tab" aria-selected="true">登录</button>
-        <button class="gate-tab" id="tabRegister" type="button" role="tab" aria-selected="false">注册</button>
+      <div class="gate-tabs" role="tablist" aria-label="账号访问方式">
+        <button class="gate-tab" id="tabLogin" type="button" role="tab" aria-selected="true" aria-controls="loginForm">登录</button>
+        <button class="gate-tab" id="tabRegister" type="button" role="tab" aria-selected="false" aria-controls="registerForm" tabindex="-1">注册</button>
       </div>
 
       <p class="form-error" id="authError" hidden tabindex="-1"></p>
 
-      <form id="loginForm" autocomplete="on">
+      <form id="loginForm" autocomplete="on" role="tabpanel" aria-labelledby="tabLogin">
         <label class="field-label" for="loginUsername">账号</label>
         <input class="text-input" id="loginUsername" name="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required>
         <label class="field-label" for="loginPassword">登录密码</label>
@@ -494,7 +517,7 @@
         </button>
       </form>
 
-      <form id="registerForm" autocomplete="on" hidden>
+      <form id="registerForm" autocomplete="on" role="tabpanel" aria-labelledby="tabRegister" hidden>
         <label class="field-label" for="registerUsername">账号</label>
         <input class="text-input" id="registerUsername" name="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required>
         <p class="input-help">2-32 位，字母或数字开头，可含下划线、点、连字符。</p>
@@ -507,13 +530,15 @@
           <span class="button-label" data-default="注册并登录">注册并登录</span>
         </button>
       </form>
+      <p class="gate-footnote">站点账号用于登录，SVN 账号在登录后单独设置。</p>
     </div>
   </div>
 
   <!-- 我的 SVN 账号 -->
-  <div class="gate" id="svnDialog" hidden>
+  <div class="gate" id="svnDialog" role="dialog" aria-modal="true" aria-labelledby="svnDialogTitle" hidden>
     <div class="gate-card">
-      <h2 class="dialog-title">我的 SVN 账号</h2>
+      <p class="panel-kicker">ACCOUNT SETTINGS</p>
+      <h2 class="dialog-title" id="svnDialogTitle">我的 SVN 账号</h2>
       <p class="input-help">保存后，版本查询与标准文件提交都会使用这组凭据，提交记录归属于该 SVN 账号。</p>
       <p class="credential-note credential-note-warn">服务端以<strong>明文</strong>保存该密码（<code>svn</code> 需要真实密码，无法只存哈希）。文件位于服务器上仅属主可读的目录，但请知悉这一点。</p>
 
@@ -565,7 +590,6 @@
     </form>
   </dialog>
 
-  <div class="lzr-signature" aria-hidden="true">LZR</div>
   <div class="notice" id="notice" role="status" aria-live="polite" aria-atomic="true"></div>
 </body>
 </html>
