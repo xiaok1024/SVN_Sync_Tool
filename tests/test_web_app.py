@@ -98,7 +98,7 @@ class WebAppApiTest(unittest.TestCase):
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
         self.assertIn("升级工具中心", response.text)
-        self.assertIn("LZR", response.text)
+        self.assertIn("SVN SYNC TOOL", response.text)
         self.assertIn("SVN 标准文件提交", response.text)
         self.assertIn("版本号路径生成", response.text)
         self.assertIn("default-src 'self'", response.headers["content-security-policy"])

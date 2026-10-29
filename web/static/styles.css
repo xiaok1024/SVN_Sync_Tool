@@ -124,8 +124,6 @@ input[type="checkbox"] { accent-color: var(--primary); }
 .nav-name { flex: 1; white-space: nowrap; font-size: 12px; }
 .nav-index { font-family: var(--mono); font-size: 10px; opacity: .62; }
 .sidebar-bottom { margin-top: auto; padding-top: 40px; }
-.sidebar-caption { display: flex; align-items: center; gap: 7px; padding: 14px 12px 18px; color: #939dac; font-size: 10px; }
-.sidebar-monogram { color: #9aa3b2; font-size: 9px; font-weight: 400; letter-spacing: .02em; }
 .account-area { padding: 17px 10px 0; border-top: 1px solid var(--line); }
 .account-identity { display: flex; align-items: center; gap: 10px; }
 .account-identity .nav-icon { color: var(--muted-2); width: 16px; }
@@ -471,7 +469,7 @@ body:has(.gate:not([hidden])), body:has(.commit-dialog[open]) { overflow: hidden
   .brand-symbol { width: 30px; height: 30px; }
   .brand-copy strong { font-size: 14px; }
   .brand-copy small { font-size: 8px; }
-  .nav-label, .sidebar-caption { display: none; }
+  .nav-label { display: none; }
   .tool-switch { flex-direction: row; gap: 14px; overflow-x: auto; scrollbar-width: none; }
   .tool-switch::-webkit-scrollbar { display: none; }
   .tool-switch a { min-height: 42px; flex: 0 0 auto; padding: 8px 0; border-radius: 0; gap: 7px; border-bottom: 2px solid transparent; }
