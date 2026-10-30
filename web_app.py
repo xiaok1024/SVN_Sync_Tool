@@ -125,6 +125,14 @@ class StandardJobRequest(BaseModel):
     commit_message: str
 
 
+class StandardUpgradeMarkdownRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    html: str
+    source_profile_id: str
+    customer_standard_path: str
+
+
 class RevisionPathQueryRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -581,6 +589,23 @@ async def create_standard_task(request: Request):
     )
     request.state.job_id = result["task"]["id"]
     return result
+
+
+@app.post("/api/v1/standard-files/upgrade-markdown")
+async def write_standard_upgrade_markdown(request: Request):
+    username = current_user(request)
+    payload = await _read_json(request, StandardUpgradeMarkdownRequest)
+    if not payload.customer_standard_path.strip():
+        raise StandardWebError(
+            "invalid_customer_path", "请填写客户标准文件 ecology 目录")
+    return await run_in_threadpool(
+        request.app.state.standard_jobs.write_upgrade_markdown,
+        html=payload.html,
+        profile_id=payload.source_profile_id,
+        customer_standard_path=payload.customer_standard_path,
+        actor=username,
+        request_id=getattr(request.state, "request_id", ""),
+    )
 
 
 @app.get("/api/v1/standard-files/tasks/{job_id}")

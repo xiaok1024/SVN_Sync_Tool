@@ -215,6 +215,7 @@ select.text-input { cursor: pointer; padding-right: 26px; }
 .field-footer > output { color: var(--muted); white-space: nowrap; font-family: var(--mono); font-size: 10px; }
 .editor, .result-output { font-family: var(--mono); font-size: 11px; line-height: 1.9; resize: vertical; tab-size: 2; }
 .editor { min-height: 260px; }
+.editor-compact { min-height: 150px; }
 .standard-file-list { min-height: 205px; }
 .source-panel { display: flex; flex-direction: column; }
 .source-editor { flex: 1; }
@@ -291,6 +292,9 @@ select.text-input { cursor: pointer; padding-right: 26px; }
 .input-state { color: var(--muted); white-space: nowrap; }
 .input-state[data-state="rich"] { color: var(--success); }
 .input-state[data-state="plain"] { color: var(--warning); }
+.upgrade-markdown-result { display: grid; gap: 4px; margin-top: 14px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 6px; background: #fafbfe; color: var(--muted); font-size: 10px; line-height: 1.7; }
+.upgrade-markdown-result[hidden] { display: none; }
+.upgrade-markdown-result p { margin: 0; overflow-wrap: anywhere; }
 
 /* 阶段和任务状态只使用有意义的状态色。 */
 .flow-steps { display: flex; margin: 0 0 26px; padding: 18px 0; list-style: none; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }

@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const vm = require("node:vm");
 const source = fs.readFileSync(require("node:path").join(__dirname, "../web/static/app.js"), "utf8");
-const stages = Array.from({ length: 5 }, () => {
+const stages = Array.from({ length: 4 }, () => {
   const classes = new Set();
   return { classes, classList: { toggle(name, on) { on ? classes.add(name) : classes.delete(name); } } };
 });
@@ -23,12 +23,12 @@ vm.runInContext(source.slice(source.indexOf("function renderStandardTask("),
 context.task = { id: "a".repeat(32), status: "committed", progress: 100, cleanup: { status: "cleaned" } };
 vm.runInContext("renderStandardTask(task)", context);
 assert(stages.every(item => item.classes.has("is-complete") && !item.classes.has("is-active")));
-assert.equal(detail, "任务已结束，服务器临时文件已清理。");
+assert.equal(detail, "任务已结束。");
 assert(context.standardElements.taskReference.textContent.includes(context.task.id));
 context.task.cleanup.status = "failed";
 vm.runInContext("renderStandardTask(task)", context);
-assert(stages[4].classes.has("is-active"));
-assert(detail.includes("清理失败"));
+assert(stages.every(item => item.classes.has("is-complete") && !item.classes.has("is-active")));
+assert.equal(detail, "任务已结束。");
 context.task.status = "committing";
 vm.runInContext("renderStandardTask(task)", context);
 assert(stages[3].classes.has("is-active"));

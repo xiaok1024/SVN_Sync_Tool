@@ -46,6 +46,11 @@ from web_svn_common import (
     supports_password_from_stdin,
 )
 from web_logging import log_event, exception_fields
+from web_upgrade_service import (
+    UpgradeWebError,
+    extract_upgrade_list,
+    generate_upgrade_markdown,
+)
 
 
 JOB_ID_RE = re.compile(r"^[a-f0-9]{32}$")
@@ -116,7 +121,7 @@ class SourceProfile:
 
     @property
     def is_standard_share(self):
-        """是否为固定标准共享根（\\192.168.7.215）。
+        """是否为固定标准共享根（服务端配置的固定标准共享）。
 
         两条策略都由前缀推导而非配置项决定，避免有人在 JSON 里把非标准
         共享错配成可以覆盖全部交集。
@@ -934,12 +939,17 @@ class StandardJobManager:
                 password = ""
             return Path(mounted).resolve(strict=True)
 
-    def _customer_source_path(self, job, profile):
-        root = self._profile_source_root(profile, getattr(job, "source_unc_prefix", ""))
-        if job.source_relative == ".":
+    def _resolve_customer_source_path(self, profile, source_unc_prefix, source_relative):
+        """把「共享根 + 来源后缀」解析成真实的本机标准目录。
+
+        标准文件提交和升级清单 Markdown 落盘共用同一条路径校验，避免两处各写一份
+        可能被绕过的越界判断。
+        """
+        root = self._profile_source_root(profile, source_unc_prefix or "")
+        if source_relative == ".":
             candidate = root / "ecology" if (root / "ecology").is_dir() else root
         else:
-            candidate = root.joinpath(*job.source_relative.split("/"))
+            candidate = root.joinpath(*source_relative.split("/"))
         try:
             resolved = candidate.resolve(strict=True)
             inside = os.path.commonpath([str(root), str(resolved)]) == str(root)
@@ -948,6 +958,108 @@ class StandardJobManager:
         if not inside or not resolved.is_dir():
             raise RuntimeError("客户标准文件 ecology 目录不存在或超出固定共享根")
         return resolved
+
+    def _customer_source_path(self, job, profile):
+        return self._resolve_customer_source_path(
+            profile, getattr(job, "source_unc_prefix", ""), job.source_relative)
+
+    @staticmethod
+    def _safe_markdown_filename(filename):
+        """只接受服务器生成的单个 .md 文件名，杜绝目录穿越与特殊字符。"""
+        text = str(filename or "")
+        if not text or text != os.path.basename(text):
+            return False
+        if text.rstrip(" .") != text or text in {".", ".."}:
+            return False
+        if not re.fullmatch(r'[^<>:"/\\|?*\x00-\x1f]+\.md', text, flags=re.I):
+            return False
+        return len(text.encode("utf-8")) <= 240
+
+    def write_upgrade_markdown(
+            self, *, html, profile_id, customer_standard_path, actor="", request_id=""):
+        """把粘贴近来的升级清单转成 Markdown，写入当前客户的标准文件目录。
+
+        只允许写入服务端配置的固定标准共享下的 QC ecology 目录；解析与生成
+        完全复用 Web 升级清单服务，不重复实现颜色识别和 Markdown 组装。
+        """
+        profile = self.profiles.get(str(profile_id or "").strip())
+        if not profile:
+            raise StandardWebError("source_profile_not_found", "标准文件来源配置不存在", 404)
+        if not profile.is_standard_share:
+            raise StandardWebError(
+                "standard_source_required",
+                "升级清单 Markdown 只能写入固定标准文件共享", 403)
+        if not profile.available:
+            raise StandardWebError("source_profile_unavailable", "标准文件来源当前不可用", 503)
+
+        raw_customer_path = clean_customer_path_text(customer_standard_path)
+        if not raw_customer_path:
+            raise StandardWebError("invalid_customer_path", "请填写客户标准文件 ecology 目录")
+        matched_prefix = profile.match_prefix(raw_customer_path)
+        if not matched_prefix:
+            raise StandardWebError(
+                "customer_path_not_allowed",
+                "客户目录不在该来源允许的共享根内", 403)
+        source_relative = parse_customer_standard_path(
+            raw_customer_path, matched_prefix, require_qc_segment=True)
+
+        try:
+            target_dir = self._resolve_customer_source_path(
+                profile, matched_prefix, source_relative)
+        except (StandardWebError, RuntimeError) as exc:
+            raise StandardWebError(
+                "customer_path_unavailable",
+                "客户标准文件 ecology 目录不存在或暂不可用", 503) from exc
+
+        # 解析与 Markdown 生成复用 Web 升级清单服务，错误统一转成标准文件错误。
+        try:
+            extracted = extract_upgrade_list(html)
+            generated = generate_upgrade_markdown(extracted["list_text"], "md")
+        except UpgradeWebError as exc:
+            raise StandardWebError(exc.code, exc.message, exc.status_code) from None
+
+        filename = generated.get("filename", "")
+        if not self._safe_markdown_filename(filename):
+            raise StandardWebError(
+                "invalid_result_filename", "生成的 Markdown 文件名不合法")
+        payload = str(generated.get("content", "")).encode("utf-8")
+        target = target_dir / filename
+        if os.path.islink(target):
+            raise StandardWebError(
+                "target_not_writable", "目标 Markdown 文件不可写入，请联系维护者", 409)
+
+        temp_path = target_dir / (".lzr-upgrade-%s.tmp" % secrets.token_hex(8))
+        try:
+            descriptor = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, target)
+        except OSError as exc:
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except OSError:
+                pass
+            raise StandardWebError(
+                "write_failed", "写入标准文件目录失败，请稍后再试", 503) from exc
+
+        stats = generated.get("stats") or {}
+        unique_files = stats.get("unique_files")
+        if unique_files is None:
+            unique_files = stats.get("file_entries", 0)
+        log_event("upgrade_markdown_written", actor=actor, request_id=request_id,
+                  file_count=unique_files, status=200)
+        return {
+            "ok": True,
+            "written": True,
+            "filename": filename,
+            "customer": generated.get("customer", ""),
+            "bytes": len(payload),
+            "stats": stats,
+            "warnings": list(generated.get("warnings", [])),
+        }
 
     @staticmethod
     def _safe_source_file(source_root, relative):

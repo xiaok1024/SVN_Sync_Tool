@@ -99,7 +99,9 @@ class WebAppApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("升级工具中心", response.text)
         self.assertIn("SVN SYNC TOOL", response.text)
-        self.assertIn("SVN 标准文件提交", response.text)
+        self.assertIn("标准文件提交与升级清单提取", response.text)
+        self.assertNotIn("data-tool-link=\"upgrade\"", response.text)
+        self.assertNotIn("data-standard-stage=\"cleanup\"", response.text)
         self.assertIn("版本号路径生成", response.text)
         self.assertIn("default-src 'self'", response.headers["content-security-policy"])
         self.assertEqual(response.headers["x-frame-options"], "DENY")
@@ -227,6 +229,95 @@ class WebAppApiTest(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 422)
         self.assertEqual(response.json()["error"]["code"], "invalid_field")
+
+    def test_standard_upgrade_markdown_writes_into_selected_customer_ecology(self):
+        from pathlib import PureWindowsPath
+        from web_standard_service import (
+            DEFAULT_STANDARD_UNC_PREFIX,
+            SourceProfile,
+            StandardJobManager,
+        )
+        with tempfile.TemporaryDirectory() as job_root, tempfile.TemporaryDirectory() as source:
+            target = Path(source, "Y", "示例客户", "QC123456", "ecology")
+            target.mkdir(parents=True)
+            manager = StandardJobManager(
+                profiles=[SourceProfile(
+                    "default", "测试来源", standard_path=source,
+                    unc_prefix=DEFAULT_STANDARD_UNC_PREFIX)],
+                temp_root=job_root, min_free_bytes=0, require_password_stdin=False,
+            )
+            original = app.state.standard_jobs
+            app.state.standard_jobs = manager
+            try:
+                customer_path = str(PureWindowsPath(DEFAULT_STANDARD_UNC_PREFIX)
+                                    / "Y" / "示例客户" / "QC123456" / "ecology")
+                response = self.client.post(
+                    "/api/v1/standard-files/upgrade-markdown",
+                    json={
+                        "html": SAMPLE_HTML,
+                        "source_profile_id": "default",
+                        "customer_standard_path": customer_path,
+                    },
+                )
+                self.assertEqual(response.status_code, 200)
+                payload = response.json()
+                self.assertTrue(payload["ok"])
+                self.assertTrue(payload["written"])
+                self.assertEqual(payload["filename"], "customer-upgrade-file-list.md")
+                written = target / payload["filename"]
+                self.assertTrue(written.is_file())
+                self.assertIn("Test.java", written.read_text(encoding="utf-8"))
+                self.assertNotIn(source, response.text)
+                self.assertNotIn("standard_path", response.text)
+            finally:
+                app.state.standard_jobs = original
+                manager.stop()
+
+    def test_standard_upgrade_markdown_rejects_extra_fields_and_history_source(self):
+        response = self.client.post(
+            "/api/v1/standard-files/upgrade-markdown",
+            json={
+                "html": SAMPLE_HTML,
+                "source_profile_id": "default",
+                "customer_standard_path": "\\192.168.7.215\ECOLOGY_customer\Y\示例客户\QC123456\ecology",
+                "extra": 1,
+            },
+        )
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["error"]["code"], "invalid_field")
+
+        from pathlib import PureWindowsPath
+        from web_standard_service import (
+            DEFAULT_HISTORICAL_UNC_PREFIX,
+            SourceProfile,
+            StandardJobManager,
+        )
+        with tempfile.TemporaryDirectory() as job_root, tempfile.TemporaryDirectory() as source:
+            manager = StandardJobManager(
+                profiles=[SourceProfile(
+                    "historical", "历史来源", standard_path=source,
+                    unc_prefix=DEFAULT_HISTORICAL_UNC_PREFIX)],
+                temp_root=job_root, min_free_bytes=0, require_password_stdin=False,
+            )
+            original = app.state.standard_jobs
+            app.state.standard_jobs = manager
+            try:
+                customer_path = str(PureWindowsPath(DEFAULT_HISTORICAL_UNC_PREFIX)
+                                    / "Z" / "示例客户" / "历史文件" / "ecology")
+                response = self.client.post(
+                    "/api/v1/standard-files/upgrade-markdown",
+                    json={
+                        "html": SAMPLE_HTML,
+                        "source_profile_id": "historical",
+                        "customer_standard_path": customer_path,
+                    },
+                )
+                self.assertEqual(response.status_code, 403)
+                self.assertEqual(
+                    response.json()["error"]["code"], "standard_source_required")
+            finally:
+                app.state.standard_jobs = original
+                manager.stop()
 
     def test_extract_and_generate_round_trip(self):
         extract = self.client.post(
@@ -569,8 +660,8 @@ class WebSourceSafetyTest(unittest.TestCase):
         # execCommand 只允许出现在统一的辅助函数里
         self.assertEqual(javascript.count('document.execCommand("copy")'), 1)
         self.assertIn("async function copyPlainText(text)", javascript)
-        # 三个复制入口都走辅助函数
-        self.assertGreaterEqual(javascript.count("await copyPlainText("), 3)
+        # 现有两个复制入口（版本号路径、标准文件提交）都走辅助函数
+        self.assertGreaterEqual(javascript.count("await copyPlainText("), 2)
 
     def test_entry_requires_explicit_lan_mode(self):
         root = Path(__file__).resolve().parents[1]
