@@ -9,6 +9,7 @@ const stages = Array.from({ length: 4 }, () => {
 });
 let detail = "";
 const context = vm.createContext({
+  options: { stageOrder: ["form", "checkout", "preview", "commit", "cleanup"], showCleanup: true },
   standardElements: {
     stages, taskReference: { hidden: true, textContent: "" },
     dialog: { open: false }, progressBar: { style: {} },
@@ -23,14 +24,20 @@ vm.runInContext(source.slice(source.indexOf("function renderStandardTask("),
 context.task = { id: "a".repeat(32), status: "committed", progress: 100, cleanup: { status: "cleaned" } };
 vm.runInContext("renderStandardTask(task)", context);
 assert(stages.every(item => item.classes.has("is-complete") && !item.classes.has("is-active")));
-assert.equal(detail, "任务已结束。");
+assert.equal(detail, "任务已结束，服务器临时文件已清理。");
 assert(context.standardElements.taskReference.textContent.includes(context.task.id));
 context.task.cleanup.status = "failed";
 vm.runInContext("renderStandardTask(task)", context);
 assert(stages.every(item => item.classes.has("is-complete") && !item.classes.has("is-active")));
-assert.equal(detail, "任务已结束。");
+assert.equal(detail, "任务已结束，临时文件清理失败，后台会重试。");
 context.task.status = "committing";
 vm.runInContext("renderStandardTask(task)", context);
 assert(stages[3].classes.has("is-active"));
 assert.equal(detail, "任务正在服务器上执行。");
-console.log("Task display: completed, cleanup failure and active submission passed");
+// 合并页没有收尾阶段：committed 直接视为结束，不进入 cleanup。
+context.options.showCleanup = false;
+context.task.status = "committed";
+vm.runInContext("renderStandardTask(task)", context);
+assert(stages.every(item => item.classes.has("is-complete") && !item.classes.has("is-active")));
+assert.equal(detail, "任务已结束。");
+console.log("Task display: completed, cleanup failure, active submission and no-cleanup mode passed");

@@ -32,6 +32,21 @@ def _normalize_relative_path(relative):
     return normalized
 
 
+def _svn_targets_file_encoding():
+    """`svn --targets` 读取目标清单文件时使用的编码。
+
+    Windows 下 SVN 按本地 ANSI 代码页解析该文件；若写入 UTF-8，含非 ASCII 的
+    路径会被读坏并报 “is not under version control”。其它平台仍沿用 UTF-8。
+    """
+    if os.name == "nt":
+        try:
+            import ctypes
+            return "cp%d" % ctypes.windll.kernel32.GetACP()
+        except Exception:  # 兜底：无法取到代码页时保持既有行为
+            return "utf-8"
+    return "utf-8"
+
+
 def parse_repository_relative_input(value, svn_root=""):
     """把 ``$/仓库/路径`` 严格映射到当前 checkout 根，拒绝其他仓库/子根。"""
     text = (value or "").strip()
@@ -284,7 +299,8 @@ class StandardFileService:
         targets_file = None
         try:
             with tempfile.NamedTemporaryFile(
-                    "w", encoding="utf-8", newline="\n", delete=False) as handle:
+                    "w", encoding=_svn_targets_file_encoding(), newline="\n",
+                    delete=False) as handle:
                 targets_file = handle.name
                 for path in safe_targets:
                     handle.write(path + "\n")

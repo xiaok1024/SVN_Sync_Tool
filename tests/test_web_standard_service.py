@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
@@ -12,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
+import web_standard_service
 from svn_standard_file_core import iter_standard_file_lines, parse_file_input
 from web_standard_service import (
     DEFAULT_HISTORICAL_UNC_PREFIX,
@@ -317,6 +319,71 @@ class HistoricalShareRulesTest(unittest.TestCase):
         self.assertNotIn("QC编号", historical["path_hint"])
 
 
+class WindowsSourcePathTest(unittest.TestCase):
+    """Windows 部署下来源根支持盘符与 UNC 路径。"""
+
+    def test_unc_path_requires_server_and_share(self):
+        is_unc = web_standard_service._is_unc_path
+        self.assertTrue(is_unc(r"\\server\share"))
+        self.assertTrue(is_unc(r"\\server\share\QC1\ecology"))
+        self.assertTrue(is_unc("\\\\server\\share/QC1"))
+        self.assertFalse(is_unc(r"\\server"))
+        self.assertFalse(is_unc(r"\\server\\"))
+        self.assertFalse(is_unc(r"D:\ecology"))
+        self.assertFalse(is_unc("/mnt/ecology"))
+
+    def test_windows_absolute_path_accepts_drive_and_unc(self):
+        abspath = web_standard_service._is_windows_absolute_path
+        self.assertTrue(abspath(r"D:\ecology"))
+        self.assertTrue(abspath("c:/ecology"))
+        self.assertTrue(abspath(r"\\srv\share\x"))
+        self.assertFalse(abspath("ecology"))
+        self.assertFalse(abspath("/mnt/ecology"))
+
+    def test_join_path_root_keeps_root_style_separators(self):
+        join = web_standard_service._join_path_root
+        self.assertEqual(join(r"D:\mnt", "host", "share"), r"D:\mnt\host\share")
+        self.assertEqual(join(r"\\srv\share", "host"), r"\\srv\share\host")
+        self.assertEqual(join("/mnt", "host", "share"), "/mnt/host/share")
+
+    @unittest.skipUnless(os.name == "nt", "Windows 才直接使用盘符/UNC 来源根")
+    def test_windows_profile_matches_configured_standard_path(self):
+        with tempfile.TemporaryDirectory() as root:
+            profile = SourceProfile("default", "Windows 来源", standard_path=root)
+            self.assertEqual(profile.match_prefix(root), root)
+            nested = os.path.join(root, "QC123456", "ecology")
+            self.assertEqual(profile.match_prefix(nested), root)
+
+    @unittest.skipUnless(os.name == "nt", "Windows 才需要清除目录中的只读属性")
+    def test_force_rmtree_removes_readonly_working_copy_files(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = Path(root, "job", ".svn", "pristine")
+            target.mkdir(parents=True)
+            readonly = target / "demo.svn-base"
+            readonly.write_text("content", encoding="utf-8")
+            os.chmod(readonly, stat.S_IREAD)
+
+            web_standard_service._rmtree_force(Path(root, "job"))
+
+            self.assertFalse(Path(root, "job").exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows 才直接使用盘符/UNC 来源根")
+    def test_windows_profile_source_root_uses_standard_path_without_mount(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as base:
+            profile = SourceProfile("default", "Windows 来源", standard_path=root)
+            manager = StandardJobManager(
+                profiles=[profile], temp_root=base, min_free_bytes=0,
+                require_password_stdin=False)
+            mount = mock.Mock(return_value="X:/should-not-be-used")
+            manager._source_mount_engine._mount_smb_macos = mount
+            try:
+                self.assertEqual(
+                    manager._profile_source_root(profile), Path(root).resolve())
+                self.assertEqual(mount.call_count, 0)
+            finally:
+                manager.stop()
+
+
 class WebSvnCredentialIsolationTest(unittest.TestCase):
     def test_password_uses_stdin_and_never_enters_argv_or_config_files(self):
         with tempfile.TemporaryDirectory() as root:
@@ -404,6 +471,8 @@ class StandardJobSafetyTest(unittest.TestCase):
                 manager.stop()
 
     def test_smb_profile_mount_is_read_only_noninteractive_and_clears_credentials(self):
+        if os.name == "nt":
+            self.skipTest("Windows 原生访问 UNC，不经过 macOS mount_smbfs 通道")
         with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as mounted:
             profile = SourceProfile(
                 "default", "测试共享", standard_path="",
@@ -543,7 +612,11 @@ class StandardJobSafetyTest(unittest.TestCase):
                 outside.mkdir(exist_ok=True)
                 symlink = Path(root, "c" * 32)
                 try:
-                    symlink.symlink_to(outside, target_is_directory=True)
+                    try:
+                        symlink.symlink_to(outside, target_is_directory=True)
+                    except (OSError, NotImplementedError):
+                        # Windows 建符号链接需要开发者模式或管理员特权。
+                        self.skipTest("当前环境不允许创建符号链接")
                     manager._cleanup_orphan_directories()
                     self.assertFalse(valid.exists())
                     self.assertTrue(invalid.exists())

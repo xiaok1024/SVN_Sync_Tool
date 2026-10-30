@@ -7,7 +7,7 @@
 - **现代图形界面**（`svn_sync_qt.py`）：Windows 主要使用方式，基于 PySide6 / Qt Widgets，打包为 exe 分发。
 - **旧版图形界面**（`svn_sync_tool.py`）：保留为迁移期功能对照和回归入口，不再作为 Windows 正式打包入口。
 - **终端版**（`svn_sync_cli.py`）：macOS 推荐使用方式，功能与 GUI 的 6 个页面一一对应，支持交互式菜单和命令行参数两种用法，详见下方「终端版」章节。也可直接使用 `outputs/SVN_Sync_Tool.app.zip` 中的图形界面。
-- **Web 工具中心**（`svn_sync_web.py`）：提供“版本号路径生成”和“标准文件提交与升级清单提取”；SVN 任务使用隔离的临时工作副本/配置目录与用户自己的 SVN 凭据。默认仅监听 `127.0.0.1`，可通过显式参数开放可信局域网访问。
+- **Web 工具中心**（`svn_sync_web.py`）：提供“版本号路径生成”、“SVN 标准文件提交”、“升级清单提取”和“标准文件提交与升级清单提取”四个相互隔离的工作区；SVN 任务使用隔离的临时工作副本/配置目录与用户自己的 SVN 凭据。默认仅监听 `127.0.0.1`，可通过显式参数开放可信局域网访问。
 
 A Windows Qt GUI and macOS CLI tool for checking out code from SVN, overwriting cross-referenced files from a local organized directory (or network share), and automatically committing changes.
 
@@ -23,6 +23,7 @@ A Windows Qt GUI and macOS CLI tool for checking out code from SVN, overwriting 
 | **升级清单提取** | 从复制的带颜色升级清单（QC 分组 + 红/黑标记的完整 SVN URL 或 `$/...` 路径）提取文件清单，并生成人读升级 Markdown 与 AI 专用 Markdown |
 | **版本号路径生成** | 快速完成这件事而设计的——不用打开 SVN log 界面一行行翻，提供一个版本号，工具直接查询出所有变更文件，并自动按 `(Vxxx)` 格式拼接好完整 URL |
 | **标准文件获取** | 按源码清单从 KB/历史目录补全客户工作副本，提交前预览整个工作副本的 SVN 状态；支持提交后恢复本地二开版本 |
+| **标准文件合并工作台（Web）** | 新增“标准文件提交与升级清单提取”页面：保留标准文件安全预览与提交，但不再显示收尾阶段；在配置任务内粘贴升级清单即可生成 Markdown 到客户标准文件目录 |
 
 | Feature | Description |
 |---------|-------------|
@@ -114,18 +115,20 @@ python3 svn_sync_cli.py standard --url https://svn.example.com/svn/cust/ecology 
 
 ## 本地 Web 预览
 
-Web 版提供两个相互隔离的工作区。桌面端使用左侧工具导航和输入 / 结果分栏，窄屏自动切换为顶部导航与纵向工作区。
+Web 版提供四个相互隔离的工作区。桌面端使用左侧工具导航和输入 / 结果分栏，窄屏自动切换为顶部导航与纵向工作区。
 「我的 SVN 账号」位于导航区，查询与提交表单也提供账号管理入口；弹窗支持键盘操作与 Escape 关闭。
 版本号输入框支持 `Cmd / Ctrl + Enter` 查询，结果区可直接粘贴已有路径并仅做本地排序。
 
 各工具按页面导航顺序如下：
 
 - **版本号路径生成**（01）：只读功能，直接复用 `svn_path_generator.py`，与 GUI Tab 5、CLI `paths` 子命令共用同一套版本号解析、`svn log` 查询、`(V版本)` URL 拼接和三种排序逻辑。只执行 `svn log`，不创建工作副本、不写入仓库；也可只对已有 `(V版本)` 路径做本地排序，此时完全不访问 SVN。打开页面时默认进入这个工作区。
-- **标准文件提交与升级清单提取**（02）：每个任务先读取客户 SVN 检出根的最新 HEAD，并将其固定为数字 revision；随后创建独立稀疏工作副本、匹配客户标准目录、覆盖并生成 `svn status` 预览。用户二次确认后才精确提交本次路径，成功后立即删除工作副本和独立 SVN 配置。失败、取消或 15 分钟未确认的任务也会清理，后台每 15 秒检查一次到期状态。同一页面还提供升级清单提取：把网页里带红黑颜色的升级清单粘贴进“升级清单提取”，选择来源配置与客户 `ecology` 目录后，服务端复用 `upgrade_list_core.py` 生成 Markdown 并写入该客户标准文件目录，不提交 SVN。
+- **SVN 标准文件提交**（02）：保留原有完整流程。每个任务先读取客户 SVN 检出根的最新 HEAD，创建独立稀疏工作副本、匹配标准目录、覆盖并生成 `svn status` 预览，用户二次确认后才精确提交本次路径。页面展示“配置任务 → 读取文件 → 覆盖预览 → 确认提交 → 收尾”五个阶段；失败、取消或超时任务仍由服务端自动清理。
+- **升级清单提取**（03）：保留原有独立页面。粘贴带红黑颜色的网页升级清单后，服务端复用 `upgrade_list_core.py` 识别颜色与 QC 分组，生成人读或 AI Markdown，供复制、下载；这一页不写入 SVN，也不写入标准文件目录。
+- **标准文件提交与升级清单提取**（04）：新增的合并页面。标准文件提交沿用原有安全预览与二次确认，但页面只展示 4 个阶段，不再显示收尾；服务端仍按既有安全策略自动清理临时目录。升级清单入口合并到“配置任务”中：粘贴升级清单后点击“生成 Markdown 到标准目录”，服务端生成 Markdown 并写入所选客户标准文件 `ecology` 目录，不要求提交 SVN。
 
-升级清单提取只做一件事：把网页里带红黑颜色的升级清单粘贴进来，服务端复用 `upgrade_list_core.py` 识别颜色与 QC 分组，生成人读 Markdown 并写入所选客户的标准文件 `ecology` 目录。这一步不要求提交 SVN，浏览器也不会长期保存粘贴的内容。
+独立的升级清单提取页面只处理剪贴板 / HTML 到 Markdown 的转换；合并页面才提供“生成 Markdown 到标准目录”。两个页面都不会长期保存粘贴内容。
 
-标准文件工作区按**角色**分两个来源，每个角色有各自的共享白名单。所有共享都只接受四段、以 `ecology` 结尾的目录，不能填写白名单外的服务器、本机绝对路径或任意共享：
+标准文件工作区按**角色**分两个来源，每个角色有各自的共享白名单。客户目录必须位于对应来源根下，并接受四段、以 `ecology` 结尾的路径校验。Windows 部署可直接使用盘符或 UNC 来源根；Linux/macOS 常驻部署继续使用挂载根：
 
 | 角色 | 共享根 | 目录格式 | 清单可否留空 |
 |------|--------|----------|--------------|
@@ -139,7 +142,13 @@ Web 版提供两个相互隔离的工作区。桌面端使用左侧工具导航�
 - **凭据按角色分两组**（`[standard]` / `[history]`），三台历史主机共用同一套 history 账号。SMB 账号由服务端统一管理，浏览器不会接收或返回 SMB 凭据。
 - 标准文件共享是**差异包而非完整产品树**：某个类没变化就不在包里，不能据此判断"标准产品没有这个文件"。
 
-配置项：`SVN_SYNC_WEB_MOUNT_ROOT` 指向挂载根（推荐，多共享时按 `<根>/<主机>/<共享>` 推导）；单共享场景仍可用 `SVN_SYNC_WEB_STANDARD_PATH` / `SVN_SYNC_WEB_HISTORICAL_PATH` 直接指定本地路径。
+配置项：
+
+- Linux/macOS 常驻部署：`SVN_SYNC_WEB_MOUNT_ROOT` 指向挂载根，多共享按 `<根>/<主机>/<共享>` 推导；单共享也可用 `SVN_SYNC_WEB_STANDARD_PATH` / `SVN_SYNC_WEB_HISTORICAL_PATH` 直接指定已挂载路径。
+- Windows 部署：使用 `SVN_SYNC_WEB_STANDARD_PATH` / `SVN_SYNC_WEB_HISTORICAL_PATH`，可直接填写盘符目录（如 `D:\E9标准文件`）或 UNC（如 `\\192.168.7.215\ECOLOGY_customer`），服务会把它作为默认来源根，不再走 `mount_smbfs`。
+- 多个固定来源：使用 `SVN_SYNC_WEB_SOURCE_PROFILES` JSON 数组。
+
+Windows 下配置 `standard_path` 后，标准文件任务会默认以该路径作为来源根：合并页从该根下对应客户目录读取并拉取文件，升级清单 Markdown 也写回该根下的客户 `ecology` 目录，无需单独挂载。
 
 ### 安装独立 Web 环境
 
@@ -182,6 +191,24 @@ export SVN_SYNC_WEB_SOURCE_PROFILES='[
 ```
 
 随后访问：`http://127.0.0.1:8765/`
+
+### Windows 启动（PowerShell）
+
+```powershell
+$env:SVN_SYNC_WEB_STANDARD_PATH = 'D:\E9标准文件'
+$env:SVN_SYNC_WEB_STANDARD_UNC_PREFIX = '\\192.168.7.215\ECOLOGY_customer'
+$env:SVN_SYNC_WEB_SOURCE_LABEL = 'E9 标准文件共享'
+$env:SVN_SYNC_WEB_ALLOWED_SVN_PREFIXES = 'https://svn.example.com/svn/'
+.\.venv-web\Scripts\python.exe svn_sync_web.py
+```
+
+`SVN_SYNC_WEB_STANDARD_PATH` 也可直接写成 UNC，例如 `\\192.168.7.215\ECOLOGY_customer`。配置完成后，标准文件提交与合并页默认使用该来源根；Windows 不需要额外挂载共享。
+
+多个固定来源 Profile 的 JSON 写法示例（JSON 字符串中的反斜杠需要转义）：
+
+```powershell
+$env:SVN_SYNC_WEB_SOURCE_PROFILES = '[{"id":"e9-default","label":"E9 标准文件共享","standard_path":"D:\\E9标准文件","unc_prefix":"\\\\192.168.7.215\\ECOLOGY_customer"}]'
+```
 
 ### 部署到 Linux 常驻运行（推荐）
 
@@ -314,7 +341,7 @@ svn-sync-tls-setup.sh --renew         # 到期前仅重签服务器证书，CA �
 会话 Cookie 带 `Secure`，不会随明文 HTTP 发送。HSTS 未设置：RFC 6797 明确排除 IP 字面量，
 对 IP 访问不生效；8081 的强制跳转已保证所有人落到 HTTPS。
 
-共享挂载（标准文件提交功能需要）：
+共享挂载（Linux/macOS 常驻部署的标准文件提交需要；Windows 直接使用盘符/UNC，无需此步骤）：
 
 ```bash
 # 凭据：按 deploy/linux/smb-credentials.example.toml 填好真实密码后放到

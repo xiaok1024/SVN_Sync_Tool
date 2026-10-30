@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="本地升级工具中心：版本号路径生成、标准文件提交与升级清单提取。">
+  <meta name="description" content="本地升级工具中心：版本号路径生成、SVN 标准文件提交、升级清单提取、标准文件提交与升级清单提取。">
   <title>升级工具中心</title>
   <link rel="icon" href="{{ url_for('static', path='/favicon.svg') }}?v=sync-2" type="image/svg+xml">
   <link rel="icon" href="{{ url_for('static', path='/favicon-32.png') }}?v=sync-2" type="image/png" sizes="32x32">
@@ -30,7 +30,15 @@
       </a>
       <a href="#svn-standard" data-tool-link="standard">
         <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M14 3H6a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8zM14 3v5h5M8 14l3 3 5-5"/></svg>
-        <span class="nav-name">标准文件提交与升级清单提取</span><span class="nav-index">02</span>
+        <span class="nav-name">SVN 标准文件提交</span><span class="nav-index">02</span>
+      </a>
+      <a href="#upgrade-list" data-tool-link="upgrade">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/></svg>
+        <span class="nav-name">升级清单提取</span><span class="nav-index">03</span>
+      </a>
+      <a href="#standard-combined" data-tool-link="combined">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M14 3H6a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8zM14 3v5h5"/><path d="M8 13h8M8 17h5"/></svg>
+        <span class="nav-name">标准文件提交与升级清单提取</span><span class="nav-index">04</span>
       </a>
     </nav>
     <div class="sidebar-bottom">
@@ -176,8 +184,8 @@
       <section class="intro standard-intro" aria-labelledby="standard-page-title">
         <div class="intro-copy">
           <p class="eyebrow">STANDARD FILES</p>
-          <h1 id="standard-page-title" tabindex="-1">标准文件提交与升级清单提取</h1>
-          <p class="intro-description">匹配标准文件、预览变更，确认后提交；粘贴升级清单即可生成 Markdown 写入同一客户 ecology 目录。</p>
+          <h1 id="standard-page-title" tabindex="-1">SVN 标准文件提交</h1>
+          <p class="intro-description">匹配标准文件、预览变更，确认后提交本次路径。</p>
         </div>
         <div class="local-note">
           <span class="local-note-icon shield-icon" aria-hidden="true"></span>
@@ -200,6 +208,9 @@
         </li>
         <li class="flow-step" data-standard-stage="commit">
           <span class="step-index">04</span><span><strong>确认提交</strong><small>一次性授权</small></span>
+        </li>
+        <li class="flow-step" data-standard-stage="cleanup">
+          <span class="step-index">05</span><span><strong>收尾</strong><small>服务器自动清理</small></span>
         </li>
       </ol>
 
@@ -239,23 +250,6 @@
               <label class="field-label" for="standardCustomerPath">客户来源目录</label>
               <input class="text-input" id="standardCustomerPath" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="\\192.168.7.215\ECOLOGY_customer\Y\客户名称\QC123456\ecology">
               <p class="input-help">粘贴所选共享下的客户 <code>ecology</code> 目录。也可粘贴任务描述，系统会自动去掉目录前后的说明文字。</p>
-            </fieldset>
-
-            <fieldset class="standard-form-section">
-              <legend>升级清单提取</legend>
-              <p class="input-help">把网页里的升级清单（保留红黑颜色）直接粘贴到下方，系统会提取并生成 Markdown，写入上方所选客户的 <code>ecology</code> 目录。</p>
-              <div class="field-label-row">
-                <label class="field-label" for="combinedUpgradeHtml">升级清单</label>
-                <output id="combinedUpgradeState" class="input-state" data-state="empty">等待粘贴</output>
-              </div>
-              <textarea class="editor editor-compact" id="combinedUpgradeHtml" rows="7" spellcheck="false" placeholder="在这里按 Ctrl / Cmd + V 粘贴网页中的带颜色升级清单…"></textarea>
-              <div class="panel-actions standard-form-actions">
-                <button class="button button-secondary" id="combinedUpgradeGenerateButton" type="button" disabled>
-                  <span class="button-label" data-default="生成 Markdown 到标准目录">生成 Markdown 到标准目录</span>
-                </button>
-                <button class="button button-secondary" id="combinedUpgradeClearButton" type="button">清空</button>
-              </div>
-              <div class="upgrade-markdown-result" id="combinedUpgradeResult" role="status" aria-live="polite" hidden></div>
             </fieldset>
 
             <fieldset class="standard-form-section">
@@ -350,10 +344,328 @@
       </div>
     </section>
 
+    <section id="upgradeToolView" data-tool-view="upgrade" hidden>
+    <section class="intro" aria-labelledby="page-title">
+      <div class="intro-copy">
+        <p class="eyebrow">UPGRADE LIST</p>
+        <h1 id="page-title" tabindex="-1">升级清单提取</h1>
+        <p class="intro-description">提取富文本中的红黑标记，校对后生成 Markdown。</p>
+      </div>
+      <div class="local-note">
+        <span class="local-note-icon" aria-hidden="true"></span>
+        <div>
+          <strong>内容不保存</strong>
+          <span>仅用于本次提取与生成</span>
+        </div>
+      </div>
+    </section>
+
+    <ol class="flow-steps" aria-label="处理步骤">
+      <li class="flow-step is-active" data-stage="1">
+        <span class="step-index">01</span>
+        <span><strong>粘贴源内容</strong><small>保留红黑颜色</small></span>
+      </li>
+      <li class="flow-step" data-stage="2">
+        <span class="step-index">02</span>
+        <span><strong>校对文件清单</strong><small>支持手工修正</small></span>
+      </li>
+      <li class="flow-step" data-stage="3">
+        <span class="step-index">03</span>
+        <span><strong>生成 Markdown</strong><small>复制或下载</small></span>
+      </li>
+    </ol>
+
+    <section class="workspace-grid" aria-label="升级清单工作区">
+      <article class="panel source-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="panel-kicker">SOURCE</p>
+            <h2>粘贴升级清单</h2>
+          </div>
+          <div class="panel-tools">
+            <button class="text-button" type="button" id="sampleButton">加载示例</button>
+            <button class="text-button" type="button" id="fileButton">读取 HTML</button>
+            <input id="htmlFile" type="file" accept=".html,.htm,text/html" hidden>
+          </div>
+        </div>
+
+        <label class="field-label" for="sourceInput">原始内容</label>
+        <textarea
+          id="sourceInput"
+          class="editor source-editor"
+          rows="14"
+          spellcheck="false"
+          placeholder="在这里按 Cmd / Ctrl + V 粘贴网页中的带颜色升级清单…"
+          aria-describedby="sourceHelp sourceState"
+        ></textarea>
+        <div class="field-footer">
+          <span id="sourceHelp">优先读取浏览器剪贴板中的 HTML，以保留红色和黑色。</span>
+          <span class="input-state" id="sourceState" data-state="empty">等待粘贴</span>
+        </div>
+
+        <div class="panel-actions">
+          <button class="button button-primary" type="button" id="extractButton">
+            <span class="button-label" data-default="提取升级清单">提取升级清单</span>
+            <span class="button-arrow" aria-hidden="true">→</span>
+          </button>
+          <button class="button button-secondary" type="button" id="clearButton">清空</button>
+        </div>
+      </article>
+
+      <article class="panel list-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="panel-kicker">REVIEW</p>
+            <h2>校对提取结果</h2>
+          </div>
+          <span class="readonly-tag">可编辑</span>
+        </div>
+
+        <div class="summary-grid" aria-label="提取结果统计">
+          <div class="summary-item"><span>QC</span><strong id="qcCount">—</strong></div>
+          <div class="summary-item"><span>文件</span><strong id="fileCount">—</strong></div>
+          <label class="summary-item summary-red summary-filter"><span><input type="checkbox" id="includeRed" checked>红色</span><strong id="redCount">—</strong></label>
+          <label class="summary-item summary-dark summary-filter"><span><input type="checkbox" id="includeBlack" checked>黑色</span><strong id="blackCount">—</strong></label>
+        </div>
+        <p class="color-filter-hint">仅将勾选颜色的文件生成到 Markdown，原始清单保持完整。</p>
+
+        <label class="field-label" for="listInput">可编辑清单</label>
+        <textarea
+          id="listInput"
+          class="editor list-editor"
+          rows="14"
+          spellcheck="false"
+          placeholder="提取后的 QC 分组与 [red] / [black] 文件会显示在这里。"
+          disabled
+        ></textarea>
+
+        <div class="warning-list" id="warningList" aria-live="polite" hidden></div>
+
+        <div class="generate-row">
+          <div class="format-switch" role="group" aria-label="Markdown 输出格式">
+            <button type="button" class="format-option is-selected" data-format="md" aria-pressed="true" disabled>人读 Markdown</button>
+            <button type="button" class="format-option" data-format="ai-md" aria-pressed="false" disabled>AI Markdown</button>
+          </div>
+          <button class="button button-primary" type="button" id="generateButton" disabled>生成结果</button>
+        </div>
+      </article>
+    </section>
+
+    <section class="panel result-panel" aria-labelledby="result-title">
+      <div class="result-heading">
+        <div>
+          <p class="panel-kicker">OUTPUT</p>
+          <h2 id="result-title">Markdown 结果</h2>
+        </div>
+        <div class="result-meta">
+          <span id="resultCustomer">尚未生成</span>
+          <span id="resultFilename">—</span>
+        </div>
+      </div>
+
+      <textarea
+        id="resultOutput"
+        class="result-output"
+        rows="18"
+        spellcheck="false"
+        readonly
+        placeholder="生成后的 Markdown 会显示在这里。"
+        aria-label="Markdown 生成结果"
+      ></textarea>
+
+      <div class="result-actions">
+        <span class="result-hint" id="resultHint">编辑清单后，选择格式并生成。</span>
+        <div>
+          <button class="button button-secondary" type="button" id="copyButton" disabled>复制结果</button>
+          <button class="button button-primary" type="button" id="downloadButton" disabled>下载文件</button>
+        </div>
+      </div>
+    </section>
+    </section>
+
+    <section id="combinedStandardToolView" data-tool-view="combined" hidden>
+      <section class="intro standard-intro" aria-labelledby="combinedStandard-page-title">
+        <div class="intro-copy">
+          <p class="eyebrow">STANDARD FILES</p>
+          <h1 id="combinedStandard-page-title" tabindex="-1">标准文件提交与升级清单提取</h1>
+          <p class="intro-description">匹配标准文件、预览变更，确认后提交；粘贴升级清单即可生成 Markdown 写入同一客户 ecology 目录。</p>
+        </div>
+        <div class="local-note">
+          <span class="local-note-icon shield-icon" aria-hidden="true"></span>
+          <div>
+            <strong>提交前二次确认</strong>
+            <span>使用你保存的 SVN 账号</span>
+          </div>
+        </div>
+      </section>
+
+      <ol class="flow-steps standard-flow-steps" aria-label="标准文件提交流程">
+        <li class="flow-step is-active" data-standard-stage="form">
+          <span class="step-index">01</span><span><strong>配置任务</strong><small>地址、账号与清单</small></span>
+        </li>
+        <li class="flow-step" data-standard-stage="checkout">
+          <span class="step-index">02</span><span><strong>读取文件</strong><small>只取清单里的文件</small></span>
+        </li>
+        <li class="flow-step" data-standard-stage="preview">
+          <span class="step-index">03</span><span><strong>覆盖预览</strong><small>核对每项变更</small></span>
+        </li>
+        <li class="flow-step" data-standard-stage="commit">
+          <span class="step-index">04</span><span><strong>确认提交</strong><small>一次性授权</small></span>
+        </li>
+      </ol>
+
+      <div class="standard-layout">
+        <article class="panel standard-form-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">CONFIGURE</p>
+              <h2>创建提交预览</h2>
+            </div>
+            <span class="readonly-tag">不直接提交</span>
+          </div>
+
+          <div class="inline-error-summary" id="combinedStandardErrorSummary" role="alert" tabindex="-1" hidden></div>
+          <div class="source-profile-alert" id="combinedSourceProfileAlert" hidden>
+            <strong>服务端尚未配置标准文件来源</strong>
+            <span>请联系管理员配置可用的标准文件来源。</span>
+          </div>
+
+          <form id="combinedStandardTaskForm" autocomplete="off" novalidate>
+            <fieldset class="standard-form-section">
+              <legend>SVN 连接</legend>
+              <label class="field-label" for="combinedStandardSvnUrl">客户 SVN 地址</label>
+              <input class="text-input" id="combinedStandardSvnUrl" type="url" inputmode="url" autocapitalize="none" autocomplete="off" spellcheck="false" placeholder="https://svn.example.com/svn/customer/ecology">
+              <p class="input-help">地址须以 <code>ecology</code> 目录结尾，一次提交一个仓库。</p>
+
+              <p class="credential-note">使用已保存的 SVN 账号提交。<button class="text-button" type="button" data-open-svn-account>管理账号 ↗</button></p>
+            </fieldset>
+
+            <fieldset class="standard-form-section">
+              <legend>标准文件来源</legend>
+              <label class="field-label" for="combinedStandardSourceProfile">来源配置</label>
+              <select class="text-input" id="combinedStandardSourceProfile" disabled>
+                <option value="">正在读取服务端配置…</option>
+              </select>
+              <p class="profile-detail" id="combinedStandardSourceProfileDetail">选择本次使用的标准文件或历史文件来源。</p>
+              <label class="field-label" for="combinedStandardCustomerPath">客户来源目录</label>
+              <input class="text-input" id="combinedStandardCustomerPath" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="\\192.168.7.215\ECOLOGY_customer\Y\客户名称\QC123456\ecology">
+              <p class="input-help">粘贴所选共享下的客户 <code>ecology</code> 目录。也可粘贴任务描述，系统会自动去掉目录前后的说明文字。</p>
+            </fieldset>
+
+            <fieldset class="standard-form-section">
+              <legend>升级清单提取</legend>
+              <p class="input-help">把网页里的升级清单（保留红黑颜色）直接粘贴到下方，系统会提取并生成 Markdown，写入上方所选客户的 <code>ecology</code> 目录。</p>
+              <div class="field-label-row">
+                <label class="field-label" for="combinedUpgradeHtml">升级清单</label>
+                <output id="combinedUpgradeState" class="input-state" data-state="empty">等待粘贴</output>
+              </div>
+              <textarea class="editor editor-compact" id="combinedUpgradeHtml" rows="7" spellcheck="false" placeholder="在这里按 Ctrl / Cmd + V 粘贴网页中的带颜色升级清单…"></textarea>
+              <div class="panel-actions standard-form-actions">
+                <button class="button button-secondary" id="combinedUpgradeGenerateButton" type="button" disabled>
+                  <span class="button-label" data-default="生成 Markdown 到标准目录">生成 Markdown 到标准目录</span>
+                </button>
+                <button class="button button-secondary" id="combinedUpgradeClearButton" type="button">清空</button>
+              </div>
+              <div class="upgrade-markdown-result" id="combinedUpgradeResult" role="status" aria-live="polite" hidden></div>
+            </fieldset>
+
+            <fieldset class="standard-form-section">
+              <legend>提交内容</legend>
+              <div class="field-label-row">
+                <label class="field-label" for="combinedStandardFileList">文件清单</label>
+                <button class="text-button compact-text-button" id="combinedStandardSampleButton" type="button">加载示例</button>
+              </div>
+              <textarea class="editor standard-file-list" id="combinedStandardFileList" rows="11" spellcheck="false" placeholder="每行一个 ecology 下的相对文件路径，例如 src/weaver/example/Demo.java"></textarea>
+              <div class="field-footer">
+                <span>每行一个相对路径，不含 URL、$/ 或颜色标记。</span>
+                <output id="combinedStandardFileCount">0 行</output>
+              </div>
+              <label class="cover-all-confirm" id="combinedStandardCoverAllConfirmWrap">
+                <input id="combinedStandardCoverAllConfirm" type="checkbox">
+                <span><strong>清单为空：覆盖全部交集文件</strong><small>只覆盖 SVN 最新版本与客户标准目录中同时存在的文件；不会新增标准目录独有文件。</small></span>
+              </label>
+
+              <label class="field-label" for="combinedStandardCommitMessage">提交说明</label>
+              <input class="text-input" id="combinedStandardCommitMessage" type="text" maxlength="500" autocomplete="off" placeholder="例如：QC123456 补充标准文件">
+              <div class="field-footer"><span>此说明将原样写入 SVN。</span><output id="combinedStandardMessageCount">0 / 500</output></div>
+            </fieldset>
+
+            <div class="panel-actions standard-form-actions">
+              <button class="button button-primary" id="combinedCreateStandardPreviewButton" type="submit" disabled>
+                <span class="button-label" data-default="创建提交预览">创建提交预览</span><span class="button-arrow" aria-hidden="true">→</span>
+              </button>
+              <button class="button button-secondary" id="combinedResetStandardFormButton" type="reset">清空</button>
+            </div>
+          </form>
+        </article>
+
+        <article class="panel standard-task-panel" aria-labelledby="combinedStandard-task-title">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">TASK</p>
+              <h2 id="combinedStandard-task-title">任务状态</h2>
+            </div>
+            <span class="task-status-badge" id="combinedStandardTaskStateBadge" data-state="idle">尚未创建</span>
+          </div>
+
+          <div class="task-status-card" id="combinedStandardTaskStatus" role="status" aria-live="polite" aria-atomic="true">
+            <span class="task-status-icon" aria-hidden="true"></span>
+            <div><strong>等待配置</strong><span>填写左侧信息后创建提交预览。</span></div>
+          </div>
+
+          <div class="task-progress-track" aria-hidden="true"><span id="combinedStandardTaskProgressBar"></span></div>
+          <p class="input-help" id="combinedStandardTaskReference" hidden></p>
+
+          <div class="standard-task-empty" id="combinedStandardTaskEmptyState">
+            <span class="empty-state-mark" aria-hidden="true">↗</span>
+            <strong>先预览，再提交</strong>
+            <p>先看清每个文件的变更，确认无误后再提交。这一步不会改动 SVN。</p>
+          </div>
+
+          <section id="combinedStandardPreviewSection" hidden>
+            <div class="preview-heading">
+              <div><p class="panel-kicker">PREVIEW</p><h3 id="combinedStandardPreviewTitle" tabindex="-1">提交预览</h3></div>
+              <span id="combinedStandardPreviewRevision">—</span>
+            </div>
+            <div class="preview-summary-grid" id="combinedStandardPreviewSummary"></div>
+            <div class="preview-issues" id="combinedStandardPreviewIssues" role="alert" hidden></div>
+            <div class="preview-table-wrap">
+              <table class="preview-table">
+                <caption class="sr-only">待提交标准文件列表</caption>
+                <thead><tr><th scope="col">文件</th><th scope="col">来源</th><th scope="col">结果</th></tr></thead>
+                <tbody id="combinedStandardPreviewItems"></tbody>
+              </table>
+            </div>
+            <div class="standard-preview-actions">
+              <button class="button button-primary" id="combinedConfirmStandardCommitButton" type="button" disabled>核对并确认提交</button>
+              <button class="button button-secondary" id="combinedCancelStandardTaskButton" type="button">取消并清理</button>
+            </div>
+          </section>
+
+          <section class="standard-result" id="combinedStandardCommitResult" hidden>
+            <div class="result-mark" id="combinedStandardResultMark" aria-hidden="true">✓</div>
+            <div><p class="panel-kicker">RESULT</p><h3 id="combinedStandardResultTitle">处理完成</h3><p id="combinedStandardResultMessage"></p></div>
+            <div class="result-revision" id="combinedStandardResultRevision" hidden></div>
+            <div class="result-url-head" id="combinedStandardResultUrlHead" hidden>
+              <span id="combinedStandardResultUrlCount"></span>
+              <button class="text-button" id="combinedStandardCopyUrlsButton" type="button">复制文件路径</button>
+            </div>
+            <div class="result-url-list" id="combinedStandardResultUrls"></div>
+          </section>
+
+          <details class="task-log-panel" id="combinedStandardTaskLogPanel">
+            <summary>查看安全执行记录</summary>
+            <ol class="task-log" id="combinedStandardTaskLog"></ol>
+          </details>
+        </article>
+      </div>
+    </section>
+
     <footer class="site-footer">
       <span>SVN Sync Tool <span aria-hidden="true">/</span> 升级工具中心</span>
       <span title="{% if deployed.short %}{{ deployed.subject }} · {{ deployed.deployed_at }} · {{ deployed.by }}{% endif %}">Web · v{{ app_version }}{% if deployed.short %} · {{ deployed.short }}{% endif %}</span>
     </footer>
+
   </main>
   </div>
 
@@ -454,6 +766,30 @@
       <div class="dialog-actions">
         <button class="button button-secondary" id="closeStandardCommitDialogButton" type="button">返回检查</button>
         <button class="button button-danger" id="submitStandardCommitButton" type="button" disabled>
+          <span class="button-label" data-default="确认并提交 SVN">确认并提交 SVN</span>
+        </button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="commit-dialog" id="combinedStandardCommitDialog" aria-labelledby="combinedStandardCommitDialogTitle">
+    <form method="dialog">
+      <p class="panel-kicker">FINAL CHECK</p>
+      <h2 id="combinedStandardCommitDialogTitle">确认提交 SVN</h2>
+      <p class="dialog-description">确认后会真正提交到 SVN。请核对地址、文件数量和提交说明。</p>
+      <dl class="commit-dialog-summary">
+        <div><dt>SVN 地址</dt><dd id="combinedDialogSvnUrl">—</dd></div>
+        <div><dt>变更文件</dt><dd id="combinedDialogFileCount">—</dd></div>
+        <div><dt>提交说明</dt><dd id="combinedDialogCommitMessage">—</dd></div>
+      </dl>
+      <label class="commit-acknowledge">
+        <input id="combinedStandardCommitAcknowledge" type="checkbox">
+        <span>我已核对预览，并确认只提交以上文件。</span>
+      </label>
+      <div class="dialog-error" id="combinedStandardCommitDialogError" role="alert" hidden></div>
+      <div class="dialog-actions">
+        <button class="button button-secondary" id="combinedCloseStandardCommitDialogButton" type="button">返回检查</button>
+        <button class="button button-danger" id="combinedSubmitStandardCommitButton" type="button" disabled>
           <span class="button-label" data-default="确认并提交 SVN">确认并提交 SVN</span>
         </button>
       </div>

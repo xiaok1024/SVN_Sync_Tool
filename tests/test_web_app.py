@@ -100,8 +100,12 @@ class WebAppApiTest(unittest.TestCase):
         self.assertIn("升级工具中心", response.text)
         self.assertIn("SVN SYNC TOOL", response.text)
         self.assertIn("标准文件提交与升级清单提取", response.text)
-        self.assertNotIn("data-tool-link=\"upgrade\"", response.text)
-        self.assertNotIn("data-standard-stage=\"cleanup\"", response.text)
+        # 旧的两个页面必须保留：升级清单导航与旧标准页的收尾阶段都在。
+        self.assertIn('data-tool-link="upgrade"', response.text)
+        self.assertIn('data-standard-stage="cleanup"', response.text)
+        # 新合并页去掉收尾阶段（其为页面最后一个工具视图）。
+        combined = response.text.split('id="combinedStandardToolView"', 1)[1]
+        self.assertNotIn('data-standard-stage="cleanup"', combined)
         self.assertIn("版本号路径生成", response.text)
         self.assertIn("default-src 'self'", response.headers["content-security-policy"])
         self.assertEqual(response.headers["x-frame-options"], "DENY")

@@ -1,10 +1,77 @@
 "use strict";
 
+const MAX_HTML_FILE_BYTES = 1024 * 1024;
+
+const SAMPLE_HTML = `
+<style>
+  .upgrade-file { color: rgb(232, 63, 63); }
+  .context-file { color: #222222; }
+</style>
+<div>QC123456 优化门户登录体验 —— 门户</div>
+<div class="upgrade-file">https://svn.example.com/svn/customer/ecology/src/com/example/LoginService.java(V120)</div>
+<div class="context-file">https://svn.example.com/svn/customer/ecology/src/com/example/LoginConfig.java(V118)</div>
+<div>QC123457 修复移动端展示问题 —— 移动端</div>
+<div style="color: #d92d20">https://svn.example.com/svn/customer/ecology/mobile/js/demo/page.js(V121)</div>
+`;
+
+const state = {
+  richHtml: "",
+  format: "md",
+  filename: "",
+  result: "",
+  suppressSourceInput: false,
+  sourceRevision: 0,
+  listRevision: 0,
+};
+
 const elements = {
+  sourceInput: document.querySelector("#sourceInput"),
+  sourceState: document.querySelector("#sourceState"),
+  htmlFile: document.querySelector("#htmlFile"),
+  fileButton: document.querySelector("#fileButton"),
+  sampleButton: document.querySelector("#sampleButton"),
+  extractButton: document.querySelector("#extractButton"),
+  clearButton: document.querySelector("#clearButton"),
+  listInput: document.querySelector("#listInput"),
+  generateButton: document.querySelector("#generateButton"),
+  warningList: document.querySelector("#warningList"),
+  resultOutput: document.querySelector("#resultOutput"),
+  resultCustomer: document.querySelector("#resultCustomer"),
+  resultFilename: document.querySelector("#resultFilename"),
+  resultHint: document.querySelector("#resultHint"),
+  copyButton: document.querySelector("#copyButton"),
+  downloadButton: document.querySelector("#downloadButton"),
   notice: document.querySelector("#notice"),
+  qcCount: document.querySelector("#qcCount"),
+  fileCount: document.querySelector("#fileCount"),
+  redCount: document.querySelector("#redCount"),
+  blackCount: document.querySelector("#blackCount"),
+  includeRed: document.querySelector("#includeRed"),
+  includeBlack: document.querySelector("#includeBlack"),
+  formatButtons: Array.from(document.querySelectorAll(".format-option")),
+  stages: Array.from(document.querySelectorAll("#upgradeToolView .flow-step")),
 };
 
 let noticeTimer = null;
+
+function setSourceValue(value) {
+  state.suppressSourceInput = true;
+  elements.sourceInput.value = value;
+  state.suppressSourceInput = false;
+}
+
+function setSourceState(kind, message) {
+  elements.sourceState.dataset.state = kind;
+  elements.sourceState.textContent = message;
+}
+
+function setStage(stage) {
+  elements.stages.forEach((item, index) => {
+    const step = index + 1;
+    item.classList.toggle("is-active", step === stage);
+    item.classList.toggle("is-complete", step < stage);
+  });
+}
 
 function showNotice(message, kind = "info") {
   window.clearTimeout(noticeTimer);
@@ -25,6 +92,58 @@ function setButtonBusy(button, busy, busyText) {
     if (!button.dataset.label) button.dataset.label = button.textContent.trim();
     button.textContent = busy ? busyText : button.dataset.label;
   }
+}
+
+function resetResult(message = "编辑清单后，选择格式并生成。") {
+  state.filename = "";
+  state.result = "";
+  elements.resultOutput.value = "";
+  elements.resultCustomer.textContent = "尚未生成";
+  elements.resultFilename.textContent = "—";
+  elements.resultHint.textContent = message;
+  elements.copyButton.disabled = true;
+  elements.downloadButton.disabled = true;
+}
+
+function resetReview(message = "编辑清单后，选择格式并生成。") {
+  state.listRevision += 1;
+  elements.listInput.value = "";
+  elements.listInput.disabled = true;
+  elements.generateButton.disabled = true;
+  elements.formatButtons.forEach((button) => {
+    button.disabled = true;
+  });
+  updateSummary();
+  showWarnings();
+  resetResult(message);
+  setStage(1);
+}
+
+function invalidateSourceRevision() {
+  state.sourceRevision += 1;
+  resetReview("源内容已变化，请重新提取升级清单。");
+}
+
+function updateSummary(summary = null) {
+  elements.qcCount.textContent = summary ? String(summary.qc_count) : "—";
+  elements.fileCount.textContent = summary ? String(summary.file_line_count) : "—";
+  elements.redCount.textContent = summary ? String(summary.red_count) : "—";
+  elements.blackCount.textContent = summary ? String(summary.black_count) : "—";
+}
+
+function showWarnings(warnings = []) {
+  elements.warningList.replaceChildren();
+  if (!warnings.length) {
+    elements.warningList.hidden = true;
+    return;
+  }
+  warnings.forEach((warning) => {
+    const item = document.createElement("p");
+    item.className = "warning-item";
+    item.textContent = warning.message;
+    elements.warningList.append(item);
+  });
+  elements.warningList.hidden = false;
 }
 
 /** 服务端没有返回统一错误体时的兜底说明，避免把 404 误读成业务失败。 */
@@ -74,6 +193,101 @@ function plainTextFromHtml(html) {
   return (parsed.body.textContent || "").replace(/\n{3,}/g, "\n\n").trim();
 }
 
+function loadRichHtml(html, label) {
+  invalidateSourceRevision();
+  state.richHtml = html;
+  setSourceValue(plainTextFromHtml(html));
+  setSourceState("rich", label);
+  elements.sourceInput.focus();
+}
+
+function invalidateSource() {
+  if (state.suppressSourceInput) return;
+  invalidateSourceRevision();
+  state.richHtml = "";
+  setSourceState(elements.sourceInput.value.trim() ? "plain" : "empty",
+    elements.sourceInput.value.trim() ? "仅检测到纯文本" : "等待粘贴");
+}
+
+async function extractList() {
+  let html = state.richHtml;
+  const sourceText = elements.sourceInput.value.trim();
+  if (!html && /^\s*</.test(sourceText)) html = sourceText;
+  if (!html) {
+    showNotice("没有检测到富文本 HTML，请重新从网页复制或读取 HTML 文件。", "warning");
+    elements.sourceInput.focus();
+    return;
+  }
+  const sourceRevision = state.sourceRevision;
+  setButtonBusy(elements.extractButton, true, "正在提取…");
+  try {
+    const data = await postJson("/api/v1/upgrade-list/extract", { html });
+    if (sourceRevision !== state.sourceRevision) return;
+    elements.listInput.disabled = false;
+    elements.listInput.value = data.list_text;
+    elements.generateButton.disabled = false;
+    elements.formatButtons.forEach((button) => {
+      button.disabled = false;
+    });
+    state.listRevision += 1;
+    updateSummary(data.summary);
+    showWarnings(data.warnings);
+    resetResult("清单已提取，可以校对后生成 Markdown。");
+    setStage(2);
+    showNotice(`已提取 ${data.summary.qc_count} 个 QC、${data.summary.file_line_count} 个文件。`, "success");
+    elements.listInput.focus();
+  } catch (error) {
+    if (sourceRevision !== state.sourceRevision) return;
+    showNotice(error.message, "error");
+  } finally {
+    setButtonBusy(elements.extractButton, false);
+  }
+}
+
+async function generateMarkdown() {
+  const listText = elements.listInput.value;
+  if (!listText.trim()) {
+    showNotice("请先提取或填写升级清单。", "warning");
+    elements.listInput.focus();
+    return;
+  }
+  if (!elements.includeRed.checked && !elements.includeBlack.checked) {
+    showNotice("请至少勾选红色或黑色文件。", "warning");
+    elements.includeRed.focus();
+    return;
+  }
+  const listRevision = state.listRevision;
+  resetResult("正在生成 Markdown…");
+  setButtonBusy(elements.generateButton, true, "正在生成…");
+  try {
+    const data = await postJson("/api/v1/upgrade-list/generate", {
+      list_text: listText,
+      format: state.format,
+      include_red: elements.includeRed.checked,
+      include_black: elements.includeBlack.checked,
+    });
+    if (listRevision !== state.listRevision) return;
+    state.filename = data.filename;
+    state.result = data.content;
+    elements.resultOutput.value = data.content;
+    elements.resultCustomer.textContent = `客户：${data.customer}`;
+    elements.resultFilename.textContent = data.filename;
+    elements.resultHint.textContent = `共 ${data.stats.qc} 个 QC、${data.stats.unique_files} 个唯一文件。`;
+    elements.copyButton.disabled = false;
+    elements.downloadButton.disabled = false;
+    showWarnings(data.warnings);
+    setStage(3);
+    showNotice("Markdown 已生成。", "success");
+    elements.resultOutput.focus();
+  } catch (error) {
+    if (listRevision !== state.listRevision) return;
+    showNotice(error.message, "error");
+  } finally {
+    setButtonBusy(elements.generateButton, false);
+    elements.generateButton.disabled = elements.listInput.disabled || !elements.listInput.value.trim();
+  }
+}
+
 /** 复制纯文本到剪贴板，返回是否成功。
  *
  * 只写 text/plain，绝不带样式：办公软件的富文本框会优先取 text/html，
@@ -115,86 +329,149 @@ async function copyPlainText(text) {
   return copied;
 }
 
-const STANDARD_SAMPLE = `src/com/example/LoginService.java
-WEB-INF/prop/example-login.properties`;
+async function copyResult() {
+  if (!state.result) return;
+  const copied = await copyPlainText(state.result);
+  showNotice(copied ? "结果已复制到剪贴板。" : "复制失败，请手工复制。",
+             copied ? "success" : "error");
+}
 
-const standardState = {
-  profilesReady: false,
-  richHtml: "",
-  suppressCombinedInput: false,
-  taskId: null,
-  accessToken: null,
-  confirmationToken: null,
-  commitIdempotencyKey: null,
-  previewSignature: null,
-  task: null,
-  pollTimer: null,
-  pollFailures: 0,
-  resultUrls: [],
-};
+function downloadResult() {
+  if (!state.result || !state.filename) return;
+  const blob = new Blob([state.result], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = state.filename;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+  showNotice(`已下载 ${state.filename}。`, "success");
+}
 
-const standardElements = {
-  toolLinks: Array.from(document.querySelectorAll("[data-tool-link]")),
-  toolViews: Array.from(document.querySelectorAll("[data-tool-view]")),
-  stages: Array.from(document.querySelectorAll("#standardToolView .flow-step")),
-  form: document.querySelector("#standardTaskForm"),
-  errorSummary: document.querySelector("#standardErrorSummary"),
-  profileAlert: document.querySelector("#sourceProfileAlert"),
-  svnUrl: document.querySelector("#standardSvnUrl"),
-  sourceProfile: document.querySelector("#standardSourceProfile"),
-  sourceProfileDetail: document.querySelector("#standardSourceProfileDetail"),
-  customerPath: document.querySelector("#standardCustomerPath"),
-  fileList: document.querySelector("#standardFileList"),
-  fileCount: document.querySelector("#standardFileCount"),
-  coverAllConfirm: document.querySelector("#standardCoverAllConfirm"),
-  coverAllConfirmWrap: document.querySelector("#standardCoverAllConfirmWrap"),
-  commitMessage: document.querySelector("#standardCommitMessage"),
-  messageCount: document.querySelector("#standardMessageCount"),
-  sampleButton: document.querySelector("#standardSampleButton"),
-  createButton: document.querySelector("#createStandardPreviewButton"),
-  resetButton: document.querySelector("#resetStandardFormButton"),
-  combinedUpgrade: document.querySelector("#combinedUpgradeHtml"),
-  combinedUpgradeState: document.querySelector("#combinedUpgradeState"),
-  combinedUpgradeButton: document.querySelector("#combinedUpgradeGenerateButton"),
-  combinedUpgradeClear: document.querySelector("#combinedUpgradeClearButton"),
-  combinedUpgradeResult: document.querySelector("#combinedUpgradeResult"),
-  stateBadge: document.querySelector("#standardTaskStateBadge"),
-  status: document.querySelector("#standardTaskStatus"),
-  taskReference: document.querySelector("#standardTaskReference"),
-  progressBar: document.querySelector("#standardTaskProgressBar"),
-  emptyState: document.querySelector("#standardTaskEmptyState"),
-  previewSection: document.querySelector("#standardPreviewSection"),
-  previewTitle: document.querySelector("#standardPreviewTitle"),
-  previewRevision: document.querySelector("#standardPreviewRevision"),
-  previewSummary: document.querySelector("#standardPreviewSummary"),
-  previewIssues: document.querySelector("#standardPreviewIssues"),
-  previewItems: document.querySelector("#standardPreviewItems"),
-  confirmButton: document.querySelector("#confirmStandardCommitButton"),
-  cancelButton: document.querySelector("#cancelStandardTaskButton"),
-  result: document.querySelector("#standardCommitResult"),
-  resultMark: document.querySelector("#standardResultMark"),
-  resultTitle: document.querySelector("#standardResultTitle"),
-  resultMessage: document.querySelector("#standardResultMessage"),
-  resultRevision: document.querySelector("#standardResultRevision"),
-  resultUrls: document.querySelector("#standardResultUrls"),
-  resultUrlHead: document.querySelector("#standardResultUrlHead"),
-  resultUrlCount: document.querySelector("#standardResultUrlCount"),
-  copyUrlsButton: document.querySelector("#standardCopyUrlsButton"),
-  log: document.querySelector("#standardTaskLog"),
-  dialog: document.querySelector("#standardCommitDialog"),
-  dialogSvnUrl: document.querySelector("#dialogSvnUrl"),
-  dialogFileCount: document.querySelector("#dialogFileCount"),
-  dialogCommitMessage: document.querySelector("#dialogCommitMessage"),
-  acknowledge: document.querySelector("#standardCommitAcknowledge"),
-  dialogError: document.querySelector("#standardCommitDialogError"),
-  submitCommitButton: document.querySelector("#submitStandardCommitButton"),
-  closeDialogButton: document.querySelector("#closeStandardCommitDialogButton"),
-};
+function clearWorkspace() {
+  state.sourceRevision += 1;
+  state.richHtml = "";
+  state.format = "md";
+  elements.includeRed.checked = true;
+  elements.includeBlack.checked = true;
+  setSourceValue("");
+  setSourceState("empty", "等待粘贴");
+  elements.htmlFile.value = "";
+  resetReview();
+  elements.formatButtons.forEach((button) => {
+    const selected = button.dataset.format === "md";
+    button.classList.toggle("is-selected", selected);
+    button.setAttribute("aria-pressed", String(selected));
+  });
+  elements.sourceInput.focus();
+}
+
+elements.sourceInput.addEventListener("paste", (event) => {
+  const html = event.clipboardData?.getData("text/html") || "";
+  const text = event.clipboardData?.getData("text/plain") || "";
+  if (html) {
+    event.preventDefault();
+    invalidateSourceRevision();
+    state.richHtml = html;
+    setSourceValue(text || plainTextFromHtml(html));
+    setSourceState("rich", "已保留富文本颜色");
+    showNotice("已读取富文本，可以开始提取。", "success");
+  } else {
+    window.setTimeout(() => {
+      state.richHtml = "";
+      setSourceState("plain", "仅检测到纯文本");
+      showNotice("当前剪贴板没有 HTML，红黑颜色可能已经丢失。", "warning");
+    }, 0);
+  }
+});
+
+elements.sourceInput.addEventListener("input", invalidateSource);
+elements.sourceInput.addEventListener("keydown", (event) => {
+  if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+    event.preventDefault();
+    extractList();
+  }
+});
+
+elements.listInput.addEventListener("input", () => {
+  state.listRevision += 1;
+  resetResult("清单已修改，请重新生成 Markdown。");
+  elements.generateButton.disabled = !elements.listInput.value.trim();
+  setStage(2);
+});
+elements.listInput.addEventListener("keydown", (event) => {
+  if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+    event.preventDefault();
+    generateMarkdown();
+  }
+});
+
+elements.sampleButton.addEventListener("click", () => {
+  loadRichHtml(SAMPLE_HTML, "已加载演示富文本");
+  showNotice("示例已载入，点击“提取升级清单”查看效果。", "info");
+});
+elements.fileButton.addEventListener("click", () => elements.htmlFile.click());
+elements.htmlFile.addEventListener("change", async () => {
+  const file = elements.htmlFile.files?.[0];
+  if (!file) return;
+  if (file.size > MAX_HTML_FILE_BYTES) {
+    elements.htmlFile.value = "";
+    showNotice("HTML 文件超过 1 MiB 限制。", "error");
+    return;
+  }
+  try {
+    const html = await file.text();
+    loadRichHtml(html, `已读取 ${file.name}`);
+    showNotice("HTML 文件已读取，可以开始提取。", "success");
+  } catch (_error) {
+    showNotice("读取 HTML 文件失败。", "error");
+  }
+});
+
+elements.formatButtons.forEach((button) => {
+  button.addEventListener("click", () => {
+    state.listRevision += 1;
+    state.format = button.dataset.format;
+    elements.formatButtons.forEach((item) => {
+      const selected = item === button;
+      item.classList.toggle("is-selected", selected);
+      item.setAttribute("aria-pressed", String(selected));
+    });
+    resetResult("输出格式已切换，请重新生成。");
+    setStage(2);
+  });
+});
+
+[elements.includeRed, elements.includeBlack].forEach((checkbox) => {
+  checkbox.addEventListener("change", () => {
+    state.listRevision += 1;
+    resetResult("颜色选择已变化，请重新生成 Markdown。");
+    if (!elements.listInput.disabled) setStage(2);
+  });
+});
+
+elements.extractButton.addEventListener("click", extractList);
+elements.generateButton.addEventListener("click", generateMarkdown);
+elements.clearButton.addEventListener("click", clearWorkspace);
+elements.copyButton.addEventListener("click", copyResult);
+elements.downloadButton.addEventListener("click", downloadResult);
+
+/** 工具导航：四个工作区共用同一套 hash 路由。 */
+const toolLinks = Array.from(document.querySelectorAll("[data-tool-link]"));
+const toolViews = Array.from(document.querySelectorAll("[data-tool-view]"));
 
 /** 键的顺序即导航顺序；第一项同时是无 hash 时的默认工具。 */
 const TOOLS = {
   path: { hash: "#revision-paths", title: "#path-page-title", name: "版本号路径生成" },
-  standard: { hash: "#svn-standard", title: "#standard-page-title", name: "标准文件提交与升级清单提取" },
+  standard: { hash: "#svn-standard", title: "#standard-page-title", name: "SVN 标准文件提交" },
+  upgrade: { hash: "#upgrade-list", title: "#page-title", name: "升级清单提取" },
+  combined: {
+    hash: "#standard-combined",
+    title: "#combinedStandard-page-title",
+    name: "标准文件提交与升级清单提取",
+  },
 };
 const DEFAULT_TOOL = Object.keys(TOOLS)[0];
 
@@ -205,10 +482,10 @@ function toolFromHash(hash) {
 
 function selectTool(tool, focusTitle = false) {
   const selected = TOOLS[tool] ? tool : DEFAULT_TOOL;
-  standardElements.toolViews.forEach((view) => {
+  toolViews.forEach((view) => {
     view.hidden = view.dataset.toolView !== selected;
   });
-  standardElements.toolLinks.forEach((link) => {
+  toolLinks.forEach((link) => {
     if (link.dataset.toolLink === selected) {
       link.setAttribute("aria-current", "page");
     } else {
@@ -224,7 +501,7 @@ function selectTool(tool, focusTitle = false) {
   }
 }
 
-standardElements.toolLinks.forEach((link) => {
+toolLinks.forEach((link) => {
   link.addEventListener("click", (event) => {
     event.preventDefault();
     selectTool(link.dataset.toolLink, true);
@@ -238,6 +515,84 @@ standardElements.toolLinks.forEach((link) => {
 window.addEventListener("hashchange", () => {
   selectTool(toolFromHash(window.location.hash));
 });
+
+/**
+ * 标准文件工作区的唯一实现。老页面（5 个阶段，保留收尾）与合并页面
+ * （4 个阶段，配置任务里带升级清单提取）共用这套逻辑，只按前缀取元素。
+ * options: idFor / sessionKey / stageOrder / showCleanup / upgrade
+ */
+function createStandardPage(options) {
+  const byId = (suffix) => document.getElementById(options.idFor(suffix));
+  let upgradeElements = null;
+
+const STANDARD_SAMPLE = `src/com/example/LoginService.java
+WEB-INF/prop/example-login.properties`;
+
+const standardState = {
+  profilesReady: false,
+  taskId: null,
+  accessToken: null,
+  confirmationToken: null,
+  commitIdempotencyKey: null,
+  previewSignature: null,
+  task: null,
+  pollTimer: null,
+  pollFailures: 0,
+  resultUrls: [],
+  richHtml: "",
+  suppressCombinedInput: false,
+};
+
+const standardElements = {
+  stages: Array.from(byId("standardToolView").querySelectorAll(".flow-step")),
+  form: byId("standardTaskForm"),
+  errorSummary: byId("standardErrorSummary"),
+  profileAlert: byId("sourceProfileAlert"),
+  svnUrl: byId("standardSvnUrl"),
+  sourceProfile: byId("standardSourceProfile"),
+  sourceProfileDetail: byId("standardSourceProfileDetail"),
+  customerPath: byId("standardCustomerPath"),
+  fileList: byId("standardFileList"),
+  fileCount: byId("standardFileCount"),
+  coverAllConfirm: byId("standardCoverAllConfirm"),
+  coverAllConfirmWrap: byId("standardCoverAllConfirmWrap"),
+  commitMessage: byId("standardCommitMessage"),
+  messageCount: byId("standardMessageCount"),
+  sampleButton: byId("standardSampleButton"),
+  createButton: byId("createStandardPreviewButton"),
+  resetButton: byId("resetStandardFormButton"),
+  stateBadge: byId("standardTaskStateBadge"),
+  status: byId("standardTaskStatus"),
+  taskReference: byId("standardTaskReference"),
+  progressBar: byId("standardTaskProgressBar"),
+  emptyState: byId("standardTaskEmptyState"),
+  previewSection: byId("standardPreviewSection"),
+  previewTitle: byId("standardPreviewTitle"),
+  previewRevision: byId("standardPreviewRevision"),
+  previewSummary: byId("standardPreviewSummary"),
+  previewIssues: byId("standardPreviewIssues"),
+  previewItems: byId("standardPreviewItems"),
+  confirmButton: byId("confirmStandardCommitButton"),
+  cancelButton: byId("cancelStandardTaskButton"),
+  result: byId("standardCommitResult"),
+  resultMark: byId("standardResultMark"),
+  resultTitle: byId("standardResultTitle"),
+  resultMessage: byId("standardResultMessage"),
+  resultRevision: byId("standardResultRevision"),
+  resultUrls: byId("standardResultUrls"),
+  resultUrlHead: byId("standardResultUrlHead"),
+  resultUrlCount: byId("standardResultUrlCount"),
+  copyUrlsButton: byId("standardCopyUrlsButton"),
+  log: byId("standardTaskLog"),
+  dialog: byId("standardCommitDialog"),
+  dialogSvnUrl: byId("dialogSvnUrl"),
+  dialogFileCount: byId("dialogFileCount"),
+  dialogCommitMessage: byId("dialogCommitMessage"),
+  acknowledge: byId("standardCommitAcknowledge"),
+  dialogError: byId("standardCommitDialogError"),
+  submitCommitButton: byId("submitStandardCommitButton"),
+  closeDialogButton: byId("closeStandardCommitDialogButton"),
+};
 
 function standardApiError(message, code = "request_failed") {
   const error = new Error(message);
@@ -287,7 +642,7 @@ function updateStandardCounters() {
 }
 
 function setStandardStage(stage) {
-  const order = ["form", "checkout", "preview", "commit"];
+  const order = options.stageOrder;
   const activeIndex = stage === "done" ? order.length : Math.max(0, order.indexOf(stage));
   standardElements.stages.forEach((item, index) => {
     item.classList.toggle("is-active", index === activeIndex);
@@ -296,10 +651,12 @@ function setStandardStage(stage) {
 }
 
 function stageForTask(task) {
-  if (task.status === "committed") return "done";
+  if (task.status === "committed"
+      && (!options.showCleanup || task.cleanup?.status === "cleaned")) return "done";
   if (["queued", "preparing"].includes(task.status)) return "checkout";
   if (task.status === "preview_ready") return "preview";
   if (["commit_queued", "committing"].includes(task.status)) return "commit";
+  if (task.status === "committed") return options.showCleanup ? "cleanup" : "done";
   if (task.status === "commit_unknown" || task.error?.code?.startsWith("commit_")) return "commit";
   if (["no_changes", "failed", "expired", "cancelled"].includes(task.status)) {
     return task.checkout_revision ? "preview" : "checkout";
@@ -467,109 +824,21 @@ function normalizeCustomerPathField() {
   if (cleaned !== standardElements.customerPath.value) standardElements.customerPath.value = cleaned;
 }
 
-function setCombinedUpgradeValue(value) {
-  standardState.suppressCombinedInput = true;
-  standardElements.combinedUpgrade.value = value;
-  standardState.suppressCombinedInput = false;
-}
-
-function setCombinedUpgradeState(kind, message) {
-  standardElements.combinedUpgradeState.dataset.state = kind;
-  standardElements.combinedUpgradeState.textContent = message;
-}
-
-function updateCombinedUpgradeButton() {
-  standardElements.combinedUpgradeButton.disabled =
-    !standardElements.combinedUpgrade.value.trim();
-}
-
-function resetCombinedUpgradeResult() {
-  standardElements.combinedUpgradeResult.hidden = true;
-  standardElements.combinedUpgradeResult.replaceChildren();
-}
-
-function resetCombinedUpgradeFormState() {
-  standardState.richHtml = "";
-  setCombinedUpgradeValue("");
-  setCombinedUpgradeState("empty", "等待粘贴");
-  resetCombinedUpgradeResult();
-  updateCombinedUpgradeButton();
-}
-
-function renderCombinedUpgradeResult(data) {
-  standardElements.combinedUpgradeResult.replaceChildren();
-  const stats = data.stats || {};
-  const lines = [`已写入 Markdown：${data.filename}`];
-  if (data.customer) lines.push(`客户：${data.customer}`);
-  lines.push(`QC：${stats.qc ?? "—"} · 唯一文件：${stats.unique_files ?? "—"}`);
-  (data.warnings || []).forEach((warning) => {
-    if (warning && warning.message) lines.push(`提示：${warning.message}`);
-  });
-  lines.forEach((text) => {
-    const paragraph = document.createElement("p");
-    paragraph.textContent = text;
-    standardElements.combinedUpgradeResult.append(paragraph);
-  });
-  standardElements.combinedUpgradeResult.hidden = false;
-}
-
-async function generateCombinedUpgradeMarkdown() {
-  const html = standardState.richHtml || standardElements.combinedUpgrade.value;
-  if (!html.trim()) {
-    showNotice("请先粘贴升级清单。", "warning");
-    standardElements.combinedUpgrade.focus();
-    return;
-  }
-  const profileId = standardElements.sourceProfile.value;
-  if (!profileId) {
-    showNotice("请先选择标准文件来源。", "warning");
-    standardElements.sourceProfile.focus();
-    return;
-  }
-  const customerPath = standardElements.customerPath.value.trim();
-  if (!customerPath) {
-    showNotice("请先填写客户来源目录。", "warning");
-    standardElements.customerPath.focus();
-    return;
-  }
-  resetCombinedUpgradeResult();
-  setButtonBusy(standardElements.combinedUpgradeButton, true, "正在生成…");
-  try {
-    const data = await standardRequest("/api/v1/standard-files/upgrade-markdown", {
-      method: "POST",
-      payload: {
-        html,
-        source_profile_id: profileId,
-        customer_standard_path: customerPath,
-      },
-    });
-    renderCombinedUpgradeResult(data);
-    setCombinedUpgradeState("rich", "已写入标准目录");
-    showNotice(`已生成 ${data.filename} 并写入客户标准文件目录。`, "success");
-  } catch (error) {
-    setCombinedUpgradeState("plain", "生成失败");
-    showNotice(error.message, "error");
-  } finally {
-    setButtonBusy(standardElements.combinedUpgradeButton, false);
-    updateCombinedUpgradeButton();
-  }
-}
-
 function saveStandardTaskSession() {
   if (!standardState.taskId || !standardState.accessToken) return;
-  sessionStorage.setItem("lzr-standard-task", JSON.stringify({
+  sessionStorage.setItem(options.sessionKey, JSON.stringify({
     id: standardState.taskId,
     token: standardState.accessToken,
   }));
 }
 
 function clearStandardTaskSession() {
-  sessionStorage.removeItem("lzr-standard-task");
+  sessionStorage.removeItem(options.sessionKey);
 }
 
 function restoreStandardTaskSession() {
   try {
-    const saved = JSON.parse(sessionStorage.getItem("lzr-standard-task") || "null");
+    const saved = JSON.parse(sessionStorage.getItem(options.sessionKey) || "null");
     if (saved?.id && saved?.token) {
       standardState.taskId = saved.id;
       standardState.accessToken = saved.token;
@@ -626,7 +895,8 @@ function scheduleStandardPoll(delay = 1500) {
 
 function schedulePollForStandardTask(task, activeDelay = 1500) {
   const active = ["queued", "preparing", "preview_ready", "commit_queued", "committing"].includes(task.status);
-  const terminalCleanupPending = ["committed", "no_changes", "failed", "expired", "cancelled", "commit_unknown"]
+  const terminalCleanupPending = options.showCleanup
+    && ["committed", "no_changes", "failed", "expired", "cancelled", "commit_unknown"]
     .includes(task.status) && task.cleanup?.status !== "cleaned";
   if (active) {
     scheduleStandardPoll(task.status === "preview_ready" ? 5000 : activeDelay);
@@ -758,11 +1028,19 @@ function renderStandardResult(task) {
   standardElements.resultUrlHead.hidden = true;
   standardState.resultUrls = [];
   const cleanupStatus = task.cleanup?.status || "pending";
+  const cleanupText = !options.showCleanup ? ""
+    : (cleanupStatus === "cleaned"
+      ? "服务器上的临时文件已清理。"
+      : (cleanupStatus === "failed"
+        ? "临时文件清理未完成，后台会继续重试。"
+        : "临时文件正在清理中。"));
   if (task.status === "committed") {
     standardElements.result.dataset.kind = "success";
     standardElements.resultMark.textContent = "✓";
     standardElements.resultTitle.textContent = "SVN 提交成功";
-    standardElements.resultMessage.textContent = "提交结果已经保存，请通知相关人员更新 SVN 最新版本。";
+    standardElements.resultMessage.textContent = options.showCleanup
+      ? `提交结果已经保存，${cleanupText}请通知相关人员更新 SVN 最新版本。`
+      : "提交结果已经保存，请通知相关人员更新 SVN 最新版本。";
     if (task.result?.revision) {
       standardElements.resultRevision.textContent = `Revision r${task.result.revision}`;
       standardElements.resultRevision.hidden = false;
@@ -782,15 +1060,19 @@ function renderStandardResult(task) {
     standardElements.result.dataset.kind = "success";
     standardElements.resultMark.textContent = "✓";
     standardElements.resultTitle.textContent = "无需提交";
-    standardElements.resultMessage.textContent = "标准文件与仓库内容一致，没有创建新的 SVN 版本。";
+    standardElements.resultMessage.textContent = options.showCleanup
+      ? `标准文件与仓库内容一致，没有创建新的 SVN 版本；${cleanupText}`
+      : "标准文件与仓库内容一致，没有创建新的 SVN 版本。";
   } else if (task.status === "commit_unknown") {
     standardElements.result.dataset.kind = "warning";
     standardElements.resultMark.textContent = "?";
     standardElements.resultTitle.textContent = "提交结果需要核验";
-    const unknownText = cleanupStatus === "pending"
-      ? "相关文件会保留 1 小时以便你核对，之后自动清理。" : "";
+    const unknownCleanupText = !options.showCleanup ? ""
+      : (cleanupStatus === "pending"
+        ? "相关文件会保留 1 小时以便你核对，之后自动清理。"
+        : cleanupText);
     standardElements.resultMessage.textContent =
-      `${task.error?.message || "请勿重复提交，并在 SVN 日志中核验本次提交说明。"} ${unknownText}`.trim();
+      `${task.error?.message || "请勿重复提交，并在 SVN 日志中核验本次提交说明。"} ${unknownCleanupText}`.trim();
     const markerLine = document.createElement("p");
     markerLine.textContent = `核验提交说明：${task.commit_message}`;
     standardElements.resultUrls.append(markerLine);
@@ -800,7 +1082,7 @@ function renderStandardResult(task) {
     standardElements.resultMark.textContent = cancelled ? "×" : "!";
     standardElements.resultTitle.textContent = cancelled ? "任务已取消" : "任务未完成";
     const baseMessage = task.error?.message || "任务已停止，没有向 SVN 提交任何内容。";
-    standardElements.resultMessage.textContent = baseMessage;
+    standardElements.resultMessage.textContent = `${baseMessage} ${cleanupText}`.trim();
   }
 }
 
@@ -816,7 +1098,10 @@ function renderStandardTask(task) {
     task.status === "preview_ready"
       ? (task.can_commit ? "预览已固定，核对后可进行一次性提交。" : "预览存在阻塞项，当前不能提交。")
       : (active ? "任务正在服务器上执行。"
-        : "任务已结束。")
+        : (!options.showCleanup ? "任务已结束。"
+          : (task.cleanup?.status === "cleaned" ? "任务已结束，服务器临时文件已清理。"
+            : (task.cleanup?.status === "failed" ? "任务已结束，临时文件清理失败，后台会重试。"
+              : "任务已结束，临时文件等待清理。"))))
   );
   setStandardStatus(task.stage_label, detail, {
     active,
@@ -941,33 +1226,6 @@ standardElements.fileList.addEventListener("input", updateStandardCounters);
 standardElements.customerPath.addEventListener("paste", () => window.setTimeout(normalizeCustomerPathField, 0));
 standardElements.customerPath.addEventListener("change", normalizeCustomerPathField);
 standardElements.coverAllConfirm.addEventListener("change", clearStandardErrors);
-standardElements.combinedUpgrade.addEventListener("paste", (event) => {
-  const html = event.clipboardData?.getData("text/html") || "";
-  const text = event.clipboardData?.getData("text/plain") || "";
-  if (html) {
-    event.preventDefault();
-    standardState.richHtml = html;
-    setCombinedUpgradeValue(text || plainTextFromHtml(html));
-    setCombinedUpgradeState("rich", "已保留富文本颜色");
-    resetCombinedUpgradeResult();
-    updateCombinedUpgradeButton();
-  } else {
-    window.setTimeout(() => {
-      standardState.richHtml = "";
-      setCombinedUpgradeState("plain", "仅检测到纯文本");
-    }, 0);
-  }
-});
-standardElements.combinedUpgrade.addEventListener("input", () => {
-  if (standardState.suppressCombinedInput) return;
-  standardState.richHtml = "";
-  resetCombinedUpgradeResult();
-  const hasText = Boolean(standardElements.combinedUpgrade.value.trim());
-  setCombinedUpgradeState(hasText ? "plain" : "empty", hasText ? "仅检测到纯文本" : "等待粘贴");
-  updateCombinedUpgradeButton();
-});
-standardElements.combinedUpgradeButton.addEventListener("click", generateCombinedUpgradeMarkdown);
-standardElements.combinedUpgradeClear.addEventListener("click", resetCombinedUpgradeFormState);
 standardElements.copyUrlsButton.addEventListener("click", async () => {
   const count = standardState.resultUrls.length;
   const copied = await copyPlainText(standardState.resultUrls.join("\n"));
@@ -992,6 +1250,168 @@ standardElements.acknowledge.addEventListener("change", () => {
 });
 standardElements.closeDialogButton.addEventListener("click", () => standardElements.dialog.close());
 standardElements.submitCommitButton.addEventListener("click", submitStandardCommit);
+
+  /** 升级清单提取：复用升级清单接口，把 Markdown 直接写进客户 ecology 目录。 */
+  function setCombinedUpgradeValue(value) {
+    standardState.suppressCombinedInput = true;
+    upgradeElements.input.value = value;
+    standardState.suppressCombinedInput = false;
+  }
+
+  function setCombinedUpgradeState(kind, message) {
+    upgradeElements.state.dataset.state = kind;
+    upgradeElements.state.textContent = message;
+  }
+
+  function updateCombinedUpgradeButton() {
+    upgradeElements.generate.disabled = !upgradeElements.input.value.trim();
+  }
+
+  function resetCombinedUpgradeResult() {
+    upgradeElements.result.hidden = true;
+    upgradeElements.result.replaceChildren();
+  }
+
+  function resetCombinedUpgradeFormState() {
+    if (!upgradeElements) return;
+    standardState.richHtml = "";
+    setCombinedUpgradeValue("");
+    setCombinedUpgradeState("empty", "等待粘贴");
+    resetCombinedUpgradeResult();
+    updateCombinedUpgradeButton();
+  }
+
+  function renderCombinedUpgradeResult(data) {
+    upgradeElements.result.replaceChildren();
+    const stats = data.stats || {};
+    const lines = [`已写入 Markdown：${data.filename}`];
+    if (data.customer) lines.push(`客户：${data.customer}`);
+    lines.push(`QC：${stats.qc ?? "—"} · 唯一文件：${stats.unique_files ?? "—"}`);
+    (data.warnings || []).forEach((warning) => {
+      if (warning && warning.message) lines.push(`提示：${warning.message}`);
+    });
+    lines.forEach((text) => {
+      const paragraph = document.createElement("p");
+      paragraph.textContent = text;
+      upgradeElements.result.append(paragraph);
+    });
+    upgradeElements.result.hidden = false;
+  }
+
+  async function writeCombinedUpgradeMarkdown() {
+    const html = standardState.richHtml || upgradeElements.input.value;
+    if (!html.trim()) {
+      showNotice("请先粘贴升级清单。", "warning");
+      upgradeElements.input.focus();
+      return;
+    }
+    const profileId = standardElements.sourceProfile.value;
+    if (!profileId) {
+      showNotice("请先选择可用的标准文件来源。", "warning");
+      standardElements.sourceProfile.focus();
+      return;
+    }
+    const customerPath = standardElements.customerPath.value.trim();
+    if (!customerPath) {
+      showNotice("请先填写客户来源目录。", "warning");
+      standardElements.customerPath.focus();
+      return;
+    }
+    resetCombinedUpgradeResult();
+    setButtonBusy(upgradeElements.generate, true, "正在生成…");
+    try {
+      const data = await standardRequest("/api/v1/standard-files/upgrade-markdown", {
+        method: "POST",
+        payload: {
+          html,
+          source_profile_id: profileId,
+          customer_standard_path: customerPath,
+        },
+      });
+      renderCombinedUpgradeResult(data);
+      setCombinedUpgradeState("rich", "已写入标准目录");
+      showNotice(`已生成 ${data.filename} 并写入客户标准文件目录。`, "success");
+    } catch (error) {
+      setCombinedUpgradeState("plain", "生成失败");
+      showNotice(error.message, "error");
+    } finally {
+      setButtonBusy(upgradeElements.generate, false);
+      updateCombinedUpgradeButton();
+    }
+  }
+
+  function bindUpgradeWriter() {
+    upgradeElements = {
+      input: document.getElementById(options.upgrade.input),
+      state: document.getElementById(options.upgrade.state),
+      generate: document.getElementById(options.upgrade.generate),
+      clear: document.getElementById(options.upgrade.clear),
+      result: document.getElementById(options.upgrade.result),
+    };
+    upgradeElements.input.addEventListener("paste", (event) => {
+      const html = event.clipboardData?.getData("text/html") || "";
+      const text = event.clipboardData?.getData("text/plain") || "";
+      if (html) {
+        event.preventDefault();
+        standardState.richHtml = html;
+        setCombinedUpgradeValue(text || plainTextFromHtml(html));
+        setCombinedUpgradeState("rich", "已保留富文本颜色");
+        resetCombinedUpgradeResult();
+        updateCombinedUpgradeButton();
+      } else {
+        window.setTimeout(() => {
+          standardState.richHtml = "";
+          setCombinedUpgradeState("plain", "仅检测到纯文本");
+        }, 0);
+      }
+    });
+    upgradeElements.input.addEventListener("input", () => {
+      if (standardState.suppressCombinedInput) return;
+      standardState.richHtml = "";
+      resetCombinedUpgradeResult();
+      const hasText = Boolean(upgradeElements.input.value.trim());
+      setCombinedUpgradeState(hasText ? "plain" : "empty", hasText ? "仅检测到纯文本" : "等待粘贴");
+      updateCombinedUpgradeButton();
+    });
+    upgradeElements.generate.addEventListener("click", writeCombinedUpgradeMarkdown);
+    upgradeElements.clear.addEventListener("click", resetCombinedUpgradeFormState);
+    resetCombinedUpgradeFormState();
+  }
+
+  if (options.upgrade) bindUpgradeWriter();
+
+  return {
+    init() {
+      updateStandardCounters();
+      restoreStandardTaskSession();
+    },
+    loadProfiles: loadStandardProfiles,
+  };
+}
+
+/** 老页面：保留 5 个阶段（含收尾），与升级清单提取页面互相独立。 */
+const standardPage = createStandardPage({
+  idFor: (suffix) => suffix,
+  sessionKey: "lzr-standard-task",
+  stageOrder: ["form", "checkout", "preview", "commit", "cleanup"],
+  showCleanup: true,
+  upgrade: null,
+});
+
+/** 新页面：标准文件提交去掉收尾，并把升级清单提取合并进配置任务。 */
+const combinedPage = createStandardPage({
+  idFor: (suffix) => `combined${suffix.charAt(0).toUpperCase()}${suffix.slice(1)}`,
+  sessionKey: "lzr-standard-task-combined",
+  stageOrder: ["form", "checkout", "preview", "commit"],
+  showCleanup: false,
+  upgrade: {
+    input: "combinedUpgradeHtml",
+    state: "combinedUpgradeState",
+    generate: "combinedUpgradeGenerateButton",
+    clear: "combinedUpgradeClearButton",
+    result: "combinedUpgradeResult",
+  },
+});
 
 const PATH_MAX_REVISIONS = 200;
 const PATH_SORT_LABELS = { rev: "按版本排序", path: "按路径排序", name: "按文件名排序" };
@@ -1287,8 +1707,8 @@ pathElements.copyButton.addEventListener("click", copyPathResult);
 pathElements.downloadButton.addEventListener("click", downloadPathResult);
 
 selectTool(toolFromHash(window.location.hash));
-updateStandardCounters();
-restoreStandardTaskSession();
+standardPage.init();
+combinedPage.init();
 updatePathRevisionCount();
 
 // 右上角连接状态：HTTPS 才算加密；本机 http 调试时如实标为未加密
@@ -1386,7 +1806,10 @@ function applyUser(user) {
   syncOverlayState();
   if (signedIn) {
     // 来源列表需要登录才能读取，因此在登录成功后（含刷新页面时的会话恢复）再拉取
-    if (!wasSignedIn) loadStandardProfiles();
+    if (!wasSignedIn) {
+      standardPage.loadProfiles();
+      combinedPage.loadProfiles();
+    }
     authElements.accountName.textContent = user.display_name || user.username;
     authElements.svnButton.textContent = user.has_svn_credentials
       ? "我的 SVN 账号" : "我的 SVN 账号 · 待设置";

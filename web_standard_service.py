@@ -10,10 +10,12 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import ntpath
 import os
 import re
 import secrets
 import shutil
+import stat
 import tempfile
 import threading
 import time
@@ -81,6 +83,42 @@ DEFAULT_HISTORICAL_UNC_PREFIXES = (
     r"\\192.168.7.173\ecology-customer2",
 )
 
+_WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def _is_unc_path(value):
+    r"""是否为 ``\\server\share`` 形式的 UNC 路径。"""
+    text = unicodedata.normalize("NFC", str(value or "").strip().strip('"'))
+    return bool(re.match(r"^\\\\[^\\/]+\\[^\\/]+(?:[\\/].*)?$", text))
+
+
+def _is_windows_absolute_path(value):
+    """是否为 Windows 盘符或 UNC 绝对路径。"""
+    text = unicodedata.normalize("NFC", str(value or "").strip().strip('"'))
+    return bool(_WINDOWS_DRIVE_RE.match(text) or _is_unc_path(text))
+
+
+def _join_path_root(root, *parts):
+    """按根路径的写法拼接，避免 Windows/Linux 分隔符混用。"""
+    text = str(root or "")
+    if _is_windows_absolute_path(text):
+        return ntpath.join(text, *[str(part) for part in parts])
+    if text.startswith("/"):
+        return str(PurePosixPath(text).joinpath(*parts))
+    return os.path.join(text, *[str(part) for part in parts])
+
+
+def _rmtree_force(path):
+    """Remove a directory tree, clearing read-only attributes when Windows requires it."""
+    def clear_readonly_and_retry(func, target, exc_info):
+        try:
+            os.chmod(target, stat.S_IWRITE)
+        except OSError:
+            pass
+        func(target)
+
+    shutil.rmtree(path, onerror=clear_readonly_and_retry)
+
 
 class StandardWebError(WebSvnError):
     """标准文件任务的业务错误；结构与其他 Web SVN 功能保持一致。"""
@@ -129,10 +167,19 @@ class SourceProfile:
         return _same_unc_prefix(self.unc_prefix, DEFAULT_STANDARD_UNC_PREFIX)
 
     def match_prefix(self, value):
-        """返回 ``value`` 命中的共享根；不在白名单内返回 ``None``。"""
+        r"""返回 ``value`` 命中的共享根；不在白名单内返回 ``None``。
+
+        Windows 还接受直接粘贴服务端配置的本地来源根（通常是盘符或 UNC）；
+        这样配置了 ``standard_path=D:\...`` 后，页面粘贴同一路径即可命中。
+        """
         normalized = unicodedata.normalize("NFC", str(value or "").strip().strip('"'))
         normalized = normalized.replace("/", "\\").rstrip("\\").lower()
-        for prefix in self.unc_prefixes:
+        prefixes = list(self.unc_prefixes)
+        if os.name == "nt" and self.standard_path:
+            local_prefix = str(self.standard_path).strip().rstrip("\\/")
+            if local_prefix:
+                prefixes.append(local_prefix)
+        for prefix in prefixes:
             key = unicodedata.normalize("NFC", prefix).replace("/", "\\").rstrip("\\").lower()
             if normalized == key or normalized.startswith(key + "\\"):
                 return prefix
@@ -142,12 +189,13 @@ class SourceProfile:
         """把命中的共享根映射到本地目录。
 
         配了 mount_root 时按 ``<root>/<主机>/<共享>`` 推导（挂载脚本用同一规则）；
-        否则退回单共享时代的 standard_path。
+        否则退回单共享时代的 standard_path。Windows 下 standard_path 可直接是
+        盘符目录或 UNC 共享根。
         """
         if self.mount_root:
             parts = unicodedata.normalize("NFC", prefix).replace("/", "\\").strip("\\").split("\\")
             if len(parts) >= 2:
-                return os.path.join(self.mount_root, parts[0], parts[1])
+                return _join_path_root(self.mount_root, parts[0], parts[1])
         return self.standard_path
 
     @property
@@ -173,6 +221,9 @@ class SourceProfile:
     @property
     def available(self):
         if self.standard_path and os.path.isdir(self.standard_path):
+            return True
+        if os.name == "nt" and any(
+                _is_unc_path(prefix) and os.path.isdir(prefix) for prefix in self.unc_prefixes):
             return True
         if self.mount_root and any(
                 _mount_ready(self.local_root_for(prefix)) for prefix in self.unc_prefixes):
@@ -699,7 +750,7 @@ class StandardJobManager:
                            attempt=job.cleanup_attempts, reason="unsafe_job_directory")
             return False
         try:
-            shutil.rmtree(job.job_dir)
+            _rmtree_force(job.job_dir)
         except OSError as exc:
             job.cleanup_status = "failed"
             job.diagnostic("cleanup_failed", level=logging.ERROR,
@@ -729,7 +780,7 @@ class StandardJobManager:
                     started = time.monotonic()
                     log_event("orphan_cleanup_started", job_id=child.name)
                     try:
-                        shutil.rmtree(child)
+                        _rmtree_force(child)
                     except OSError as exc:
                         log_event("orphan_cleanup_failed", level=logging.ERROR,
                                   job_id=child.name, **exception_fields(exc))
@@ -906,6 +957,12 @@ class StandardJobManager:
         # 多共享时按命中的共享根取各自挂载点；单共享沿用 standard_path。
         prefix = unc_prefix or profile.unc_prefix
         local_root = profile.local_root_for(prefix)
+        if os.name == "nt" and profile.standard_path:
+            # Windows 本地部署：standard_path 就是实际来源根（盘符或 UNC）。
+            # 不再走 macOS mount_smbfs，也不要求先挂载。
+            if os.path.isdir(profile.standard_path):
+                return Path(profile.standard_path).resolve(strict=True)
+            raise RuntimeError("服务端标准文件来源目录不存在或不可访问")
         if profile.mount_root:
             # Linux 部署：共享由 systemd 预先挂好，服务不自行挂载；掉线要明确报出来
             if _mount_ready(local_root):
@@ -913,6 +970,11 @@ class StandardJobManager:
             raise RuntimeError("服务端共享 %s 当前未挂载或已断开" % prefix)
         if local_root and os.path.isdir(local_root):
             return Path(local_root).resolve(strict=True)
+        if os.name == "nt" and _is_unc_path(prefix):
+            # Windows 原生支持 UNC，直接访问；共享不可用时给出明确错误。
+            if os.path.isdir(prefix):
+                return Path(prefix).resolve(strict=True)
+            raise RuntimeError("服务端共享 %s 当前不可访问" % prefix)
         with self._source_mount_lock:
             if local_root and os.path.isdir(local_root):
                 return Path(local_root).resolve(strict=True)
@@ -1116,12 +1178,14 @@ class StandardJobManager:
         else:
             matched_prefix = profile.unc_prefix
             source_relative = "."
-        if profile.mount_root and not _mount_ready(profile.local_root_for(matched_prefix)):
-            # 建任务时就拒绝，而不是等后台检出后再以「目录不存在」失败
-            raise StandardWebError(
-                "source_share_unmounted",
-                "服务端共享 %s 当前未挂载或已断开，请稍后再试；持续出现请联系维护者"
-                % matched_prefix, 503)
+        if profile.mount_root and not (os.name == "nt" and profile.standard_path):
+            # 建任务时就拒绝，而不是等后台检出后再以「目录不存在」失败。
+            # Windows 直接使用 standard_path / UNC，不要求预先挂载。
+            if not _mount_ready(profile.local_root_for(matched_prefix)):
+                raise StandardWebError(
+                    "source_share_unmounted",
+                    "服务端共享 %s 当前未挂载或已断开，请稍后再试；持续出现请联系维护者"
+                    % matched_prefix, 503)
         relative_paths = parse_web_file_list(file_list)
         selection_mode = "listed" if relative_paths else "intersection"
         if selection_mode == "intersection" and not profile.allows_cover_all:
