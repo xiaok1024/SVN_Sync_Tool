@@ -544,6 +544,8 @@ const standardState = {
   autoCustomerPath: "",
   autoSvnUrl: "",
   allowedSvnPrefixes: [],
+  autoMarkdownDone: false,
+  autoMarkdownJobId: null,
 };
 
 const standardElements = {
@@ -964,6 +966,8 @@ async function createStandardTask(event) {
     standardState.confirmationToken = null;
     standardState.commitIdempotencyKey = null;
     standardState.previewSignature = null;
+    standardState.autoMarkdownDone = false;
+    standardState.autoMarkdownJobId = null;
     standardState.pollFailures = 0;
     saveStandardTaskSession();
     setStandardFormLocked(true);
@@ -1207,6 +1211,7 @@ function renderStandardTask(task) {
   if (["committed", "no_changes", "failed", "expired", "cancelled", "commit_unknown"].includes(task.status)) {
     renderStandardResult(task);
   }
+  maybeAutoWriteCombinedUpgradeMarkdown(task);
 }
 
 function openStandardCommitDialog() {
@@ -1288,6 +1293,8 @@ function releaseStandardTaskState() {
   standardState.confirmationToken = null;
   standardState.commitIdempotencyKey = null;
   standardState.previewSignature = null;
+  standardState.autoMarkdownDone = false;
+  standardState.autoMarkdownJobId = null;
   standardState.task = null;
   clearStandardTaskSession();
   setStandardFormLocked(false);
@@ -1426,6 +1433,8 @@ standardElements.stages.forEach((item, index) => {
   function resetCombinedUpgradeFormState() {
     if (!upgradeElements) return;
     standardState.richHtml = "";
+    standardState.autoMarkdownDone = false;
+    standardState.autoMarkdownJobId = null;
     setCombinedUpgradeValue("");
     setCombinedUpgradeState("empty", "等待粘贴");
     resetCombinedUpgradeResult();
@@ -1449,27 +1458,34 @@ standardElements.stages.forEach((item, index) => {
     upgradeElements.result.hidden = false;
   }
 
-  async function writeCombinedUpgradeMarkdown() {
+  async function writeCombinedUpgradeMarkdown(options = {}) {
+    const auto = Boolean(options.auto);
     const html = standardState.richHtml || upgradeElements.input.value;
     if (!html.trim()) {
-      showNotice("请先粘贴升级清单。", "warning");
-      upgradeElements.input.focus();
+      if (!auto) {
+        showNotice("请先粘贴升级清单。", "warning");
+        upgradeElements.input.focus();
+      }
       return;
     }
     const profileId = standardElements.sourceProfile.value;
     if (!profileId) {
-      showNotice("请先选择可用的标准文件来源。", "warning");
-      standardElements.sourceProfile.focus();
+      if (!auto) {
+        showNotice("请先选择可用的标准文件来源。", "warning");
+        standardElements.sourceProfile.focus();
+      }
       return;
     }
     const customerPath = standardElements.customerPath.value.trim();
     if (!customerPath) {
-      showNotice("请先填写客户来源目录。", "warning");
-      standardElements.customerPath.focus();
+      if (!auto) {
+        showNotice("请先填写客户来源目录。", "warning");
+        standardElements.customerPath.focus();
+      }
       return;
     }
     resetCombinedUpgradeResult();
-    setButtonBusy(upgradeElements.generate, true, "正在生成…");
+    if (!auto) setButtonBusy(upgradeElements.generate, true, "正在生成…");
     try {
       const data = await standardRequest("/api/v1/standard-files/upgrade-markdown", {
         method: "POST",
@@ -1480,15 +1496,31 @@ standardElements.stages.forEach((item, index) => {
         },
       });
       renderCombinedUpgradeResult(data);
-      setCombinedUpgradeState("rich", "已写入标准目录");
-      showNotice(`已生成 ${data.filename} 并写入客户标准文件目录。`, "success");
+      setCombinedUpgradeState("rich", auto ? "已自动写入标准目录" : "已写入标准目录");
+      showNotice(auto
+        ? `已自动生成 ${data.filename} 并覆盖写入客户标准文件目录。`
+        : `已生成 ${data.filename} 并写入客户标准文件目录。`, "success");
     } catch (error) {
       setCombinedUpgradeState("plain", "生成失败");
       showNotice(error.message, "error");
     } finally {
-      setButtonBusy(upgradeElements.generate, false);
+      if (!auto) setButtonBusy(upgradeElements.generate, false);
       updateCombinedUpgradeButton();
     }
+  }
+
+  /** 预览就绪且已同步到本地后，自动把升级清单写入客户标准目录（每次覆盖）。 */
+  function maybeAutoWriteCombinedUpgradeMarkdown(task) {
+    if (!options.upgrade || !upgradeElements || !task) return false;
+    if (!["preview_ready", "no_changes"].includes(task.status)) return false;
+    if (standardState.autoMarkdownJobId !== task.id) {
+      standardState.autoMarkdownJobId = task.id;
+      standardState.autoMarkdownDone = false;
+    }
+    if (standardState.autoMarkdownDone) return false;
+    standardState.autoMarkdownDone = true;
+    void writeCombinedUpgradeMarkdown({ auto: true });
+    return true;
   }
 
   function bindUpgradeWriter() {

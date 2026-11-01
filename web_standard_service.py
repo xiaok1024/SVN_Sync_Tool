@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import logging
@@ -1323,6 +1324,17 @@ class StandardJobManager:
                     temp_path.unlink()
             except OSError:
                 pass
+            denied = isinstance(exc, PermissionError) or getattr(exc, "errno", None) in (
+                errno.EACCES, errno.EPERM, errno.EROFS)
+            log_event("upgrade_markdown_write_failed", level=logging.WARNING,
+                      actor=actor, request_id=request_id,
+                      error_code="share_write_denied" if denied else "write_failed",
+                      **exception_fields(exc))
+            if denied:
+                raise StandardWebError(
+                    "share_write_denied",
+                    "标准文件共享没有写权限：当前连接账号对该目录只有读权限。"
+                    "请提供有写权限的 SMB/共享账号后重试。", 503) from exc
             raise StandardWebError(
                 "write_failed", "写入标准文件目录失败，请稍后再试", 503) from exc
 

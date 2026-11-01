@@ -145,6 +145,12 @@ class WebAppApiTest(unittest.TestCase):
         self.assertLess(create_at, reset_at)
         self.assertLess(reset_at, status_at)
 
+    def test_combined_task_actions_are_right_aligned(self):
+        """合并页的任务操作按钮在任务状态面板里靠右展示。"""
+        css = self.client.get("/static/styles.css").text
+        self.assertIn(
+            ".standard-task-actions { justify-content: flex-end;", css)
+
     def test_allowed_hosts_only_come_from_loopback_and_environment(self):
         """旧开发机名和测试桩不该写死在生产白名单里。"""
         hosts = web_app._allowed_hosts()
@@ -311,6 +317,45 @@ class WebAppApiTest(unittest.TestCase):
                 app.state.standard_jobs = original
                 manager.stop()
 
+    def test_standard_upgrade_markdown_reports_share_write_denied(self):
+        """共享目录写权限不足时必须给出可执行的提示，而不是笼统的写入失败。"""
+        from pathlib import PureWindowsPath
+        from unittest import mock
+        from web_standard_service import (
+            DEFAULT_STANDARD_UNC_PREFIX,
+            SourceProfile,
+            StandardJobManager,
+        )
+        with tempfile.TemporaryDirectory() as job_root, tempfile.TemporaryDirectory() as source:
+            target = Path(source, "Y", "示例客户", "QC123456", "ecology")
+            target.mkdir(parents=True)
+            manager = StandardJobManager(
+                profiles=[SourceProfile(
+                    "default", "测试来源", standard_path=source,
+                    unc_prefix=DEFAULT_STANDARD_UNC_PREFIX)],
+                temp_root=job_root, min_free_bytes=0, require_password_stdin=False,
+            )
+            original = app.state.standard_jobs
+            app.state.standard_jobs = manager
+            try:
+                customer_path = str(PureWindowsPath(DEFAULT_STANDARD_UNC_PREFIX)
+                                    / "Y" / "示例客户" / "QC123456" / "ecology")
+                with mock.patch("os.open", side_effect=PermissionError(13, "denied")):
+                    response = self.client.post(
+                        "/api/v1/standard-files/upgrade-markdown",
+                        json={
+                            "html": SAMPLE_HTML,
+                            "source_profile_id": "default",
+                            "customer_standard_path": customer_path,
+                        },
+                    )
+                self.assertEqual(response.status_code, 503)
+                error = response.json()["error"]
+                self.assertEqual(error["code"], "share_write_denied")
+                self.assertIn("写权限", error["message"])
+            finally:
+                app.state.standard_jobs = original
+                manager.stop()
     def test_standard_upgrade_markdown_rejects_extra_fields_and_history_source(self):
         response = self.client.post(
             "/api/v1/standard-files/upgrade-markdown",
@@ -723,6 +768,20 @@ class WebSourceSafetyTest(unittest.TestCase):
         # 旧的单字段自动填写已被合并逻辑取代
         self.assertNotIn("applyAutoCustomerPath(plain)", javascript)
 
+    def test_preview_ready_auto_writes_upgrade_markdown(self):
+        """合并页在本地 SVN 同步完成（preview_ready/no_changes）后自动覆盖写入 Markdown。"""
+        root = Path(__file__).resolve().parents[1]
+        javascript = (root / "web" / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("function maybeAutoWriteCombinedUpgradeMarkdown(task)", javascript)
+        self.assertIn('["preview_ready", "no_changes"].includes(task.status)', javascript)
+        self.assertIn("writeCombinedUpgradeMarkdown({ auto: true })", javascript)
+        self.assertIn("autoMarkdownDone", javascript)
+        # 自动模式下不再抢占焦点、不弹校验警告
+        self.assertIn("const auto = Boolean(options.auto);", javascript)
+        self.assertIn("if (!auto) setButtonBusy(upgradeElements.generate, true", javascript)
+        # 每次自动写入都以覆盖方式落到标准目录（后端 os.replace 覆盖旧文件）
+        service = (root / "web_standard_service.py").read_text(encoding="utf-8")
+        self.assertIn("os.replace(temp_path, target)", service)
     def test_entry_requires_explicit_lan_mode(self):
         root = Path(__file__).resolve().parents[1]
         source = (root / "svn_sync_web.py").read_text(encoding="utf-8")

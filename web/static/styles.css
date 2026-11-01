@@ -221,7 +221,7 @@ select.text-input { cursor: pointer; padding-right: 26px; }
 .source-editor { flex: 1; }
 .panel-actions, .result-actions, .generate-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
 .panel-actions { justify-content: flex-start; margin-top: 22px; }
-.standard-task-actions { margin-top: 0; margin-bottom: 20px; }
+.standard-task-actions { justify-content: flex-end; margin-top: 0; margin-bottom: 20px; }
 .button {
   display: inline-flex;
   justify-content: center;
