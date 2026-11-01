@@ -488,7 +488,7 @@
         <div class="intro-copy">
           <p class="eyebrow">STANDARD FILES</p>
           <h1 id="combinedStandard-page-title" tabindex="-1">标准文件提交与升级清单提取</h1>
-          <p class="intro-description">匹配标准文件、预览变更，确认后提交；粘贴升级清单即可生成 Markdown 写入同一客户 ecology 目录。</p>
+          <p class="intro-description">匹配标准文件、预览变更，确认后提交；粘贴升级清单即可把 Markdown 生成到本地导出目录。</p>
         </div>
         <div class="local-note">
           <span class="local-note-icon shield-icon" aria-hidden="true"></span>
@@ -541,7 +541,7 @@
 
             <fieldset class="standard-form-section">
               <legend>升级清单提取</legend>
-              <p class="input-help">把网页里的升级清单（保留红黑颜色）直接粘贴到下方；系统会提取并生成 Markdown 写入所选客户的 <code>ecology</code> 目录，并自动识别客户来源目录与客户 SVN 地址。</p>
+              <p class="input-help">把网页里的升级清单（保留红黑颜色）直接粘贴到下方；系统会按客户来源目录推导本地路径，生成 <code>upgrade-file-list-ai-&lt;任务编号&gt;.md</code> 到本地导出目录，并自动识别客户来源目录与客户 SVN 地址。</p>
               <div class="field-label-row">
                 <label class="field-label" for="combinedUpgradeHtml">升级清单</label>
                 <output id="combinedUpgradeState" class="input-state" data-state="empty">等待粘贴</output>
@@ -549,7 +549,7 @@
               <textarea class="editor editor-compact" id="combinedUpgradeHtml" rows="7" spellcheck="false" placeholder="在这里按 Ctrl / Cmd + V 粘贴网页中的带颜色升级清单…"></textarea>
               <div class="panel-actions standard-form-actions">
                 <button class="button button-secondary" id="combinedUpgradeGenerateButton" type="button" disabled>
-                  <span class="button-label" data-default="生成 Markdown 到标准目录">生成 Markdown 到标准目录</span>
+                  <span class="button-label" data-default="生成 Markdown到本地目录">生成 Markdown到本地目录</span>
                 </button>
                 <button class="button button-secondary" id="combinedUpgradeClearButton" type="button">清空</button>
               </div>

@@ -28,6 +28,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 
 try:  # tomllib 是 Python 3.11+ 的标准库；3.10（如 Ubuntu 22.04）回退到 tomli
     import tomllib
@@ -1258,11 +1259,13 @@ class StandardJobManager:
         return len(text.encode("utf-8")) <= 240
 
     def write_upgrade_markdown(
-            self, *, html, profile_id, customer_standard_path, actor="", request_id=""):
-        """把粘贴近来的升级清单转成 Markdown，写入当前客户的标准文件目录。
+            self, *, html, profile_id, customer_standard_path, task_id="",
+            actor="", request_id=""):
+        r"""把粘贴近来的升级清单转成 Markdown，写入本地导出目录。
 
-        只允许写入服务端配置的固定标准共享下的 QC ecology 目录；解析与生成
-        完全复用 Web 升级清单服务，不重复实现颜色识别和 Markdown 组装。
+        目标目录与本地 SVN 导出保持一致：
+          <export_root>\分组\客户\ecology\upgrade-file-list-ai-<任务编号>.md
+        解析与生成完全复用 Web 升级清单服务，不重复实现颜色识别和 Markdown 组装。
         """
         profile = self.profiles.get(str(profile_id or "").strip())
         if not profile:
@@ -1270,7 +1273,7 @@ class StandardJobManager:
         if not profile.is_standard_share:
             raise StandardWebError(
                 "standard_source_required",
-                "升级清单 Markdown 只能写入固定标准文件共享", 403)
+                "升级清单 Markdown 只接受标准文件来源配置", 403)
         if not profile.available:
             raise StandardWebError("source_profile_unavailable", "标准文件来源当前不可用", 503)
 
@@ -1285,13 +1288,17 @@ class StandardJobManager:
         source_relative = parse_customer_standard_path(
             raw_customer_path, matched_prefix, require_qc_segment=True)
 
-        try:
-            target_dir = self._resolve_customer_source_path(
-                profile, matched_prefix, source_relative)
-        except (StandardWebError, RuntimeError) as exc:
+        if not self.export_root:
             raise StandardWebError(
-                "customer_path_unavailable",
-                "客户标准文件 ecology 目录不存在或暂不可用", 503) from exc
+                "export_root_unavailable",
+                "未配置本地导出目录（workspace.export_root），无法生成 Markdown", 503)
+        try:
+            target_dir = self._local_export_target(
+                SimpleNamespace(source_relative=source_relative))
+        except Exception as exc:
+            raise StandardWebError(
+                "local_target_unavailable",
+                "无法从客户来源目录推导本地导出路径，请检查共享根与分组层级", 503) from exc
 
         # 解析与 Markdown 生成复用 Web 升级清单服务，错误统一转成标准文件错误。
         try:
@@ -1300,7 +1307,12 @@ class StandardJobManager:
         except UpgradeWebError as exc:
             raise StandardWebError(exc.code, exc.message, exc.status_code) from None
 
-        filename = generated.get("filename", "")
+        task_number = str(task_id or "").strip().lower()
+        if not JOB_ID_RE.fullmatch(task_number):
+            raise StandardWebError(
+                "invalid_task_number",
+                "缺少有效的任务编号，请先创建提交预览后再生成 Markdown", 422)
+        filename = "upgrade-file-list-ai-%s.md" % task_number
         if not self._safe_markdown_filename(filename):
             raise StandardWebError(
                 "invalid_result_filename", "生成的 Markdown 文件名不合法")
@@ -1312,6 +1324,7 @@ class StandardJobManager:
 
         temp_path = target_dir / (".lzr-upgrade-%s.tmp" % secrets.token_hex(8))
         try:
+            target_dir.mkdir(parents=True, exist_ok=True)
             descriptor = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(descriptor, "wb") as handle:
                 handle.write(payload)
@@ -1328,15 +1341,15 @@ class StandardJobManager:
                 errno.EACCES, errno.EPERM, errno.EROFS)
             log_event("upgrade_markdown_write_failed", level=logging.WARNING,
                       actor=actor, request_id=request_id,
-                      error_code="share_write_denied" if denied else "write_failed",
+                      error_code="local_write_denied" if denied else "write_failed",
                       **exception_fields(exc))
             if denied:
                 raise StandardWebError(
-                    "share_write_denied",
-                    "标准文件共享没有写权限：当前连接账号对该目录只有读权限。"
-                    "请提供有写权限的 SMB/共享账号后重试。", 503) from exc
+                    "local_write_denied",
+                    "本地导出目录没有写权限：当前 Windows 账号无法写入该目录。"
+                    "请检查目录权限后重试。", 503) from exc
             raise StandardWebError(
-                "write_failed", "写入标准文件目录失败，请稍后再试", 503) from exc
+                "write_failed", "写入本地导出目录失败，请检查磁盘空间和目录权限后重试", 503) from exc
 
         stats = generated.get("stats") or {}
         unique_files = stats.get("unique_files")

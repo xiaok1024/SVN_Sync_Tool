@@ -131,6 +131,7 @@ class StandardUpgradeMarkdownRequest(BaseModel):
     html: str
     source_profile_id: str
     customer_standard_path: str
+    task_id: str = ""
 
 
 class RevisionPathQueryRequest(BaseModel):
@@ -605,6 +606,7 @@ async def write_standard_upgrade_markdown(request: Request):
         html=payload.html,
         profile_id=payload.source_profile_id,
         customer_standard_path=payload.customer_standard_path,
+        task_id=payload.task_id,
         actor=username,
         request_id=getattr(request.state, "request_id", ""),
     )

@@ -1409,7 +1409,7 @@ standardElements.stages.forEach((item, index) => {
   });
 });
 
-  /** 升级清单提取：复用升级清单接口，把 Markdown 直接写进客户 ecology 目录。 */
+  /** 升级清单提取：复用升级清单接口，把 Markdown 写入本地导出目录。 */
   function setCombinedUpgradeValue(value) {
     standardState.suppressCombinedInput = true;
     upgradeElements.input.value = value;
@@ -1484,6 +1484,13 @@ standardElements.stages.forEach((item, index) => {
       }
       return;
     }
+    const taskId = String(options.taskId || standardState.taskId || "").trim();
+    if (!/^[a-f0-9]{32}$/i.test(taskId)) {
+      if (!auto) {
+        showNotice("请先创建提交预览以获取任务编号，再生成 Markdown。", "warning");
+      }
+      return;
+    }
     resetCombinedUpgradeResult();
     if (!auto) setButtonBusy(upgradeElements.generate, true, "正在生成…");
     try {
@@ -1493,13 +1500,14 @@ standardElements.stages.forEach((item, index) => {
           html,
           source_profile_id: profileId,
           customer_standard_path: customerPath,
+          task_id: taskId,
         },
       });
       renderCombinedUpgradeResult(data);
-      setCombinedUpgradeState("rich", auto ? "已自动写入标准目录" : "已写入标准目录");
+      setCombinedUpgradeState("rich", auto ? "已自动写入本地目录" : "已写入本地目录");
       showNotice(auto
-        ? `已自动生成 ${data.filename} 并覆盖写入客户标准文件目录。`
-        : `已生成 ${data.filename} 并写入客户标准文件目录。`, "success");
+        ? `已自动生成 ${data.filename} 并覆盖写入本地导出目录。`
+        : `已生成 ${data.filename} 并写入本地导出目录。`, "success");
     } catch (error) {
       setCombinedUpgradeState("plain", "生成失败");
       showNotice(error.message, "error");
@@ -1509,7 +1517,7 @@ standardElements.stages.forEach((item, index) => {
     }
   }
 
-  /** 预览就绪且已同步到本地后，自动把升级清单写入客户标准目录（每次覆盖）。 */
+  /** 预览就绪且已同步到本地后，自动把升级清单写入本地导出目录（每次覆盖）。 */
   function maybeAutoWriteCombinedUpgradeMarkdown(task) {
     if (!options.upgrade || !upgradeElements || !task) return false;
     if (!["preview_ready", "no_changes"].includes(task.status)) return false;
@@ -1519,7 +1527,7 @@ standardElements.stages.forEach((item, index) => {
     }
     if (standardState.autoMarkdownDone) return false;
     standardState.autoMarkdownDone = true;
-    void writeCombinedUpgradeMarkdown({ auto: true });
+    void writeCombinedUpgradeMarkdown({ auto: true, taskId: task.id });
     return true;
   }
 

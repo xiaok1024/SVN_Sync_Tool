@@ -274,41 +274,46 @@ class WebAppApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
         self.assertEqual(response.json()["error"]["code"], "invalid_field")
 
-    def test_standard_upgrade_markdown_writes_into_selected_customer_ecology(self):
+    def test_standard_upgrade_markdown_writes_into_local_export_directory(self):
         from pathlib import PureWindowsPath
         from web_standard_service import (
             DEFAULT_STANDARD_UNC_PREFIX,
             SourceProfile,
             StandardJobManager,
         )
-        with tempfile.TemporaryDirectory() as job_root, tempfile.TemporaryDirectory() as source:
-            target = Path(source, "Y", "示例客户", "QC123456", "ecology")
-            target.mkdir(parents=True)
+        with tempfile.TemporaryDirectory() as job_root, \
+                tempfile.TemporaryDirectory() as source, \
+                tempfile.TemporaryDirectory() as export_root:
             manager = StandardJobManager(
                 profiles=[SourceProfile(
                     "default", "测试来源", standard_path=source,
                     unc_prefix=DEFAULT_STANDARD_UNC_PREFIX)],
                 temp_root=job_root, min_free_bytes=0, require_password_stdin=False,
+                export_root=export_root,
             )
             original = app.state.standard_jobs
             app.state.standard_jobs = manager
             try:
                 customer_path = str(PureWindowsPath(DEFAULT_STANDARD_UNC_PREFIX)
                                     / "Y" / "示例客户" / "QC123456" / "ecology")
+                task_id = "0123456789abcdef0123456789abcdef"
                 response = self.client.post(
                     "/api/v1/standard-files/upgrade-markdown",
                     json={
                         "html": SAMPLE_HTML,
                         "source_profile_id": "default",
                         "customer_standard_path": customer_path,
+                        "task_id": task_id,
                     },
                 )
                 self.assertEqual(response.status_code, 200)
                 payload = response.json()
                 self.assertTrue(payload["ok"])
                 self.assertTrue(payload["written"])
-                self.assertEqual(payload["filename"], "customer-upgrade-file-list.md")
-                written = target / payload["filename"]
+                self.assertEqual(
+                    payload["filename"],
+                    "upgrade-file-list-ai-" + task_id + ".md")
+                written = Path(export_root, "Y", "示例客户", "ecology", payload["filename"])
                 self.assertTrue(written.is_file())
                 self.assertIn("Test.java", written.read_text(encoding="utf-8"))
                 self.assertNotIn(source, response.text)
@@ -317,8 +322,8 @@ class WebAppApiTest(unittest.TestCase):
                 app.state.standard_jobs = original
                 manager.stop()
 
-    def test_standard_upgrade_markdown_reports_share_write_denied(self):
-        """共享目录写权限不足时必须给出可执行的提示，而不是笼统的写入失败。"""
+    def test_standard_upgrade_markdown_reports_local_write_denied(self):
+        """本地导出目录写权限不足时必须给出明确的本地目录提示。"""
         from pathlib import PureWindowsPath
         from unittest import mock
         from web_standard_service import (
@@ -326,33 +331,37 @@ class WebAppApiTest(unittest.TestCase):
             SourceProfile,
             StandardJobManager,
         )
-        with tempfile.TemporaryDirectory() as job_root, tempfile.TemporaryDirectory() as source:
-            target = Path(source, "Y", "示例客户", "QC123456", "ecology")
-            target.mkdir(parents=True)
+        with tempfile.TemporaryDirectory() as job_root, \
+                tempfile.TemporaryDirectory() as source, \
+                tempfile.TemporaryDirectory() as export_root:
             manager = StandardJobManager(
                 profiles=[SourceProfile(
                     "default", "测试来源", standard_path=source,
                     unc_prefix=DEFAULT_STANDARD_UNC_PREFIX)],
                 temp_root=job_root, min_free_bytes=0, require_password_stdin=False,
+                export_root=export_root,
             )
             original = app.state.standard_jobs
             app.state.standard_jobs = manager
             try:
                 customer_path = str(PureWindowsPath(DEFAULT_STANDARD_UNC_PREFIX)
                                     / "Y" / "示例客户" / "QC123456" / "ecology")
-                with mock.patch("os.open", side_effect=PermissionError(13, "denied")):
+                with mock.patch(
+                        "web_standard_service.os.replace",
+                        side_effect=PermissionError(13, "denied")):
                     response = self.client.post(
                         "/api/v1/standard-files/upgrade-markdown",
                         json={
                             "html": SAMPLE_HTML,
                             "source_profile_id": "default",
                             "customer_standard_path": customer_path,
+                            "task_id": "0123456789abcdef0123456789abcdef",
                         },
                     )
                 self.assertEqual(response.status_code, 503)
                 error = response.json()["error"]
-                self.assertEqual(error["code"], "share_write_denied")
-                self.assertIn("写权限", error["message"])
+                self.assertEqual(error["code"], "local_write_denied")
+                self.assertIn("本地导出目录", error["message"])
             finally:
                 app.state.standard_jobs = original
                 manager.stop()
@@ -774,14 +783,20 @@ class WebSourceSafetyTest(unittest.TestCase):
         javascript = (root / "web" / "static" / "app.js").read_text(encoding="utf-8")
         self.assertIn("function maybeAutoWriteCombinedUpgradeMarkdown(task)", javascript)
         self.assertIn('["preview_ready", "no_changes"].includes(task.status)', javascript)
-        self.assertIn("writeCombinedUpgradeMarkdown({ auto: true })", javascript)
+        self.assertIn("writeCombinedUpgradeMarkdown({ auto: true, taskId: task.id })", javascript)
+        self.assertIn("task_id: taskId", javascript)
         self.assertIn("autoMarkdownDone", javascript)
         # 自动模式下不再抢占焦点、不弹校验警告
         self.assertIn("const auto = Boolean(options.auto);", javascript)
         self.assertIn("if (!auto) setButtonBusy(upgradeElements.generate, true", javascript)
-        # 每次自动写入都以覆盖方式落到标准目录（后端 os.replace 覆盖旧文件）
+        # 每次自动写入都以覆盖方式落到本地导出目录（后端 os.replace 覆盖旧文件）
         service = (root / "web_standard_service.py").read_text(encoding="utf-8")
         self.assertIn("os.replace(temp_path, target)", service)
+        self.assertIn("target_dir.mkdir(parents=True, exist_ok=True)", service)
+        self.assertIn('"upgrade-file-list-ai-%s.md" % task_number', service)
+        html = (root / "web" / "templates" / "index.html").read_text(encoding="utf-8")
+        self.assertIn("生成 Markdown到本地目录", html)
+        self.assertNotIn("生成 Markdown 到标准目录", html)
     def test_entry_requires_explicit_lan_mode(self):
         root = Path(__file__).resolve().parents[1]
         source = (root / "svn_sync_web.py").read_text(encoding="utf-8")
