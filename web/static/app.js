@@ -1458,6 +1458,13 @@ standardElements.stages.forEach((item, index) => {
     upgradeElements.result.hidden = false;
   }
 
+  function extractQcNumberFromCommitMessage(value) {
+    const match = String(value || "").match(
+      /(?:^|[^A-Za-z0-9])(?:QC|NO)\s*(?:号|编号)?\s*[.:：]?\s*(\d{5,12})(?!\d)/i,
+    );
+    return match ? match[1] : "";
+  }
+
   async function writeCombinedUpgradeMarkdown(options = {}) {
     const auto = Boolean(options.auto);
     const html = standardState.richHtml || upgradeElements.input.value;
@@ -1484,10 +1491,15 @@ standardElements.stages.forEach((item, index) => {
       }
       return;
     }
-    const taskId = String(options.taskId || standardState.taskId || "").trim();
-    if (!/^[a-f0-9]{32}$/i.test(taskId)) {
+    const commitMessage = String(
+      options.commitMessage || standardElements.commitMessage.value || "").trim();
+    if (!extractQcNumberFromCommitMessage(commitMessage)) {
       if (!auto) {
-        showNotice("请先创建提交预览以获取任务编号，再生成 Markdown。", "warning");
+        showNotice(
+          "提交说明中未找到有效的 QC 号，请使用例如 no.5081286 或 QC5081286 的格式。",
+          "warning",
+        );
+        standardElements.commitMessage.focus();
       }
       return;
     }
@@ -1500,7 +1512,7 @@ standardElements.stages.forEach((item, index) => {
           html,
           source_profile_id: profileId,
           customer_standard_path: customerPath,
-          task_id: taskId,
+          commit_message: commitMessage,
         },
       });
       renderCombinedUpgradeResult(data);
@@ -1527,7 +1539,10 @@ standardElements.stages.forEach((item, index) => {
     }
     if (standardState.autoMarkdownDone) return false;
     standardState.autoMarkdownDone = true;
-    void writeCombinedUpgradeMarkdown({ auto: true, taskId: task.id });
+    void writeCombinedUpgradeMarkdown({
+      auto: true,
+      commitMessage: task.commit_message,
+    });
     return true;
   }
 

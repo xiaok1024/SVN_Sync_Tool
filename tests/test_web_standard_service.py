@@ -21,6 +21,7 @@ from web_standard_service import (
     DEFAULT_STANDARD_UNC_PREFIX,
     SourceProfile,
     StandardJob,
+    extract_qc_number,
     StandardJobManager,
     StandardWebError,
     WebSvnEngine,
@@ -44,6 +45,17 @@ def wait_for_job(manager, job_id, access_token, terminal_states, timeout=20):
 
 
 class StandardWebParsingTest(unittest.TestCase):
+    def test_extract_qc_number_uses_explicit_qc_or_no_marker(self):
+        self.assertEqual(
+            extract_qc_number(
+                "no.5081286 E9.00补丁：KB900220905升至KB900260901"),
+            "5081286",
+        )
+        self.assertEqual(extract_qc_number("QC5081286 标准文件"), "5081286")
+        self.assertEqual(extract_qc_number("No: 5081286 标准文件"), "5081286")
+        self.assertEqual(extract_qc_number("QC号：5081286 标准文件"), "5081286")
+        self.assertEqual(extract_qc_number("KB900220905 仅包含知识库编号"), "")
+
     def test_source_profile_discovers_credentials_from_e9_paths_registry(self):
         with tempfile.TemporaryDirectory() as root:
             secrets_root = Path(root, "secrets")

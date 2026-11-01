@@ -86,6 +86,16 @@ DEFAULT_HISTORICAL_UNC_PREFIXES = (
 )
 
 _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
+_QC_NUMBER_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:QC|NO)\s*(?:\u53f7|\u7f16\u53f7)?\s*[.:\uff1a]?\s*(\d{5,12})(?!\d)",
+    re.IGNORECASE,
+)
+
+
+def extract_qc_number(commit_message):
+    """Extract the QC number from an SVN commit message."""
+    match = _QC_NUMBER_RE.search(str(commit_message or ""))
+    return match.group(1) if match else ""
 
 
 def _is_unc_path(value):
@@ -1259,12 +1269,12 @@ class StandardJobManager:
         return len(text.encode("utf-8")) <= 240
 
     def write_upgrade_markdown(
-            self, *, html, profile_id, customer_standard_path, task_id="",
+            self, *, html, profile_id, customer_standard_path, commit_message="",
             actor="", request_id=""):
         r"""把粘贴近来的升级清单转成 Markdown，写入本地导出目录。
 
         目标目录与本地 SVN 导出保持一致：
-          <export_root>\分组\客户\ecology\upgrade-file-list-ai-<任务编号>.md
+          <export_root>\分组\客户\ecology\upgrade-file-list-ai-<QC号>.md
         解析与生成完全复用 Web 升级清单服务，不重复实现颜色识别和 Markdown 组装。
         """
         profile = self.profiles.get(str(profile_id or "").strip())
@@ -1307,12 +1317,13 @@ class StandardJobManager:
         except UpgradeWebError as exc:
             raise StandardWebError(exc.code, exc.message, exc.status_code) from None
 
-        task_number = str(task_id or "").strip().lower()
-        if not JOB_ID_RE.fullmatch(task_number):
+        qc_number = extract_qc_number(commit_message)
+        if not qc_number:
             raise StandardWebError(
-                "invalid_task_number",
-                "缺少有效的任务编号，请先创建提交预览后再生成 Markdown", 422)
-        filename = "upgrade-file-list-ai-%s.md" % task_number
+                "invalid_qc_number",
+                "提交说明中未找到有效的 QC 号，请使用例如 no.5081286 或 QC5081286 的格式",
+                422)
+        filename = "upgrade-file-list-ai-%s.md" % qc_number
         if not self._safe_markdown_filename(filename):
             raise StandardWebError(
                 "invalid_result_filename", "生成的 Markdown 文件名不合法")

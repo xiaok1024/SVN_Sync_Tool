@@ -541,7 +541,7 @@
 
             <fieldset class="standard-form-section">
               <legend>升级清单提取</legend>
-              <p class="input-help">把网页里的升级清单（保留红黑颜色）直接粘贴到下方；系统会按客户来源目录推导本地路径，生成 <code>upgrade-file-list-ai-&lt;任务编号&gt;.md</code> 到本地导出目录，并自动识别客户来源目录与客户 SVN 地址。</p>
+              <p class="input-help">把网页里的升级清单（保留红黑颜色）直接粘贴到下方；系统会从“提交说明”提取 QC 号（支持 <code>no.5081286</code> 或 <code>QC5081286</code>），生成 <code>upgrade-file-list-ai-&lt;QC号&gt;.md</code> 到本地导出目录，并自动识别客户来源目录与客户 SVN 地址。</p>
               <div class="field-label-row">
                 <label class="field-label" for="combinedUpgradeHtml">升级清单</label>
                 <output id="combinedUpgradeState" class="input-state" data-state="empty">等待粘贴</output>

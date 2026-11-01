@@ -296,14 +296,14 @@ class WebAppApiTest(unittest.TestCase):
             try:
                 customer_path = str(PureWindowsPath(DEFAULT_STANDARD_UNC_PREFIX)
                                     / "Y" / "示例客户" / "QC123456" / "ecology")
-                task_id = "0123456789abcdef0123456789abcdef"
+                commit_message = "no.5081286 E9.00补丁：KB900220905升至KB900260901"
                 response = self.client.post(
                     "/api/v1/standard-files/upgrade-markdown",
                     json={
                         "html": SAMPLE_HTML,
                         "source_profile_id": "default",
                         "customer_standard_path": customer_path,
-                        "task_id": task_id,
+                        "commit_message": commit_message,
                     },
                 )
                 self.assertEqual(response.status_code, 200)
@@ -312,12 +312,51 @@ class WebAppApiTest(unittest.TestCase):
                 self.assertTrue(payload["written"])
                 self.assertEqual(
                     payload["filename"],
-                    "upgrade-file-list-ai-" + task_id + ".md")
+                    "upgrade-file-list-ai-5081286.md")
                 written = Path(export_root, "Y", "示例客户", "ecology", payload["filename"])
                 self.assertTrue(written.is_file())
                 self.assertIn("Test.java", written.read_text(encoding="utf-8"))
                 self.assertNotIn(source, response.text)
                 self.assertNotIn("standard_path", response.text)
+            finally:
+                app.state.standard_jobs = original
+                manager.stop()
+
+    def test_standard_upgrade_markdown_rejects_missing_qc_number(self):
+        """提交说明里的 KB 编号不能冒充 QC 号，必须明确写 QC/no. 前缀。"""
+        from pathlib import PureWindowsPath
+        from web_standard_service import (
+            DEFAULT_STANDARD_UNC_PREFIX,
+            SourceProfile,
+            StandardJobManager,
+        )
+        with tempfile.TemporaryDirectory() as job_root, \
+                tempfile.TemporaryDirectory() as source, \
+                tempfile.TemporaryDirectory() as export_root:
+            manager = StandardJobManager(
+                profiles=[SourceProfile(
+                    "default", "测试来源", standard_path=source,
+                    unc_prefix=DEFAULT_STANDARD_UNC_PREFIX)],
+                temp_root=job_root, min_free_bytes=0, require_password_stdin=False,
+                export_root=export_root,
+            )
+            original = app.state.standard_jobs
+            app.state.standard_jobs = manager
+            try:
+                customer_path = str(PureWindowsPath(DEFAULT_STANDARD_UNC_PREFIX)
+                                    / "Y" / "示例客户" / "QC123456" / "ecology")
+                response = self.client.post(
+                    "/api/v1/standard-files/upgrade-markdown",
+                    json={
+                        "html": SAMPLE_HTML,
+                        "source_profile_id": "default",
+                        "customer_standard_path": customer_path,
+                        "commit_message": "KB900220905 补丁",
+                    },
+                )
+                self.assertEqual(response.status_code, 422)
+                self.assertEqual(
+                    response.json()["error"]["code"], "invalid_qc_number")
             finally:
                 app.state.standard_jobs = original
                 manager.stop()
@@ -355,7 +394,7 @@ class WebAppApiTest(unittest.TestCase):
                             "html": SAMPLE_HTML,
                             "source_profile_id": "default",
                             "customer_standard_path": customer_path,
-                            "task_id": "0123456789abcdef0123456789abcdef",
+                            "commit_message": "QC5081286 写权限测试",
                         },
                     )
                 self.assertEqual(response.status_code, 503)
@@ -783,8 +822,9 @@ class WebSourceSafetyTest(unittest.TestCase):
         javascript = (root / "web" / "static" / "app.js").read_text(encoding="utf-8")
         self.assertIn("function maybeAutoWriteCombinedUpgradeMarkdown(task)", javascript)
         self.assertIn('["preview_ready", "no_changes"].includes(task.status)', javascript)
-        self.assertIn("writeCombinedUpgradeMarkdown({ auto: true, taskId: task.id })", javascript)
-        self.assertIn("task_id: taskId", javascript)
+        self.assertIn("commitMessage: task.commit_message", javascript)
+        self.assertIn("commit_message: commitMessage", javascript)
+        self.assertIn("extractQcNumberFromCommitMessage", javascript)
         self.assertIn("autoMarkdownDone", javascript)
         # 自动模式下不再抢占焦点、不弹校验警告
         self.assertIn("const auto = Boolean(options.auto);", javascript)
@@ -793,7 +833,7 @@ class WebSourceSafetyTest(unittest.TestCase):
         service = (root / "web_standard_service.py").read_text(encoding="utf-8")
         self.assertIn("os.replace(temp_path, target)", service)
         self.assertIn("target_dir.mkdir(parents=True, exist_ok=True)", service)
-        self.assertIn('"upgrade-file-list-ai-%s.md" % task_number', service)
+        self.assertIn('"upgrade-file-list-ai-%s.md" % qc_number', service)
         html = (root / "web" / "templates" / "index.html").read_text(encoding="utf-8")
         self.assertIn("生成 Markdown到本地目录", html)
         self.assertNotIn("生成 Markdown 到标准目录", html)
