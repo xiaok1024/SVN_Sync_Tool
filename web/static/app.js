@@ -542,6 +542,8 @@ const standardState = {
   richHtml: "",
   suppressCombinedInput: false,
   autoCustomerPath: "",
+  autoSvnUrl: "",
+  allowedSvnPrefixes: [],
 };
 
 const standardElements = {
@@ -764,6 +766,10 @@ function validateStandardForm() {
 async function loadStandardProfiles() {
   try {
     const data = await standardRequest("/api/v1/standard-files/source-profiles");
+    // 服务端把 allowed_svn_prefixes 一起下发，前端据此从升级清单识别客户 SVN 地址
+    standardState.allowedSvnPrefixes = Array.isArray(data.allowed_svn_prefixes)
+      ? data.allowed_svn_prefixes.map((item) => String(item || "").trim()).filter(Boolean)
+      : [];
     standardElements.sourceProfile.replaceChildren();
     const available = data.profiles.filter((profile) => profile.available);
     if (!available.length) {
@@ -792,6 +798,8 @@ async function loadStandardProfiles() {
     standardElements.sourceProfile.disabled = Boolean(standardState.taskId);
     standardElements.createButton.disabled = Boolean(standardState.taskId);
     updateSelectedProfileDetail();
+    // 白名单随来源配置一起下发；用户先粘贴清单时在这里补一次客户 SVN 地址
+    if (options.upgrade && upgradeElements) applyAutoCustomerSvnUrl(upgradeElements.input.value);
   } catch (error) {
     standardElements.profileAlert.hidden = false;
     standardElements.profileAlert.querySelector("strong").textContent = "无法读取标准文件来源";
@@ -858,6 +866,54 @@ function applyAutoCustomerPath(text) {
   standardElements.customerPath.value = path;
   standardState.autoCustomerPath = path;
   standardElements.customerPath.removeAttribute("aria-invalid");
+  return true;
+}
+
+/** 从升级清单里挑出命中服务端白名单的客户 SVN 仓库地址。
+ *  客户仓库地址 = 白名单前缀 + 前缀后的第一段路径（仓库名）。例如
+ *  https://10.1.3.13/svn/J江苏美思德化学股份/src/x/Y.java
+ *  -> https://10.1.3.13/svn/J江苏美思德化学股份
+ *  升级清单里常出现 https\:// 这类转义写法，这里先还原成 https:// */
+function extractCustomerSvnUrl(value) {
+  const prefixes = (standardState.allowedSvnPrefixes || []).filter(Boolean);
+  if (!prefixes.length) return "";
+  const raw = String(value || "")
+    .replace(/[\u200b\u00a0]/g, " ")
+    .replace(/\\\//g, "/")
+    .replace(/\\:/g, ":");
+  const haystack = raw.toLowerCase();
+  const ordered = prefixes.slice().sort((left, right) => right.length - left.length);
+  for (const prefix of ordered) {
+    const needle = String(prefix).toLowerCase();
+    let from = 0;
+    while (true) {
+      const index = haystack.indexOf(needle, from);
+      if (index < 0) break;
+      const rest = raw.slice(index + prefix.length);
+      if (rest.startsWith("/")) {
+        let segment = rest.slice(1).split("/")[0] || "";
+        segment = segment.split(/[\\?#\s"'<>|)]/, 1)[0] || "";
+        if (segment && segment !== "." && segment !== "..") {
+          return `${prefix}/${segment}`;
+        }
+      }
+      from = index + needle.length;
+    }
+  }
+  return "";
+}
+
+/** 粘贴升级清单时自动填写客户 SVN 地址；用户手动改过的值不会被覆盖。 */
+function applyAutoCustomerSvnUrl(text) {
+  if (!options.upgrade || !upgradeElements) return false;
+  const url = extractCustomerSvnUrl(text);
+  if (!url) return false;
+  const current = standardElements.svnUrl.value.trim();
+  if (current === url) return false;
+  if (current && current !== standardState.autoSvnUrl) return false;
+  standardElements.svnUrl.value = url;
+  standardState.autoSvnUrl = url;
+  standardElements.svnUrl.removeAttribute("aria-invalid");
   return true;
 }
 
@@ -1443,6 +1499,18 @@ standardElements.stages.forEach((item, index) => {
       clear: document.getElementById(options.upgrade.clear),
       result: document.getElementById(options.upgrade.result),
     };
+    function applyAutoStandardFieldsFromUpgrade(text) {
+      const filledUrl = applyAutoCustomerSvnUrl(text);
+      const filledPath = applyAutoCustomerPath(text);
+      if (filledUrl && filledPath) {
+        showNotice("已从升级清单自动填写客户 SVN 地址与客户来源目录。", "success");
+      } else if (filledUrl) {
+        showNotice("已从升级清单自动填写客户 SVN 地址。", "success");
+      } else if (filledPath) {
+        showNotice("已从升级清单自动填写客户来源目录。", "success");
+      }
+    }
+
     upgradeElements.input.addEventListener("paste", (event) => {
       const html = event.clipboardData?.getData("text/html") || "";
       const text = event.clipboardData?.getData("text/plain") || "";
@@ -1454,12 +1522,12 @@ standardElements.stages.forEach((item, index) => {
         setCombinedUpgradeState("rich", "已保留富文本颜色");
         resetCombinedUpgradeResult();
         updateCombinedUpgradeButton();
-        if (applyAutoCustomerPath(plain)) showNotice("已从升级清单自动填写客户来源目录。", "success");
+        applyAutoStandardFieldsFromUpgrade(plain);
       } else {
         window.setTimeout(() => {
           standardState.richHtml = "";
           setCombinedUpgradeState("plain", "仅检测到纯文本");
-          if (applyAutoCustomerPath(upgradeElements.input.value)) showNotice("已从升级清单自动填写客户来源目录。", "success");
+          applyAutoStandardFieldsFromUpgrade(upgradeElements.input.value);
         }, 0);
       }
     });
@@ -1470,7 +1538,7 @@ standardElements.stages.forEach((item, index) => {
       const hasText = Boolean(upgradeElements.input.value.trim());
       setCombinedUpgradeState(hasText ? "plain" : "empty", hasText ? "仅检测到纯文本" : "等待粘贴");
       updateCombinedUpgradeButton();
-      if (applyAutoCustomerPath(upgradeElements.input.value)) showNotice("已从升级清单自动填写客户来源目录。", "success");
+      applyAutoStandardFieldsFromUpgrade(upgradeElements.input.value);
     });
     upgradeElements.generate.addEventListener("click", writeCombinedUpgradeMarkdown);
     upgradeElements.clear.addEventListener("click", resetCombinedUpgradeFormState);

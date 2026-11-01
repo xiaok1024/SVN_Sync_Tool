@@ -905,7 +905,14 @@ class StandardJobManager:
 
     def public_profiles(self):
         values = [profile.public_dict() for profile in self.profiles.values()]
-        return {"ok": True, "configured": bool(values), "profiles": values}
+        # allowed_svn_prefixes 只是仓库 URL 前缀（__init__ 已去掉尾部斜杠），
+        # 不含本地路径与凭据：前端据此从升级清单里识别客户 SVN 地址。
+        return {
+            "ok": True,
+            "configured": bool(values),
+            "profiles": values,
+            "allowed_svn_prefixes": list(self.allowed_svn_prefixes),
+        }
 
     def _cleanup_loop(self):
         while not self._stop_event.wait(self.cleanup_interval):

@@ -111,6 +111,17 @@ class WebAppApiTest(unittest.TestCase):
         self.assertEqual(response.headers["x-frame-options"], "DENY")
         self.assertEqual(response.headers["cache-control"], "no-store")
 
+    def test_combined_page_orders_commit_message_and_svn_url_around_upgrade(self):
+        """合并页把提交说明放到升级清单提取上面，客户 SVN 地址放到下面。"""
+        combined = self.client.get("/").text.split('id="combinedStandardToolView"', 1)[1]
+        message_at = combined.index("<legend>提交说明</legend>")
+        upgrade_at = combined.index("<legend>升级清单提取</legend>")
+        svn_at = combined.index("<legend>SVN 连接</legend>")
+        self.assertLess(message_at, upgrade_at)
+        self.assertLess(upgrade_at, svn_at)
+        # 客户 SVN 地址落在升级清单提取之后（即下面那个 SVN 连接块里）
+        self.assertLess(upgrade_at, combined.index('for="combinedStandardSvnUrl"'))
+
     def test_allowed_hosts_only_come_from_loopback_and_environment(self):
         """旧开发机名和测试桩不该写死在生产白名单里。"""
         hosts = web_app._allowed_hosts()
@@ -675,6 +686,19 @@ class WebSourceSafetyTest(unittest.TestCase):
         self.assertIn("const showCoverAll = emptyList && allowsCoverAll;", javascript)
         self.assertIn("standardElements.coverAllConfirm.checked = true;", javascript)
         self.assertIn("standardElements.coverAllConfirm.dataset.userTouched", javascript)
+
+    def test_upgrade_paste_prefills_customer_svn_url_from_allowed_prefixes(self):
+        """升级清单里的 SVN 地址按服务端 allowed_svn_prefixes 匹配，
+        用「白名单前缀 + 仓库名」填写客户 SVN 地址。"""
+        root = Path(__file__).resolve().parents[1]
+        javascript = (root / "web" / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("data.allowed_svn_prefixes", javascript)
+        self.assertIn("standardState.allowedSvnPrefixes", javascript)
+        self.assertIn("function extractCustomerSvnUrl(", javascript)
+        self.assertIn("function applyAutoCustomerSvnUrl(", javascript)
+        self.assertIn("applyAutoStandardFieldsFromUpgrade(", javascript)
+        # 旧的单字段自动填写已被合并逻辑取代
+        self.assertNotIn("applyAutoCustomerPath(plain)", javascript)
 
     def test_entry_requires_explicit_lan_mode(self):
         root = Path(__file__).resolve().parents[1]

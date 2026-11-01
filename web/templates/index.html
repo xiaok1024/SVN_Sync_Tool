@@ -532,17 +532,16 @@
 
           <form id="combinedStandardTaskForm" autocomplete="off" novalidate>
             <fieldset class="standard-form-section">
-              <legend>SVN 连接</legend>
-              <label class="field-label" for="combinedStandardSvnUrl">客户 SVN 地址</label>
-              <input class="text-input" id="combinedStandardSvnUrl" type="url" inputmode="url" autocapitalize="none" autocomplete="off" spellcheck="false" placeholder="https://svn.example.com/svn/customer/ecology">
-              <p class="input-help">填写与本地 <code>ecology</code> 内容对应的 SVN 目录；仓库根目录已直接包含 <code>src/cloudstore</code> 时填仓库根，不要重复追加 <code>ecology</code>。</p>
-
-              <p class="credential-note">使用已保存的 SVN 账号提交。<button class="text-button" type="button" data-open-svn-account>管理账号 ↗</button></p>
+              <legend>提交说明</legend>
+              <p class="input-help">本次提交写入 SVN 日志的说明，会原样保留。</p>
+              <label class="field-label" for="combinedStandardCommitMessage">提交说明</label>
+              <input class="text-input" id="combinedStandardCommitMessage" type="text" maxlength="500" autocomplete="off" placeholder="例如：QC123456 补充标准文件">
+              <div class="field-footer"><span>此说明将原样写入 SVN。</span><output id="combinedStandardMessageCount">0 / 500</output></div>
             </fieldset>
 
             <fieldset class="standard-form-section">
               <legend>升级清单提取</legend>
-              <p class="input-help">把网页里的升级清单（保留红黑颜色）直接粘贴到下方；系统会提取并生成 Markdown，写入所选客户的 <code>ecology</code> 目录，并尝试自动识别客户来源目录。</p>
+              <p class="input-help">把网页里的升级清单（保留红黑颜色）直接粘贴到下方；系统会提取并生成 Markdown 写入所选客户的 <code>ecology</code> 目录，并自动识别客户来源目录与客户 SVN 地址。</p>
               <div class="field-label-row">
                 <label class="field-label" for="combinedUpgradeHtml">升级清单</label>
                 <output id="combinedUpgradeState" class="input-state" data-state="empty">等待粘贴</output>
@@ -555,6 +554,15 @@
                 <button class="button button-secondary" id="combinedUpgradeClearButton" type="button">清空</button>
               </div>
               <div class="upgrade-markdown-result" id="combinedUpgradeResult" role="status" aria-live="polite" hidden></div>
+            </fieldset>
+
+            <fieldset class="standard-form-section">
+              <legend>SVN 连接</legend>
+              <label class="field-label" for="combinedStandardSvnUrl">客户 SVN 地址</label>
+              <input class="text-input" id="combinedStandardSvnUrl" type="url" inputmode="url" autocapitalize="none" autocomplete="off" spellcheck="false" placeholder="https://svn.example.com/svn/customer/ecology">
+              <p class="input-help">填写与本地 <code>ecology</code> 内容对应的 SVN 目录；粘贴升级清单后，系统会按服务端白名单自动填写。仓库根目录已直接包含 <code>src/cloudstore</code> 时填仓库根，不要重复追加 <code>ecology</code>。</p>
+
+              <p class="credential-note">使用已保存的 SVN 账号提交。<button class="text-button" type="button" data-open-svn-account>管理账号 ↗</button></p>
             </fieldset>
 
             <fieldset class="standard-form-section">
@@ -584,10 +592,6 @@
                 <input id="combinedStandardCoverAllConfirm" type="checkbox">
                 <span><strong>清单为空：覆盖全部交集文件</strong><small>只覆盖 SVN 最新版本与客户标准目录中同时存在的文件；不会新增标准目录独有文件。</small></span>
               </label>
-
-              <label class="field-label" for="combinedStandardCommitMessage">提交说明</label>
-              <input class="text-input" id="combinedStandardCommitMessage" type="text" maxlength="500" autocomplete="off" placeholder="例如：QC123456 补充标准文件">
-              <div class="field-footer"><span>此说明将原样写入 SVN。</span><output id="combinedStandardMessageCount">0 / 500</output></div>
             </fieldset>
 
             <div class="panel-actions standard-form-actions">

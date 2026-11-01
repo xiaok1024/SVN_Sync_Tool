@@ -526,6 +526,25 @@ class StandardJobSafetyTest(unittest.TestCase):
             require_password_stdin=False,
         )
 
+    def test_public_profiles_expose_allowed_svn_prefixes(self):
+        """前端要按白名单从升级清单里识别客户 SVN 地址；只下发 URL 前缀，
+        不带任何本地路径或凭据。"""
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as source:
+            Path(source, "ecology").mkdir()
+            manager = StandardJobManager(
+                profiles=[SourceProfile("default", "测试来源", standard_path=source)],
+                temp_root=root, min_free_bytes=0,
+                max_root_bytes=1024 * 1024 * 1024, require_password_stdin=False,
+                allowed_svn_prefixes=("https://10.1.3.13/svn/", "http://10.1.3.12:80/svn/"))
+            try:
+                payload = manager.public_profiles()
+                self.assertEqual(
+                    payload["allowed_svn_prefixes"],
+                    ["https://10.1.3.13/svn", "http://10.1.3.12:80/svn"])
+                self.assertNotIn("standard_path", json.dumps(payload, ensure_ascii=False))
+            finally:
+                manager.stop()
+
     def test_empty_list_requires_explicit_intersection_confirmation(self):
         with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as source:
             Path(source, "ecology").mkdir()
