@@ -1273,8 +1273,8 @@ class StandardJobManager:
             actor="", request_id=""):
         r"""把粘贴近来的升级清单转成 Markdown，写入本地导出目录。
 
-        目标目录与本地 SVN 导出保持一致：
-          <export_root>\分组\客户\ecology\upgrade-file-list-ai-<QC号>.md
+        目标目录按客户来源目录去掉 QC 编号段和 ecology 段：
+          <export_root>\分组\客户\upgrade-file-list-ai-<QC号>.md
         解析与生成完全复用 Web 升级清单服务，不重复实现颜色识别和 Markdown 组装。
         """
         profile = self.profiles.get(str(profile_id or "").strip())
@@ -1304,7 +1304,8 @@ class StandardJobManager:
                 "未配置本地导出目录（workspace.export_root），无法生成 Markdown", 503)
         try:
             target_dir = self._local_export_target(
-                SimpleNamespace(source_relative=source_relative))
+                SimpleNamespace(source_relative=source_relative),
+                include_ecology=False)
         except Exception as exc:
             raise StandardWebError(
                 "local_target_unavailable",
@@ -1983,11 +1984,17 @@ class StandardJobManager:
             return []
         return export_parts
 
-    def _local_export_target(self, job):
-        """返回本地导出根目录，并保证不会越出 export_root。"""
+    def _local_export_target(self, job, *, include_ecology=True):
+        """返回本地导出目录，并保证不会越出 export_root。
+
+        Markdown 文件按约定放在 ``分组\客户`` 下，因此调用方传
+        ``include_ecology=False``；SVN 文件导出仍保留 ``ecology`` 段。
+        """
         if not self.export_root:
             raise RuntimeError("未配置本地导出根目录")
         parts = self._local_export_parts(job)
+        if not include_ecology and parts and parts[-1].lower() == "ecology":
+            parts = parts[:-1]
         if not parts:
             raise RuntimeError("无法从客户来源目录推导本地导出路径")
         root = self.export_root.resolve()

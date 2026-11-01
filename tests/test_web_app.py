@@ -313,8 +313,10 @@ class WebAppApiTest(unittest.TestCase):
                 self.assertEqual(
                     payload["filename"],
                     "upgrade-file-list-ai-5081286.md")
-                written = Path(export_root, "Y", "示例客户", "ecology", payload["filename"])
+                written = Path(export_root, "Y", "示例客户", payload["filename"])
                 self.assertTrue(written.is_file())
+                self.assertFalse(
+                    Path(export_root, "Y", "示例客户", "ecology", payload["filename"]).exists())
                 self.assertIn("Test.java", written.read_text(encoding="utf-8"))
                 self.assertNotIn(source, response.text)
                 self.assertNotIn("standard_path", response.text)
