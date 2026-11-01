@@ -213,17 +213,46 @@ python3 -m venv .venv-web
 
 随后访问：`http://127.0.0.1:8765/`
 
-### Windows 启动（PowerShell）
+### 部署到 Windows / 一键启动与关闭
+
+首次部署（每台 Windows 服务器执行一次）：
 
 ```powershell
-# 方式一：编辑项目内默认配置（推荐）
-# .\conf\web-sources.toml
-# 方式二：指定其他配置文件路径
-$env:SVN_SYNC_WEB_SOURCE_CONFIG = 'D:\svn-sync\web-sources.toml'
-.\.venv-web\Scripts\python.exe svn_sync_web.py
+git clone -b windows https://github.com/xiaok1024/SVN_Sync_Tool.git D:\svn-sync-tool
+cd D:\svn-sync-tool
+python -m venv .venv-web
+.\.venv-web\Scripts\python.exe -m pip install -r requirements-web.txt
 ```
 
-配置完成后，`standard_path` 指向的标准文件目录会作为合并页默认来源根。修改配置文件后重启服务才生效。
+后续更新代码后在项目根目录执行 `git pull origin windows`，再重启服务。
+
+编辑 `conf\web-sources.toml`，至少确认 `[workspace] export_root` 和各 `[[profiles]]` 的
+`standard_path` / `unc_prefix` 指向这台服务器实际可访问的盘符或 UNC 路径。服务只在启动时读取
+该配置，修改后必须重启。
+
+一键启停（在项目根目录双击 `.bat`，或在命令行执行）：
+
+```bat
+start-web.bat
+stop-web.bat
+```
+
+默认只监听 `127.0.0.1:8765`。如果其他 Windows 服务器或电脑需要访问，在配置 HTTPS 后执行：
+
+```bat
+start-web.bat -Lan
+```
+
+也可以覆盖端口或指定配置文件：
+
+```bat
+start-web.bat -Port 9000
+start-web.bat -Config D:\svn-sync\web-sources.toml
+```
+
+`start-web.bat` 会把服务及其真实监听进程 PID 写入 `run\web-process.json`，标准输出和错误分别写入
+`run\web-*.out.log` / `run\web-*.err.log`；`stop-web.bat` 会按 PID 同时清理外层 Python 和实际
+uvicorn 进程，不会只留下子进程。
 
 ### 部署到 Linux 常驻运行（推荐）
 
@@ -670,6 +699,8 @@ python3 svn_sync_cli.py                    # 终端版
 ├── upgrade_list_core.py                # 富文本升级清单解析与 Markdown 生成
 ├── clipboard_core.py                   # Windows/macOS HTML 剪贴板适配
 ├── svn_sync_web.py                     # Web 启动入口（默认本机，可显式开放局域网）
+├── start-web.bat / stop-web.bat        # Windows 一键启动、关闭入口
+├── deploy/windows/                     # Windows 启停 PowerShell 实现与运行状态管理
 ├── web_app.py / web_upgrade_service.py # Web API 与升级清单适配层
 ├── web_svn_common.py                   # Web 端共用的 SVN 地址校验、凭据校验与隔离引擎
 ├── web_standard_service.py             # Web 标准文件临时任务、凭据隔离与清理
