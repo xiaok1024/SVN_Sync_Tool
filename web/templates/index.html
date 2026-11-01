@@ -235,7 +235,7 @@
               <legend>SVN 连接</legend>
               <label class="field-label" for="standardSvnUrl">客户 SVN 地址</label>
               <input class="text-input" id="standardSvnUrl" type="url" inputmode="url" autocapitalize="none" autocomplete="off" spellcheck="false" placeholder="https://svn.example.com/svn/customer/ecology">
-              <p class="input-help">地址须以 <code>ecology</code> 目录结尾，一次提交一个仓库。</p>
+              <p class="input-help">填写与本地 <code>ecology</code> 内容对应的 SVN 目录；仓库根目录已直接包含 <code>src/cloudstore</code> 时填仓库根，不要重复追加 <code>ecology</code>。</p>
 
               <p class="credential-note">使用已保存的 SVN 账号提交。<button class="text-button" type="button" data-open-svn-account>管理账号 ↗</button></p>
             </fieldset>
@@ -535,26 +535,14 @@
               <legend>SVN 连接</legend>
               <label class="field-label" for="combinedStandardSvnUrl">客户 SVN 地址</label>
               <input class="text-input" id="combinedStandardSvnUrl" type="url" inputmode="url" autocapitalize="none" autocomplete="off" spellcheck="false" placeholder="https://svn.example.com/svn/customer/ecology">
-              <p class="input-help">地址须以 <code>ecology</code> 目录结尾，一次提交一个仓库。</p>
+              <p class="input-help">填写与本地 <code>ecology</code> 内容对应的 SVN 目录；仓库根目录已直接包含 <code>src/cloudstore</code> 时填仓库根，不要重复追加 <code>ecology</code>。</p>
 
               <p class="credential-note">使用已保存的 SVN 账号提交。<button class="text-button" type="button" data-open-svn-account>管理账号 ↗</button></p>
             </fieldset>
 
             <fieldset class="standard-form-section">
-              <legend>标准文件来源</legend>
-              <label class="field-label" for="combinedStandardSourceProfile">来源配置</label>
-              <select class="text-input" id="combinedStandardSourceProfile" disabled>
-                <option value="">正在读取服务端配置…</option>
-              </select>
-              <p class="profile-detail" id="combinedStandardSourceProfileDetail">选择本次使用的标准文件或历史文件来源。</p>
-              <label class="field-label" for="combinedStandardCustomerPath">客户来源目录</label>
-              <input class="text-input" id="combinedStandardCustomerPath" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="\\192.168.7.215\ECOLOGY_customer\Y\客户名称\QC123456\ecology">
-              <p class="input-help">粘贴所选共享下的客户 <code>ecology</code> 目录。也可粘贴任务描述，系统会自动去掉目录前后的说明文字。</p>
-            </fieldset>
-
-            <fieldset class="standard-form-section">
               <legend>升级清单提取</legend>
-              <p class="input-help">把网页里的升级清单（保留红黑颜色）直接粘贴到下方，系统会提取并生成 Markdown，写入上方所选客户的 <code>ecology</code> 目录。</p>
+              <p class="input-help">把网页里的升级清单（保留红黑颜色）直接粘贴到下方；系统会提取并生成 Markdown，写入所选客户的 <code>ecology</code> 目录，并尝试自动识别客户来源目录。</p>
               <div class="field-label-row">
                 <label class="field-label" for="combinedUpgradeHtml">升级清单</label>
                 <output id="combinedUpgradeState" class="input-state" data-state="empty">等待粘贴</output>
@@ -567,6 +555,18 @@
                 <button class="button button-secondary" id="combinedUpgradeClearButton" type="button">清空</button>
               </div>
               <div class="upgrade-markdown-result" id="combinedUpgradeResult" role="status" aria-live="polite" hidden></div>
+            </fieldset>
+
+            <fieldset class="standard-form-section">
+              <legend>标准文件来源</legend>
+              <label class="field-label" for="combinedStandardSourceProfile">来源配置</label>
+              <select class="text-input" id="combinedStandardSourceProfile" disabled>
+                <option value="">正在读取服务端配置…</option>
+              </select>
+              <p class="profile-detail" id="combinedStandardSourceProfileDetail">选择本次使用的标准文件或历史文件来源。</p>
+              <label class="field-label" for="combinedStandardCustomerPath">客户来源目录</label>
+              <input class="text-input" id="combinedStandardCustomerPath" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="\\192.168.7.215\ECOLOGY_customer\Y\客户名称\QC123456\ecology">
+              <p class="input-help">粘贴所选共享下的客户 <code>ecology</code> 目录。也可粘贴任务描述，系统会自动去掉目录前后的说明文字。</p>
             </fieldset>
 
             <fieldset class="standard-form-section">

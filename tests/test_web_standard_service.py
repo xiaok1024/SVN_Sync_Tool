@@ -510,7 +510,7 @@ class WebSvnCredentialIsolationTest(unittest.TestCase):
             self.assertIn("--password-from-stdin", command)
             self.assertIn("--no-auth-cache", command)
             self.assertEqual(command[command.index("--config-dir") + 1], root)
-            self.assertEqual(engine._svn_password_input(), b"secret-value\n")
+            self.assertEqual(engine._svn_password_input(), b"secret-value")
             for filename in ("config", "servers"):
                 self.assertNotIn(
                     "secret-value", Path(root, filename).read_text(encoding="utf-8"))

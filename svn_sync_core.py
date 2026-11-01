@@ -120,7 +120,7 @@ class SyncEngine:
     def _svn_password_input(self):
         password = str(_value(self.svn_pass) or "")
         if self.svn_password_from_stdin and password:
-            return (password + "\n").encode("utf-8")
+            return password.encode("utf-8")
         return None
 
     def _svn_env(self):

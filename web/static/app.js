@@ -541,6 +541,7 @@ const standardState = {
   resultUrls: [],
   richHtml: "",
   suppressCombinedInput: false,
+  autoCustomerPath: "",
 };
 
 const standardElements = {
@@ -645,8 +646,16 @@ function setStandardStage(stage) {
   const order = options.stageOrder;
   const activeIndex = stage === "done" ? order.length : Math.max(0, order.indexOf(stage));
   standardElements.stages.forEach((item, index) => {
+    const complete = index < activeIndex;
     item.classList.toggle("is-active", index === activeIndex);
-    item.classList.toggle("is-complete", index < activeIndex);
+    item.classList.toggle("is-complete", complete);
+    // 只有已经走过的步骤才提供“返回”能力，避免把进度伪装成可前进。
+    const icon = item.querySelector(".step-index");
+    if (icon) {
+      icon.classList.toggle("is-back", complete);
+      if (complete) icon.setAttribute("title", "返回任务配置");
+      else icon.removeAttribute("title");
+    }
   });
 }
 
@@ -822,6 +831,28 @@ function cleanCustomerPathText(value) {
 function normalizeCustomerPathField() {
   const cleaned = cleanCustomerPathText(standardElements.customerPath.value);
   if (cleaned !== standardElements.customerPath.value) standardElements.customerPath.value = cleaned;
+}
+
+/** 从升级清单/任务描述里提取 UNC 客户来源目录（以 \\ecology 结尾）。 */
+function extractUncCustomerPath(value) {
+  const text = String(value || "").replace(/[\u200b\u00a0]/g, " ");
+  // 从 \\ 开始，贪婪截取到 \\ecology（后面不能再跟路径字符，避免命中 \\ECOLOGY_customer）。
+  const match = text.match(/\\\\[^\s"'<>|]*?\\ecology(?![\\A-Za-z0-9_])/i);
+  return match ? match[0] : "";
+}
+
+/** 粘贴升级清单时自动填写客户来源目录；用户手动改过的值不会被覆盖。 */
+function applyAutoCustomerPath(text) {
+  if (!options.upgrade) return false;
+  const path = extractUncCustomerPath(text);
+  if (!path) return false;
+  const current = standardElements.customerPath.value.trim();
+  if (current === path) return false;
+  if (current && current !== standardState.autoCustomerPath) return false;
+  standardElements.customerPath.value = path;
+  standardState.autoCustomerPath = path;
+  standardElements.customerPath.removeAttribute("aria-invalid");
+  return true;
 }
 
 function saveStandardTaskSession() {
@@ -1167,7 +1198,7 @@ async function submitStandardCommit() {
 }
 
 async function cancelStandardTask() {
-  if (!standardState.taskId || !standardState.accessToken) return;
+  if (!standardState.taskId || !standardState.accessToken) return true;
   standardElements.cancelButton.disabled = true;
   try {
     const data = await standardRequest(
@@ -1178,9 +1209,11 @@ async function cancelStandardTask() {
     renderStandardTask(data.task);
     showNotice("已取消，服务器上的临时文件会自动清理。", "success");
     schedulePollForStandardTask(data.task, 600);
+    return true;
   } catch (error) {
     showNotice(error.message, "error");
     standardElements.cancelButton.disabled = false;
+    return false;
   }
 }
 
@@ -1200,6 +1233,7 @@ function releaseStandardTaskState() {
   standardElements.result.hidden = true;
   standardElements.emptyState.hidden = false;
   standardElements.progressBar.style.width = "0%";
+  standardElements.cancelButton.disabled = false;
   setStandardStatus("等待配置", "填写左侧信息后创建提交预览。", { kind: "idle" });
   setStandardStage("form");
 }
@@ -1250,6 +1284,58 @@ standardElements.acknowledge.addEventListener("change", () => {
 });
 standardElements.closeDialogButton.addEventListener("click", () => standardElements.dialog.close());
 standardElements.submitCommitButton.addEventListener("click", submitStandardCommit);
+
+// 点击流程步骤小图标可返回“配置任务”，等同于回到上一步重新编辑。
+function currentStandardStageIndex() {
+  const index = standardElements.stages.findIndex((item) => item.classList.contains("is-active"));
+  return index < 0 ? 0 : index;
+}
+
+function isTerminalStandardTask(task) {
+  return Boolean(task) && ["committed", "no_changes", "failed", "expired", "cancelled", "commit_unknown"].includes(task.status);
+}
+
+function standardTaskIsRunning() {
+  return Boolean(standardState.taskId) && !isTerminalStandardTask(standardState.task);
+}
+
+// 进入这些状态后服务端不允许取消，前端也不能假装回退。
+const STANDARD_COMMIT_LOCK = ["commit_queued", "committing", "commit_unknown"];
+
+async function returnToStandardConfig() {
+  if (standardState.taskId && STANDARD_COMMIT_LOCK.includes(standardState.task?.status)) {
+    showNotice("任务已进入提交阶段，无法返回配置。", "warning");
+    return;
+  }
+  // 未结束的任务先请求取消（服务端会拒绝提交阶段的取消），再回到可编辑的表单。
+  if (standardTaskIsRunning()) {
+    const cancelled = await cancelStandardTask();
+    if (!cancelled) return;
+  }
+  if (standardState.taskId && STANDARD_COMMIT_LOCK.includes(standardState.task?.status)) {
+    showNotice("任务已进入提交阶段，无法返回配置。", "warning");
+    return;
+  }
+  releaseStandardTaskState();
+  standardElements.form.scrollIntoView({ behavior: "smooth", block: "start" });
+  showNotice("已返回任务配置，可修改后重新创建预览。", "info");
+}
+
+standardElements.stages.forEach((item, index) => {
+  const icon = item.querySelector(".step-index");
+  if (!icon) return;
+  icon.setAttribute("role", "button");
+  icon.setAttribute("tabindex", "0");
+  const activate = (event) => {
+    event.preventDefault();
+    if (index >= currentStandardStageIndex()) return; // 不能前进，也不能停在当前步骤
+    returnToStandardConfig();
+  };
+  icon.addEventListener("click", activate);
+  icon.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " " || event.key === "Spacebar") activate(event);
+  });
+});
 
   /** 升级清单提取：复用升级清单接口，把 Markdown 直接写进客户 ecology 目录。 */
   function setCombinedUpgradeValue(value) {
@@ -1353,15 +1439,18 @@ standardElements.submitCommitButton.addEventListener("click", submitStandardComm
       const text = event.clipboardData?.getData("text/plain") || "";
       if (html) {
         event.preventDefault();
+        const plain = text || plainTextFromHtml(html);
         standardState.richHtml = html;
-        setCombinedUpgradeValue(text || plainTextFromHtml(html));
+        setCombinedUpgradeValue(plain);
         setCombinedUpgradeState("rich", "已保留富文本颜色");
         resetCombinedUpgradeResult();
         updateCombinedUpgradeButton();
+        if (applyAutoCustomerPath(plain)) showNotice("已从升级清单自动填写客户来源目录。", "success");
       } else {
         window.setTimeout(() => {
           standardState.richHtml = "";
           setCombinedUpgradeState("plain", "仅检测到纯文本");
+          if (applyAutoCustomerPath(upgradeElements.input.value)) showNotice("已从升级清单自动填写客户来源目录。", "success");
         }, 0);
       }
     });
@@ -1372,6 +1461,7 @@ standardElements.submitCommitButton.addEventListener("click", submitStandardComm
       const hasText = Boolean(upgradeElements.input.value.trim());
       setCombinedUpgradeState(hasText ? "plain" : "empty", hasText ? "仅检测到纯文本" : "等待粘贴");
       updateCombinedUpgradeButton();
+      if (applyAutoCustomerPath(upgradeElements.input.value)) showNotice("已从升级清单自动填写客户来源目录。", "success");
     });
     upgradeElements.generate.addEventListener("click", writeCombinedUpgradeMarkdown);
     upgradeElements.clear.addEventListener("click", resetCombinedUpgradeFormState);
