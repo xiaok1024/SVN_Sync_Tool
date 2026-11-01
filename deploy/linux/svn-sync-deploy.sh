@@ -89,8 +89,10 @@ activate() {
     local sha="$1" release="$RELEASES/$1"
     [ -d "$release" ] || die "release 不存在: $release"
     write_marker "$sha" "$release"
+    # conf/web-sources.toml 由部署机自己维护：发布不带它过来，--delete 也不会清掉
     rsync -a --delete \
         --exclude='/.venv-web' --exclude='__pycache__' --exclude='*.pyc' \
+        --exclude='/conf/web-sources.toml' \
         "$release/" "$LIVE_DIR/"
     systemctl restart "$SERVICE"
     if wait_healthy; then

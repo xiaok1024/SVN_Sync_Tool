@@ -23,6 +23,7 @@ from web_standard_service import (
     StandardJobManager,
     StandardWebError,
     WebSvnEngine,
+    load_source_config,
     load_source_profiles,
     parse_customer_standard_path,
     parse_web_file_list,
@@ -50,7 +51,8 @@ class StandardWebParsingTest(unittest.TestCase):
             credentials.write_text("[standard]\n", encoding="utf-8")
             config = Path(root, "e9-paths.json")
             config.write_text(json.dumps({"secrets.root": str(secrets_root)}), encoding="utf-8")
-            profiles = load_source_profiles({"E9_PATHS_FILE": str(config)})
+            profiles = load_source_profiles(
+                {"E9_PATHS_FILE": str(config)}, allow_default=False)
             # 现在会同时产出标准共享与历史文件共享两个来源
             by_id = {profile.profile_id: profile for profile in profiles}
             self.assertEqual(set(by_id), {"default", "historical"})
@@ -61,6 +63,121 @@ class StandardWebParsingTest(unittest.TestCase):
             self.assertTrue(by_id["default"].allows_cover_all)
             self.assertFalse(by_id["historical"].allows_cover_all)
             self.assertIn("192.168.7.108", by_id["historical"].unc_prefix)
+
+    def test_default_source_config_path_is_project_conf_file(self):
+        expected = (
+            Path(web_standard_service.__file__).resolve().parent
+            / "conf" / "web-sources.toml"
+        )
+        self.assertEqual(
+            web_standard_service._default_source_config_path().resolve(),
+            expected.resolve(),
+        )
+
+    def test_source_config_file_loads_profiles_and_svn_whitelist(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root, "标准文件")
+            source.mkdir()
+            config_path = Path(root, "web-sources.toml")
+            config_path.write_text(
+                "[server]\n"
+                "allowed_svn_prefixes = [\"https://svn.example.com/svn/\"]\n"
+                "[[profiles]]\n"
+                'id = "default"\n'
+                'label = "E9 标准文件共享"\n'
+                'role = "standard"\n'
+                "standard_path = %s\n"
+                "unc_prefix = %s\n"
+                % (json.dumps(str(source), ensure_ascii=False),
+                   json.dumps(DEFAULT_STANDARD_UNC_PREFIX)),
+                encoding="utf-8",
+            )
+            loaded = load_source_config(
+                {"SVN_SYNC_WEB_SOURCE_CONFIG": str(config_path)})
+            self.assertEqual(loaded["config_path"], str(config_path.resolve()))
+            self.assertEqual(
+                loaded["allowed_svn_prefixes"],
+                ("https://svn.example.com/svn/",))
+            self.assertEqual([profile.profile_id for profile in loaded["profiles"]], ["default"])
+            profile = loaded["profiles"][0]
+            self.assertEqual(profile.label, "E9 标准文件共享")
+            self.assertEqual(profile.standard_path, os.path.realpath(source))
+            self.assertTrue(profile.allows_cover_all)
+
+    def test_source_config_default_path_is_loaded_at_startup(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root, "默认标准文件")
+            source.mkdir()
+            config_path = Path(root, "web-sources.toml")
+            config_path.write_text(
+                "[server]\n"
+                "[[profiles]]\n"
+                'id = "default"\n'
+                'label = "默认路径来源"\n'
+                'role = "standard"\n'
+                "standard_path = %s\n"
+                "unc_prefix = %s\n"
+                % (json.dumps(str(source), ensure_ascii=False),
+                   json.dumps(DEFAULT_STANDARD_UNC_PREFIX)),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                    mock.patch.object(
+                        web_standard_service,
+                        "_default_source_config_path",
+                        return_value=config_path):
+                manager = StandardJobManager.from_environment()
+            self.assertEqual(manager.profiles["default"].label, "默认路径来源")
+            self.assertEqual(
+                manager.profiles["default"].standard_path,
+                os.path.realpath(source),
+            )
+
+    def test_source_config_file_errors_are_reported(self):
+        with tempfile.TemporaryDirectory() as root:
+            missing = Path(root, "missing.toml")
+            with self.assertRaisesRegex(ValueError, "不存在"):
+                load_source_profiles(config_path=missing)
+            invalid = Path(root, "invalid.toml")
+            invalid.write_text("[[profiles]\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "无法读取"):
+                load_source_profiles(config_path=invalid)
+
+    def test_source_config_is_cached_until_restart(self):
+        with tempfile.TemporaryDirectory() as root:
+            config_path = Path(root, "web-sources.toml")
+            source = Path(root, "标准文件")
+            source.mkdir()
+            config_path.write_text(
+                "[server]\n"
+                "[[profiles]]\n"
+                'id = "default"\n'
+                'label = "启动时名称"\n'
+                'role = "standard"\n'
+                "standard_path = %s\n"
+                "unc_prefix = %s\n"
+                % (json.dumps(str(source), ensure_ascii=False),
+                   json.dumps(DEFAULT_STANDARD_UNC_PREFIX)),
+                encoding="utf-8",
+            )
+            manager = StandardJobManager.from_environment(
+                {"SVN_SYNC_WEB_SOURCE_CONFIG": str(config_path)})
+            self.assertEqual(manager.profiles["default"].label, "启动时名称")
+            config_path.write_text(
+                "[server]\n"
+                "[[profiles]]\n"
+                'id = "default"\n'
+                'label = "修改后名称"\n'
+                'role = "standard"\n'
+                "standard_path = %s\n"
+                "unc_prefix = %s\n"
+                % (json.dumps(str(source), ensure_ascii=False),
+                   json.dumps(DEFAULT_STANDARD_UNC_PREFIX)),
+                encoding="utf-8",
+            )
+            self.assertEqual(manager.profiles["default"].label, "启动时名称")
+            reloaded = load_source_profiles(config_path=config_path)
+            self.assertEqual(reloaded[0].label, "修改后名称")
 
     def test_profile_loading_survives_a_shallow_install_path(self):
         """部署到 /opt/<服务名> 这类浅路径时不能因父级不足而崩在导入阶段。"""

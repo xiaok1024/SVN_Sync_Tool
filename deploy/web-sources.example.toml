@@ -1,0 +1,52 @@
+# SVN_Sync_Tool Web 来源配置示例（TOML）
+#
+# 默认位置（推荐：直接改当前项目 conf 目录下的这份文件，服务启动时读取一次）：
+#   Windows: <项目根>\conf\web-sources.toml
+#   Linux:   <项目根>/conf/web-sources.toml
+#            （常驻部署是 /opt/svn-sync-tool/conf/web-sources.toml）
+#
+# 仓库自带的默认配置就是 conf/web-sources.toml（不含密码）；本文件是带注释的完整示例。
+#
+# 也可以在启动前指定其他路径：
+#   Windows PowerShell:
+#     $env:SVN_SYNC_WEB_SOURCE_CONFIG = 'D:\svn-sync\web-sources.toml'
+#   Linux:
+#     Environment=SVN_SYNC_WEB_SOURCE_CONFIG=/etc/svn-sync-tool/web-sources.toml
+#
+# 修改本文件后必须重启 Web 服务；运行中的进程不会重新读取。
+
+[server]
+# Linux 常驻部署使用挂载根；多共享按 <mount_root>/<主机>/<共享> 推导。
+# Windows 盘符/UNC 方案可留空。
+mount_root = ""
+# SMB 凭据文件路径，只写路径，不要把用户名或密码写进本文件。
+# Windows 直连盘符/UNC 时通常可以留空。
+smb_credentials_file = ""
+# 可选：限制浏览器允许连接的 SVN 仓库前缀。
+allowed_svn_prefixes = ["https://svn.example.com/svn/"]
+
+# Windows 标准文件来源示例：
+#   标准文件任务和合并工作台默认使用这个来源根。
+#   TOML 单引号字符串保留反斜杠，不需要写成双反斜杠。
+[[profiles]]
+id = "e9-default"
+label = "E9 标准文件共享"
+role = "standard"
+standard_path = 'D:\E9标准文件'
+unc_prefix = '\\192.168.7.215\ECOLOGY_customer'
+
+# Linux 标准文件来源示例（使用上面的 mount_root 时可删除本段并保留 id 即可）：
+# [[profiles]]
+# id = "e9-default"
+# label = "E9 标准文件共享"
+# role = "standard"
+# unc_prefix = '\\192.168.7.215\ECOLOGY_customer'
+
+# 历史文件来源示例（需要历史文件共享时再启用）：
+# [[profiles]]
+# id = "historical"
+# label = "E9 历史文件共享"
+# role = "historical"
+# standard_path = 'D:\E9历史文件'
+# unc_prefix = '\\192.168.7.108\ECOLOGY_customer'
+# 不写 extra_unc_prefixes 时，historical 角色默认包含三台历史共享。

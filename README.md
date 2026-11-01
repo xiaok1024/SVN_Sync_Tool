@@ -142,13 +142,59 @@ Web 版提供四个相互隔离的工作区。桌面端使用左侧工具导航�
 - **凭据按角色分两组**（`[standard]` / `[history]`），三台历史主机共用同一套 history 账号。SMB 账号由服务端统一管理，浏览器不会接收或返回 SMB 凭据。
 - 标准文件共享是**差异包而非完整产品树**：某个类没变化就不在包里，不能据此判断"标准产品没有这个文件"。
 
-配置项：
+配置项（TOML 文件）：
 
-- Linux/macOS 常驻部署：`SVN_SYNC_WEB_MOUNT_ROOT` 指向挂载根，多共享按 `<根>/<主机>/<共享>` 推导；单共享也可用 `SVN_SYNC_WEB_STANDARD_PATH` / `SVN_SYNC_WEB_HISTORICAL_PATH` 直接指定已挂载路径。
-- Windows 部署：使用 `SVN_SYNC_WEB_STANDARD_PATH` / `SVN_SYNC_WEB_HISTORICAL_PATH`，可直接填写盘符目录（如 `D:\E9标准文件`）或 UNC（如 `\\192.168.7.215\ECOLOGY_customer`），服务会把它作为默认来源根，不再走 `mount_smbfs`。
-- 多个固定来源：使用 `SVN_SYNC_WEB_SOURCE_PROFILES` JSON 数组。
+来源配置现在从配置文件读取，服务启动时只读取一次并缓存在进程内；修改后**必须重启 Web 服务**才生效。默认配置放在**当前项目的 `conf` 目录**：
 
-Windows 下配置 `standard_path` 后，标准文件任务会默认以该路径作为来源根：合并页从该根下对应客户目录读取并拉取文件，升级清单 Markdown 也写回该根下的客户 `ecology` 目录，无需单独挂载。
+- 默认位置（推荐）：`<项目根>/conf/web-sources.toml`，仓库已附带一份默认配置，直接编辑即可；
+- Linux 常驻部署：`conf/web-sources.toml` 由部署机自己维护，`deploy-linux.sh` / `svn-sync-deploy` 都不会覆盖它。
+
+也可以在启动前用 `SVN_SYNC_WEB_SOURCE_CONFIG` 指定其他路径：
+
+```bash
+export SVN_SYNC_WEB_SOURCE_CONFIG='/etc/svn-sync-tool/web-sources.toml'
+```
+
+完整示例见 `deploy/web-sources.example.toml`。Windows 盘符/UNC 示例：
+
+```toml
+[server]
+allowed_svn_prefixes = ["https://svn.example.com/svn/"]
+
+[[profiles]]
+id = "e9-default"
+label = "E9 标准文件共享"
+role = "standard"
+# TOML 单引号字符串保留反斜杠，不要写成双反斜杠
+standard_path = 'D:\E9标准文件'
+unc_prefix = '\\192.168.7.215\ECOLOGY_customer'
+```
+
+Windows 下配置 `standard_path` 后，标准文件任务与合并工作台默认以该路径作为来源根；可直接使用盘符目录或 UNC，不需要额外挂载共享。升级清单 Markdown 会写回该来源根下客户目录的 `ecology` 目录。
+
+Linux 常驻部署示例：
+
+```toml
+[server]
+mount_root = "/mnt/ecology"
+smb_credentials_file = "/root/.config/svn_sync_tool/smb-credentials.toml"
+allowed_svn_prefixes = ["https://svn.example.com/svn/"]
+
+[[profiles]]
+id = "e9-default"
+label = "E9 标准文件共享"
+role = "standard"
+unc_prefix = '\\192.168.7.215\ECOLOGY_customer'
+
+# 需要历史文件来源时再启用；三台历史共享会自动加入白名单
+[[profiles]]
+id = "historical"
+label = "E9 历史文件共享"
+role = "historical"
+unc_prefix = '\\192.168.7.108\ECOLOGY_customer'
+```
+
+仓库自带的 `conf/web-sources.toml` 是默认配置，只保存来源和凭据文件路径，不保存用户名/密码；SMB 凭据仍放在独立的 `smb-credentials.toml`，不得加入 Git。旧版 `SVN_SYNC_WEB_STANDARD_PATH` 等环境变量仅在未提供来源配置文件时作为兼容路径读取。
 
 ### 安装独立 Web 环境
 
@@ -159,32 +205,7 @@ python3 -m venv .venv-web
 
 ### 启动
 
-先配置固定标准文件共享。若该共享已经挂载，可把挂载根配置为本地路径：
-
-```bash
-export SVN_SYNC_WEB_STANDARD_PATH='/Volumes/ECOLOGY_customer'
-export SVN_SYNC_WEB_STANDARD_UNC_PREFIX='\\192.168.7.215\ECOLOGY_customer'
-export SVN_SYNC_WEB_SOURCE_LABEL='E9 标准文件共享'
-
-# 推荐同时限制网站允许连接的 SVN 前缀；多个前缀用逗号分隔
-export SVN_SYNC_WEB_ALLOWED_SVN_PREFIXES='https://svn.example.com/svn/'
-```
-
-若尚未挂载，配置本机已有的 SMB 凭据文件。服务会读取其中的 `[standard]`，自动挂载并在任务间复用，服务停止时只卸载自己创建的临时挂载；该文件不得加入 Git：
-
-```bash
-export E9_SMB_CREDENTIALS_FILE='/绝对路径/e9-smb-credentials.toml'
-```
-
-也可使用 `SVN_SYNC_WEB_SMB_CREDENTIALS_FILE` 覆盖上述变量。多个固定来源 Profile 可使用 JSON 数组：
-
-```bash
-export SVN_SYNC_WEB_SOURCE_PROFILES='[
-  {"id":"e9-default","label":"E9 标准文件共享","standard_path":"/Volumes/ECOLOGY_customer","unc_prefix":"\\\\192.168.7.215\\ECOLOGY_customer"}
-]'
-```
-
-然后启动：
+先编辑项目内默认配置 `conf/web-sources.toml`，或用 `SVN_SYNC_WEB_SOURCE_CONFIG` 指定其他文件，然后启动：
 
 ```bash
 .venv-web/bin/python svn_sync_web.py
@@ -195,20 +216,14 @@ export SVN_SYNC_WEB_SOURCE_PROFILES='[
 ### Windows 启动（PowerShell）
 
 ```powershell
-$env:SVN_SYNC_WEB_STANDARD_PATH = 'D:\E9标准文件'
-$env:SVN_SYNC_WEB_STANDARD_UNC_PREFIX = '\\192.168.7.215\ECOLOGY_customer'
-$env:SVN_SYNC_WEB_SOURCE_LABEL = 'E9 标准文件共享'
-$env:SVN_SYNC_WEB_ALLOWED_SVN_PREFIXES = 'https://svn.example.com/svn/'
+# 方式一：编辑项目内默认配置（推荐）
+# .\conf\web-sources.toml
+# 方式二：指定其他配置文件路径
+$env:SVN_SYNC_WEB_SOURCE_CONFIG = 'D:\svn-sync\web-sources.toml'
 .\.venv-web\Scripts\python.exe svn_sync_web.py
 ```
 
-`SVN_SYNC_WEB_STANDARD_PATH` 也可直接写成 UNC，例如 `\\192.168.7.215\ECOLOGY_customer`。配置完成后，标准文件提交与合并页默认使用该来源根；Windows 不需要额外挂载共享。
-
-多个固定来源 Profile 的 JSON 写法示例（JSON 字符串中的反斜杠需要转义）：
-
-```powershell
-$env:SVN_SYNC_WEB_SOURCE_PROFILES = '[{"id":"e9-default","label":"E9 标准文件共享","standard_path":"D:\\E9标准文件","unc_prefix":"\\\\192.168.7.215\\ECOLOGY_customer"}]'
-```
+配置完成后，`standard_path` 指向的标准文件目录会作为合并页默认来源根。修改配置文件后重启服务才生效。
 
 ### 部署到 Linux 常驻运行（推荐）
 
@@ -231,6 +246,11 @@ systemd 单元 `/etc/systemd/system/svn-sync-web.service` 以 root 运行，`Res
 并已 `enable` 开机自启；日志走 journald（`journalctl -u svn-sync-web -f`）。
 `deploy-linux.sh`（不带参数）用 `rsync --delete` 把**本地工作区**同步过去，只用于开发中快速验证；
 正式发布走下面的 `--from-git`。
+
+Linux 上的来源配置放在 `/opt/svn-sync-tool/conf/web-sources.toml`。该文件由部署机自己维护，
+`deploy-linux.sh` 与正式发布都**不会覆盖它**；首次启用时从 `deploy/web-sources.example.toml`
+复制一份再改（至少填 `[server] mount_root` 与各 `[[profiles]]` 的 `unc_prefix`），改完执行
+`systemctl restart svn-sync-web` 才生效。没有这个文件时，服务退回读取 systemd 单元里声明的旧环境变量。
 
 ### 正式发布：服务器只从 GitHub main 取代码
 
@@ -356,7 +376,7 @@ systemctl daemon-reload && systemctl enable --now svn-sync-mounts.service svn-sy
 svn-sync-mount-shares.sh --status    # 查看十个共享的挂载状态
 ```
 
-挂载点规则是 `<SVN_SYNC_WEB_MOUNT_ROOT>/<主机>/<共享>`，与 `SourceProfile.local_root_for`
+挂载点规则是 `<web-sources.toml 中 server.mount_root>/<主机>/<共享>`，与 `SourceProfile.local_root_for`
 保持一致——改其中一处必须同步改另一处，否则服务找不到已挂载的共享。
 
 `svn-sync-mounts.timer` 每 10 分钟触发一次 **`svn-sync-mounts-heal.service`** 重跑挂载脚本：
@@ -378,7 +398,7 @@ active 单元的 start 是空操作，直接触发它等于什么都不做。Web
   `--lan` 的自动探测结果会与之合并。
 - **SMB 共享要预先挂好**：`svn_sync_core` 的自动挂载只实现了 macOS（`mount_smbfs`）
   和 Windows（UNC 直连）。Linux 上需用 `mount.cifs` 事先挂载，再把
-  `SVN_SYNC_WEB_MOUNT_ROOT` 指向挂载根——服务命中本地路径分支后完全不会走
+  `[server] mount_root` 指向挂载根——服务命中本地路径分支后完全不会走
   那段平台代码。
 - **SMB 协议版本要能降级**：当前启用的 `.215` / `.108` / `.173` 用 `vers=3.0` 正常，
   但实测 `192.168.7.106`（暂未启用）必须降到 `2.1` 才挂得上。挂载脚本按 3.0 → 2.1

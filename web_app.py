@@ -213,6 +213,8 @@ def _deploy_info():
 PATH_QUERY_SERVICE = PathQueryService.from_environment()
 AUTH_SERVICE = AuthService.from_environment()
 
+# 来源配置只在进程启动、即模块导入时读取一次；运行期间不重读。
+# StandardJobManager 持有 profiles 缓存，因此修改配置文件后必须重启 Web 服务。
 try:
     STANDARD_JOB_MANAGER = StandardJobManager.from_environment()
 except ValueError as exc:

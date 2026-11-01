@@ -49,6 +49,8 @@ EXCLUDES=(
     --exclude='/.git' --exclude='/.venv*' --exclude='/dist' --exclude='/build'
     --exclude='/outputs' --exclude='/.idea' --exclude='__pycache__' --exclude='*.pyc'
     --exclude='.DS_Store' --exclude='._*' --exclude='/README.assets' --exclude='/qt_assets'
+    # 来源配置由每台机器自己维护：既不下发本机配置，也不让 --delete 清掉服务器上的那份
+    --exclude='/conf/web-sources.toml'
 )
 echo "同步源码 → ${SSH_HOST}:${REMOTE_DIR}"
 ssh "${SSH_OPTS[@]}" "$SSH_HOST" "mkdir -p '$REMOTE_DIR'"

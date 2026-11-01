@@ -251,12 +251,12 @@ class SourceProfile:
         }
 
 
-def _configured_path(value):
+def _configured_path(value, label="Web 标准文件来源"):
     text = os.path.expanduser(str(value or "").strip())
     if not text:
         return ""
     if not os.path.isabs(text):
-        raise ValueError("Web 标准文件来源必须配置为绝对路径")
+        raise ValueError("%s必须配置为绝对路径" % label)
     return os.path.realpath(text)
 
 
@@ -309,14 +309,146 @@ def _discover_smb_credentials_file(env, allow_workspace_default=False):
             if isinstance(root, str) and root.strip() else "")
 
 
-def load_source_profiles(environ=None):
-    env = environ or os.environ
+SOURCE_CONFIG_ENV = "SVN_SYNC_WEB_SOURCE_CONFIG"
+
+
+def _default_source_config_path():
+    """当前项目 conf 目录下的默认来源配置文件，可用环境变量覆盖。"""
+    return Path(__file__).resolve().parent / "conf" / "web-sources.toml"
+
+
+def _resolve_source_config_path(env, allow_default=True):
+    explicit = str(env.get(SOURCE_CONFIG_ENV, "") or "").strip()
+    if explicit:
+        return Path(os.path.expanduser(explicit)).resolve()
+    if not allow_default:
+        return None
+    candidate = _default_source_config_path()
+    return candidate.resolve() if candidate.is_file() else None
+
+
+def _config_string_list(value, field):
+    """读取 TOML 字符串数组，并兼容旧的逗号分隔环境变量写法。"""
+    if value in (None, ""):
+        return ()
+    if isinstance(value, str):
+        return tuple(part.strip() for part in value.split(",") if part.strip())
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("%s 必须是字符串数组" % field)
+    result = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError("%s 必须是字符串数组" % field)
+        text = item.strip()
+        if text:
+            result.append(text)
+    return tuple(result)
+
+
+def _infer_profile_role(value):
+    role = str(value.get("role", "") or "").strip().lower()
+    if role:
+        if role not in {"standard", "historical"}:
+            raise ValueError("来源 Profile role 只支持 standard 或 historical")
+        return role
+    configured_prefix = str(value.get("unc_prefix", "") or "").strip()
+    if configured_prefix and any(
+            _same_unc_prefix(configured_prefix, prefix)
+            for prefix in DEFAULT_HISTORICAL_UNC_PREFIXES):
+        return "historical"
+    return "standard"
+
+
+def _parse_source_config(payload, env):
+    """把 TOML 配置转换成不可变的运行期来源列表。
+
+    文件在 :func:`load_source_config` 中只读取一次。这里不读取任何凭据内容，
+    只保存凭据文件路径；SMB/SVN 密码仍由任务运行时从独立凭据文件读取。
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("来源配置文件根节点必须是 TOML 表")
+    server = payload.get("server", {})
+    if not isinstance(server, dict):
+        raise ValueError("来源配置 server 必须是 TOML 表")
+    raw_profiles = payload.get("profiles", [])
+    if not isinstance(raw_profiles, list):
+        raise ValueError("来源配置 profiles 必须是数组")
+
+    default_mount_root = _configured_path(
+        server.get("mount_root"), "server.mount_root")
+    default_credentials_file = _configured_path(
+        server.get("smb_credentials_file"), "server.smb_credentials_file")
+    if not default_credentials_file:
+        # 兼容已有的 e9-paths.json / E9_SECRETS_ROOT 发现方式；只保存路径。
+        default_credentials_file = _discover_smb_credentials_file(env)
+    allowed_svn_prefixes = _config_string_list(
+        server.get("allowed_svn_prefixes", payload.get("allowed_svn_prefixes")),
+        "server.allowed_svn_prefixes",
+    )
+
+    profiles = []
+    for index, value in enumerate(raw_profiles):
+        field = "profiles[%d]" % index
+        if not isinstance(value, dict):
+            raise ValueError("%s 必须是 TOML 表" % field)
+        profile_id = str(value.get("id", "")).strip().lower()
+        if not PROFILE_ID_RE.fullmatch(profile_id):
+            raise ValueError("%s.id 格式不正确" % field)
+        role = _infer_profile_role(value)
+        raw_path = value.get("standard_path")
+        if raw_path in (None, "") and role == "historical":
+            raw_path = value.get("historical_path", "")
+        standard_path = _configured_path(raw_path, "%s.standard_path" % field)
+        default_unc_prefix = (
+            DEFAULT_HISTORICAL_UNC_PREFIX
+            if role == "historical"
+            else DEFAULT_STANDARD_UNC_PREFIX
+        )
+        unc_prefix = str(value.get("unc_prefix", default_unc_prefix) or "").strip()
+        if "extra_unc_prefixes" in value:
+            extra_unc_prefixes = _config_string_list(
+                value.get("extra_unc_prefixes"), "%s.extra_unc_prefixes" % field)
+        elif role == "historical":
+            extra_unc_prefixes = tuple(
+                prefix for prefix in DEFAULT_HISTORICAL_UNC_PREFIXES
+                if not _same_unc_prefix(prefix, unc_prefix)
+            )
+        else:
+            extra_unc_prefixes = ()
+        mount_root = (
+            _configured_path(value.get("mount_root"), "%s.mount_root" % field)
+            if "mount_root" in value
+            else default_mount_root
+        )
+        credentials_file = (
+            _configured_path(value.get("smb_credentials_file"),
+                             "%s.smb_credentials_file" % field)
+            if value.get("smb_credentials_file")
+            else default_credentials_file
+        )
+        profiles.append(SourceProfile(
+            profile_id=profile_id,
+            label=str(value.get("label", "")).strip() or profile_id,
+            standard_path=standard_path,
+            historical_path="",
+            unc_prefix=unc_prefix,
+            extra_unc_prefixes=extra_unc_prefixes,
+            mount_root=mount_root,
+            smb_credentials_file=credentials_file,
+        ))
+    if len({profile.profile_id for profile in profiles}) != len(profiles):
+        raise ValueError("来源 Profile id 不能重复")
+    return tuple(profiles), allowed_svn_prefixes
+
+
+def _load_legacy_source_profiles(env):
+    """旧环境变量兼容路径；仅在未找到来源配置文件时使用。"""
     raw = str(env.get("SVN_SYNC_WEB_SOURCE_PROFILES", "") or "").strip()
     profiles = []
     default_unc_prefix = str(
         env.get("SVN_SYNC_WEB_STANDARD_UNC_PREFIX", DEFAULT_STANDARD_UNC_PREFIX) or "").strip()
     default_credentials_file = _discover_smb_credentials_file(
-        env, allow_workspace_default=environ is None)
+        env, allow_workspace_default=env is os.environ)
     # 多共享时的本地挂载根；挂载脚本按 <root>/<主机>/<共享> 落盘，此处规则一致
     mount_root = _configured_path(env.get("SVN_SYNC_WEB_MOUNT_ROOT"))
     if raw:
@@ -373,7 +505,46 @@ def load_source_profiles(environ=None):
             ))
     if len({profile.profile_id for profile in profiles}) != len(profiles):
         raise ValueError("来源 Profile id 不能重复")
-    return profiles
+    return tuple(profiles)
+
+
+def load_source_config(environ=None, config_path=None, allow_default=True):
+    """读取来源配置文件；该函数只应在服务启动阶段调用一次。
+
+    优先使用显式路径或 ``SVN_SYNC_WEB_SOURCE_CONFIG``，否则读取当前项目
+    ``conf/web-sources.toml``。若配置文件不存在，则兼容
+    读取旧环境变量。返回的 profiles 会被 ``StandardJobManager`` 持有为缓存，
+    文件后续变化不会影响当前进程，必须重启服务才生效。
+    """
+    env = os.environ if environ is None else environ
+    path = (Path(os.path.expanduser(str(config_path))).resolve()
+            if config_path is not None
+            else _resolve_source_config_path(env, allow_default=allow_default))
+    if path is not None:
+        if not path.is_file():
+            raise ValueError("来源配置文件不存在: %s" % path)
+        try:
+            payload = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+            raise ValueError("来源配置文件无法读取: %s" % path) from exc
+        profiles, allowed_svn_prefixes = _parse_source_config(payload, env)
+        return {
+            "profiles": profiles,
+            "allowed_svn_prefixes": allowed_svn_prefixes,
+            "config_path": str(path),
+        }
+
+    return {
+        "profiles": _load_legacy_source_profiles(env),
+        "allowed_svn_prefixes": (),
+        "config_path": "",
+    }
+
+
+def load_source_profiles(environ=None, config_path=None, allow_default=True):
+    """兼容旧调用点：返回启动期来源 Profile 列表。"""
+    return list(load_source_config(
+        environ, config_path, allow_default=allow_default)["profiles"])
 
 
 def _iso(timestamp):
@@ -613,11 +784,16 @@ class StandardJobManager:
 
     @classmethod
     def from_environment(cls, environ=None):
-        env = environ or os.environ
-        prefixes = read_allowed_svn_prefixes(env)
-        # 保留 ``None``，让 load_source_profiles 能区分正常启动与测试显式传入
-        # 的环境映射，并在正常启动时按 ecology-9-dev 路径注册表查找凭据引用。
-        return cls(load_source_profiles(environ), allowed_svn_prefixes=prefixes)
+        """创建启动期实例，并在这里一次性读取来源配置文件。
+
+        ``profiles`` 是进程级缓存；请求处理不会重新读取配置文件，修改文件后
+        必须重启 Web 服务才会生效。
+        """
+        env = os.environ if environ is None else environ
+        source_config = load_source_config(env, allow_default=True)
+        prefixes = (source_config["allowed_svn_prefixes"]
+                    or read_allowed_svn_prefixes(env))
+        return cls(source_config["profiles"], allowed_svn_prefixes=prefixes)
 
     def start(self):
         with self._jobs_lock:
