@@ -1,0 +1,2243 @@
+"use strict";
+
+const MAX_HTML_FILE_BYTES = 1024 * 1024;
+
+const SAMPLE_HTML = `
+<style>
+  .upgrade-file { color: rgb(232, 63, 63); }
+  .context-file { color: #222222; }
+</style>
+<div>QC123456 优化门户登录体验 —— 门户</div>
+<div class="upgrade-file">https://svn.example.com/svn/customer/ecology/src/com/example/LoginService.java(V120)</div>
+<div class="context-file">https://svn.example.com/svn/customer/ecology/src/com/example/LoginConfig.java(V118)</div>
+<div>QC123457 修复移动端展示问题 —— 移动端</div>
+<div style="color: #d92d20">https://svn.example.com/svn/customer/ecology/mobile/js/demo/page.js(V121)</div>
+`;
+
+const state = {
+  richHtml: "",
+  format: "md",
+  filename: "",
+  result: "",
+  suppressSourceInput: false,
+  sourceRevision: 0,
+  listRevision: 0,
+};
+
+const elements = {
+  sourceInput: document.querySelector("#sourceInput"),
+  sourceState: document.querySelector("#sourceState"),
+  htmlFile: document.querySelector("#htmlFile"),
+  fileButton: document.querySelector("#fileButton"),
+  sampleButton: document.querySelector("#sampleButton"),
+  extractButton: document.querySelector("#extractButton"),
+  clearButton: document.querySelector("#clearButton"),
+  listInput: document.querySelector("#listInput"),
+  generateButton: document.querySelector("#generateButton"),
+  warningList: document.querySelector("#warningList"),
+  resultOutput: document.querySelector("#resultOutput"),
+  resultCustomer: document.querySelector("#resultCustomer"),
+  resultFilename: document.querySelector("#resultFilename"),
+  resultHint: document.querySelector("#resultHint"),
+  copyButton: document.querySelector("#copyButton"),
+  downloadButton: document.querySelector("#downloadButton"),
+  notice: document.querySelector("#notice"),
+  qcCount: document.querySelector("#qcCount"),
+  fileCount: document.querySelector("#fileCount"),
+  redCount: document.querySelector("#redCount"),
+  blackCount: document.querySelector("#blackCount"),
+  includeRed: document.querySelector("#includeRed"),
+  includeBlack: document.querySelector("#includeBlack"),
+  formatButtons: Array.from(document.querySelectorAll(".format-option")),
+  stages: Array.from(document.querySelectorAll("#upgradeToolView .flow-step")),
+};
+
+let noticeTimer = null;
+
+function setSourceValue(value) {
+  state.suppressSourceInput = true;
+  elements.sourceInput.value = value;
+  state.suppressSourceInput = false;
+}
+
+function setSourceState(kind, message) {
+  elements.sourceState.dataset.state = kind;
+  elements.sourceState.textContent = message;
+}
+
+function setStage(stage) {
+  elements.stages.forEach((item, index) => {
+    const step = index + 1;
+    item.classList.toggle("is-active", step === stage);
+    item.classList.toggle("is-complete", step < stage);
+  });
+}
+
+function showNotice(message, kind = "info") {
+  window.clearTimeout(noticeTimer);
+  elements.notice.textContent = message;
+  elements.notice.dataset.kind = kind;
+  elements.notice.classList.add("is-visible");
+  noticeTimer = window.setTimeout(() => elements.notice.classList.remove("is-visible"), 4200);
+}
+
+function setButtonBusy(button, busy, busyText) {
+  button.disabled = busy;
+  button.setAttribute("aria-busy", String(busy));
+  button.classList.toggle("is-busy", busy);
+  const label = button.querySelector(".button-label");
+  if (label) {
+    label.textContent = busy ? busyText : label.dataset.default;
+  } else {
+    if (!button.dataset.label) button.dataset.label = button.textContent.trim();
+    button.textContent = busy ? busyText : button.dataset.label;
+  }
+}
+
+function resetResult(message = "编辑清单后，选择格式并生成。") {
+  state.filename = "";
+  state.result = "";
+  elements.resultOutput.value = "";
+  elements.resultCustomer.textContent = "尚未生成";
+  elements.resultFilename.textContent = "—";
+  elements.resultHint.textContent = message;
+  elements.copyButton.disabled = true;
+  elements.downloadButton.disabled = true;
+}
+
+function resetReview(message = "编辑清单后，选择格式并生成。") {
+  state.listRevision += 1;
+  elements.listInput.value = "";
+  elements.listInput.disabled = true;
+  elements.generateButton.disabled = true;
+  elements.formatButtons.forEach((button) => {
+    button.disabled = true;
+  });
+  updateSummary();
+  showWarnings();
+  resetResult(message);
+  setStage(1);
+}
+
+function invalidateSourceRevision() {
+  state.sourceRevision += 1;
+  resetReview("源内容已变化，请重新提取升级清单。");
+}
+
+function updateSummary(summary = null) {
+  elements.qcCount.textContent = summary ? String(summary.qc_count) : "—";
+  elements.fileCount.textContent = summary ? String(summary.file_line_count) : "—";
+  elements.redCount.textContent = summary ? String(summary.red_count) : "—";
+  elements.blackCount.textContent = summary ? String(summary.black_count) : "—";
+}
+
+function showWarnings(warnings = []) {
+  elements.warningList.replaceChildren();
+  if (!warnings.length) {
+    elements.warningList.hidden = true;
+    return;
+  }
+  warnings.forEach((warning) => {
+    const item = document.createElement("p");
+    item.className = "warning-item";
+    item.textContent = warning.message;
+    elements.warningList.append(item);
+  });
+  elements.warningList.hidden = false;
+}
+
+/** 服务端没有返回统一错误体时的兜底说明，避免把 404 误读成业务失败。 */
+function httpFallbackMessage(status) {
+  if (status === 404) {
+    return "接口不存在（404）：页面已是新版，但服务端进程还是旧的，请重启 Web 服务。";
+  }
+  if (status === 405) return "接口不支持该请求方式（405），请重启 Web 服务后重试。";
+  if (status === 502 || status === 503 || status === 504) {
+    return `服务暂时不可用（${status}），请稍后重试。`;
+  }
+  return `处理失败（HTTP ${status}），请稍后重试。`;
+}
+
+async function requestJson(method, url, payload) {
+  const init = { method, headers: { Accept: "application/json" } };
+  if (payload !== null && payload !== undefined) {
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(payload);
+  }
+  const response = await fetch(url, init);
+  let data;
+  try {
+    data = await response.json();
+  } catch (_error) {
+    throw new Error(response.ok
+      ? "服务返回了无法识别的响应"
+      : httpFallbackMessage(response.status));
+  }
+  if (!response.ok || !data.ok) {
+    // 会话过期或未登录：任何接口都可能返回，统一退回登录门。
+    if (response.status === 401 && data?.error?.code === "login_required"
+        && typeof applyUser === "function") {
+      applyUser(null);
+    }
+    throw new Error(data?.error?.message || httpFallbackMessage(response.status));
+  }
+  return data;
+}
+
+function postJson(url, payload) {
+  return requestJson("POST", url, payload);
+}
+
+function plainTextFromHtml(html) {
+  const parsed = new DOMParser().parseFromString(html, "text/html");
+  return (parsed.body.textContent || "").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function loadRichHtml(html, label) {
+  invalidateSourceRevision();
+  state.richHtml = html;
+  setSourceValue(plainTextFromHtml(html));
+  setSourceState("rich", label);
+  elements.sourceInput.focus();
+}
+
+function invalidateSource() {
+  if (state.suppressSourceInput) return;
+  invalidateSourceRevision();
+  state.richHtml = "";
+  setSourceState(elements.sourceInput.value.trim() ? "plain" : "empty",
+    elements.sourceInput.value.trim() ? "仅检测到纯文本" : "等待粘贴");
+}
+
+async function extractList() {
+  let html = state.richHtml;
+  const sourceText = elements.sourceInput.value.trim();
+  if (!html && /^\s*</.test(sourceText)) html = sourceText;
+  if (!html) {
+    showNotice("没有检测到富文本 HTML，请重新从网页复制或读取 HTML 文件。", "warning");
+    elements.sourceInput.focus();
+    return;
+  }
+  const sourceRevision = state.sourceRevision;
+  setButtonBusy(elements.extractButton, true, "正在提取…");
+  try {
+    const data = await postJson("/api/v1/upgrade-list/extract", { html });
+    if (sourceRevision !== state.sourceRevision) return;
+    elements.listInput.disabled = false;
+    elements.listInput.value = data.list_text;
+    elements.generateButton.disabled = false;
+    elements.formatButtons.forEach((button) => {
+      button.disabled = false;
+    });
+    state.listRevision += 1;
+    updateSummary(data.summary);
+    showWarnings(data.warnings);
+    resetResult("清单已提取，可以校对后生成 Markdown。");
+    setStage(2);
+    showNotice(`已提取 ${data.summary.qc_count} 个 QC、${data.summary.file_line_count} 个文件。`, "success");
+    elements.listInput.focus();
+  } catch (error) {
+    if (sourceRevision !== state.sourceRevision) return;
+    showNotice(error.message, "error");
+  } finally {
+    setButtonBusy(elements.extractButton, false);
+  }
+}
+
+async function generateMarkdown() {
+  const listText = elements.listInput.value;
+  if (!listText.trim()) {
+    showNotice("请先提取或填写升级清单。", "warning");
+    elements.listInput.focus();
+    return;
+  }
+  if (!elements.includeRed.checked && !elements.includeBlack.checked) {
+    showNotice("请至少勾选红色或黑色文件。", "warning");
+    elements.includeRed.focus();
+    return;
+  }
+  const listRevision = state.listRevision;
+  resetResult("正在生成 Markdown…");
+  setButtonBusy(elements.generateButton, true, "正在生成…");
+  try {
+    const data = await postJson("/api/v1/upgrade-list/generate", {
+      list_text: listText,
+      format: state.format,
+      include_red: elements.includeRed.checked,
+      include_black: elements.includeBlack.checked,
+    });
+    if (listRevision !== state.listRevision) return;
+    state.filename = data.filename;
+    state.result = data.content;
+    elements.resultOutput.value = data.content;
+    elements.resultCustomer.textContent = `客户：${data.customer}`;
+    elements.resultFilename.textContent = data.filename;
+    elements.resultHint.textContent = `共 ${data.stats.qc} 个 QC、${data.stats.unique_files} 个唯一文件。`;
+    elements.copyButton.disabled = false;
+    elements.downloadButton.disabled = false;
+    showWarnings(data.warnings);
+    setStage(3);
+    showNotice("Markdown 已生成。", "success");
+    elements.resultOutput.focus();
+  } catch (error) {
+    if (listRevision !== state.listRevision) return;
+    showNotice(error.message, "error");
+  } finally {
+    setButtonBusy(elements.generateButton, false);
+    elements.generateButton.disabled = elements.listInput.disabled || !elements.listInput.value.trim();
+  }
+}
+
+/** 复制纯文本到剪贴板，返回是否成功。
+ *
+ * 只写 text/plain，绝不带样式：办公软件的富文本框会优先取 text/html，
+ * 若降级路径选中的是带背景色的 DOM 节点，粘过去就会带上底色。
+ * 因此降级一律用临时 textarea——它的选区只有纯文本这一种格式。
+ *
+ * 注意 navigator.clipboard 仅在安全上下文（HTTPS 或 localhost）可用；
+ * 本服务常以内网 HTTP 访问，实际几乎总是走降级路径。
+ */
+async function copyPlainText(text) {
+  if (!text) return false;
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (_error) {
+      // 落到下面的 textarea 方案
+    }
+  }
+  const holder = document.createElement("textarea");
+  holder.value = text;
+  // 不用 display:none —— 那样无法选中
+  holder.setAttribute("readonly", "");
+  holder.style.position = "fixed";
+  holder.style.top = "-1000px";
+  holder.style.opacity = "0";
+  document.body.append(holder);
+  const previous = document.activeElement;
+  let copied = false;
+  try {
+    holder.select();
+    holder.setSelectionRange(0, holder.value.length);
+    copied = document.execCommand("copy");
+  } catch (_error) {
+    copied = false;
+  }
+  holder.remove();
+  if (previous && typeof previous.focus === "function") previous.focus();
+  return copied;
+}
+
+async function copyResult() {
+  if (!state.result) return;
+  const copied = await copyPlainText(state.result);
+  showNotice(copied ? "结果已复制到剪贴板。" : "复制失败，请手工复制。",
+             copied ? "success" : "error");
+}
+
+function downloadResult() {
+  if (!state.result || !state.filename) return;
+  const blob = new Blob([state.result], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = state.filename;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+  showNotice(`已下载 ${state.filename}。`, "success");
+}
+
+function clearWorkspace() {
+  state.sourceRevision += 1;
+  state.richHtml = "";
+  state.format = "md";
+  elements.includeRed.checked = true;
+  elements.includeBlack.checked = true;
+  setSourceValue("");
+  setSourceState("empty", "等待粘贴");
+  elements.htmlFile.value = "";
+  resetReview();
+  elements.formatButtons.forEach((button) => {
+    const selected = button.dataset.format === "md";
+    button.classList.toggle("is-selected", selected);
+    button.setAttribute("aria-pressed", String(selected));
+  });
+  elements.sourceInput.focus();
+}
+
+elements.sourceInput.addEventListener("paste", (event) => {
+  const html = event.clipboardData?.getData("text/html") || "";
+  const text = event.clipboardData?.getData("text/plain") || "";
+  if (html) {
+    event.preventDefault();
+    invalidateSourceRevision();
+    state.richHtml = html;
+    setSourceValue(text || plainTextFromHtml(html));
+    setSourceState("rich", "已保留富文本颜色");
+    showNotice("已读取富文本，可以开始提取。", "success");
+  } else {
+    window.setTimeout(() => {
+      state.richHtml = "";
+      setSourceState("plain", "仅检测到纯文本");
+      showNotice("当前剪贴板没有 HTML，红黑颜色可能已经丢失。", "warning");
+    }, 0);
+  }
+});
+
+elements.sourceInput.addEventListener("input", invalidateSource);
+elements.sourceInput.addEventListener("keydown", (event) => {
+  if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+    event.preventDefault();
+    extractList();
+  }
+});
+
+elements.listInput.addEventListener("input", () => {
+  state.listRevision += 1;
+  resetResult("清单已修改，请重新生成 Markdown。");
+  elements.generateButton.disabled = !elements.listInput.value.trim();
+  setStage(2);
+});
+elements.listInput.addEventListener("keydown", (event) => {
+  if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+    event.preventDefault();
+    generateMarkdown();
+  }
+});
+
+elements.sampleButton.addEventListener("click", () => {
+  loadRichHtml(SAMPLE_HTML, "已加载演示富文本");
+  showNotice("示例已载入，点击“提取升级清单”查看效果。", "info");
+});
+elements.fileButton.addEventListener("click", () => elements.htmlFile.click());
+elements.htmlFile.addEventListener("change", async () => {
+  const file = elements.htmlFile.files?.[0];
+  if (!file) return;
+  if (file.size > MAX_HTML_FILE_BYTES) {
+    elements.htmlFile.value = "";
+    showNotice("HTML 文件超过 1 MiB 限制。", "error");
+    return;
+  }
+  try {
+    const html = await file.text();
+    loadRichHtml(html, `已读取 ${file.name}`);
+    showNotice("HTML 文件已读取，可以开始提取。", "success");
+  } catch (_error) {
+    showNotice("读取 HTML 文件失败。", "error");
+  }
+});
+
+elements.formatButtons.forEach((button) => {
+  button.addEventListener("click", () => {
+    state.listRevision += 1;
+    state.format = button.dataset.format;
+    elements.formatButtons.forEach((item) => {
+      const selected = item === button;
+      item.classList.toggle("is-selected", selected);
+      item.setAttribute("aria-pressed", String(selected));
+    });
+    resetResult("输出格式已切换，请重新生成。");
+    setStage(2);
+  });
+});
+
+[elements.includeRed, elements.includeBlack].forEach((checkbox) => {
+  checkbox.addEventListener("change", () => {
+    state.listRevision += 1;
+    resetResult("颜色选择已变化，请重新生成 Markdown。");
+    if (!elements.listInput.disabled) setStage(2);
+  });
+});
+
+elements.extractButton.addEventListener("click", extractList);
+elements.generateButton.addEventListener("click", generateMarkdown);
+elements.clearButton.addEventListener("click", clearWorkspace);
+elements.copyButton.addEventListener("click", copyResult);
+elements.downloadButton.addEventListener("click", downloadResult);
+
+/** 工具导航：四个工作区共用同一套 hash 路由。 */
+const toolLinks = Array.from(document.querySelectorAll("[data-tool-link]"));
+const toolViews = Array.from(document.querySelectorAll("[data-tool-view]"));
+
+/** 键的顺序即导航顺序；第一项同时是无 hash 时的默认工具。 */
+const TOOLS = {
+  path: { hash: "#revision-paths", title: "#path-page-title", name: "版本号路径生成" },
+  standard: { hash: "#svn-standard", title: "#standard-page-title", name: "SVN 标准文件提交" },
+  upgrade: { hash: "#upgrade-list", title: "#page-title", name: "升级清单提取" },
+  combined: {
+    hash: "#standard-combined",
+    title: "#combinedStandard-page-title",
+    name: "标准文件提交与升级清单提取",
+  },
+};
+const DEFAULT_TOOL = Object.keys(TOOLS)[0];
+
+function toolFromHash(hash) {
+  const found = Object.keys(TOOLS).find((name) => TOOLS[name].hash === hash);
+  return found || DEFAULT_TOOL;
+}
+
+function selectTool(tool, focusTitle = false) {
+  const selected = TOOLS[tool] ? tool : DEFAULT_TOOL;
+  toolViews.forEach((view) => {
+    view.hidden = view.dataset.toolView !== selected;
+  });
+  toolLinks.forEach((link) => {
+    if (link.dataset.toolLink === selected) {
+      link.setAttribute("aria-current", "page");
+    } else {
+      link.removeAttribute("aria-current");
+    }
+  });
+  const desiredHash = TOOLS[selected].hash;
+  document.querySelector("#currentToolName").textContent = TOOLS[selected].name;
+  document.title = `${TOOLS[selected].name} · 升级工具中心`;
+  if (window.location.hash !== desiredHash) history.replaceState(null, "", desiredHash);
+  if (focusTitle) {
+    document.querySelector(TOOLS[selected].title)?.focus({ preventScroll: true });
+  }
+}
+
+toolLinks.forEach((link) => {
+  link.addEventListener("click", (event) => {
+    event.preventDefault();
+    selectTool(link.dataset.toolLink, true);
+    window.scrollTo({
+      top: 0,
+      behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth",
+    });
+  });
+});
+
+window.addEventListener("hashchange", () => {
+  selectTool(toolFromHash(window.location.hash));
+});
+
+/**
+ * 标准文件工作区的唯一实现。老页面（5 个阶段，保留收尾）与合并页面
+ * （4 个阶段，配置任务里带升级清单提取）共用这套逻辑，只按前缀取元素。
+ * options: idFor / sessionKey / stageOrder / showCleanup / upgrade
+ */
+function createStandardPage(options) {
+  const byId = (suffix) => document.getElementById(options.idFor(suffix));
+  let upgradeElements = null;
+
+const STANDARD_SAMPLE = `src/com/example/LoginService.java
+WEB-INF/prop/example-login.properties`;
+
+const standardState = {
+  profilesReady: false,
+  taskId: null,
+  accessToken: null,
+  confirmationToken: null,
+  commitIdempotencyKey: null,
+  previewSignature: null,
+  task: null,
+  pollTimer: null,
+  pollFailures: 0,
+  resultUrls: [],
+  richHtml: "",
+  suppressCombinedInput: false,
+  autoCustomerPath: "",
+  autoSvnUrl: "",
+  allowedSvnPrefixes: [],
+  autoMarkdownDone: false,
+  autoMarkdownJobId: null,
+};
+
+const standardElements = {
+  stages: Array.from(byId("standardToolView").querySelectorAll(".flow-step")),
+  form: byId("standardTaskForm"),
+  errorSummary: byId("standardErrorSummary"),
+  profileAlert: byId("sourceProfileAlert"),
+  svnUrl: byId("standardSvnUrl"),
+  sourceProfile: byId("standardSourceProfile"),
+  sourceProfileDetail: byId("standardSourceProfileDetail"),
+  customerPath: byId("standardCustomerPath"),
+  fileList: byId("standardFileList"),
+  fileCount: byId("standardFileCount"),
+  coverAllConfirm: byId("standardCoverAllConfirm"),
+  coverAllConfirmWrap: byId("standardCoverAllConfirmWrap"),
+  commitMessage: byId("standardCommitMessage"),
+  messageCount: byId("standardMessageCount"),
+  sampleButton: byId("standardSampleButton"),
+  createButton: byId("createStandardPreviewButton"),
+  resetButton: byId("resetStandardFormButton"),
+  stateBadge: byId("standardTaskStateBadge"),
+  status: byId("standardTaskStatus"),
+  taskReference: byId("standardTaskReference"),
+  progressBar: byId("standardTaskProgressBar"),
+  emptyState: byId("standardTaskEmptyState"),
+  previewSection: byId("standardPreviewSection"),
+  previewTitle: byId("standardPreviewTitle"),
+  previewRevision: byId("standardPreviewRevision"),
+  previewSummary: byId("standardPreviewSummary"),
+  previewIssues: byId("standardPreviewIssues"),
+  previewItems: byId("standardPreviewItems"),
+  confirmButton: byId("confirmStandardCommitButton"),
+  cancelButton: byId("cancelStandardTaskButton"),
+  result: byId("standardCommitResult"),
+  resultMark: byId("standardResultMark"),
+  resultTitle: byId("standardResultTitle"),
+  resultMessage: byId("standardResultMessage"),
+  resultRevision: byId("standardResultRevision"),
+  resultUrls: byId("standardResultUrls"),
+  resultUrlHead: byId("standardResultUrlHead"),
+  resultUrlCount: byId("standardResultUrlCount"),
+  copyUrlsButton: byId("standardCopyUrlsButton"),
+  log: byId("standardTaskLog"),
+  dialog: byId("standardCommitDialog"),
+  dialogSvnUrl: byId("dialogSvnUrl"),
+  dialogFileCount: byId("dialogFileCount"),
+  dialogCommitMessage: byId("dialogCommitMessage"),
+  acknowledge: byId("standardCommitAcknowledge"),
+  dialogError: byId("standardCommitDialogError"),
+  submitCommitButton: byId("submitStandardCommitButton"),
+  closeDialogButton: byId("closeStandardCommitDialogButton"),
+};
+
+function standardApiError(message, code = "request_failed") {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+async function standardRequest(url, { method = "GET", payload = null, token = null } = {}) {
+  const headers = {};
+  if (payload !== null) headers["Content-Type"] = "application/json";
+  if (token) headers["X-LZR-Job-Token"] = token;
+  const response = await fetch(url, {
+    method,
+    headers,
+    body: payload === null ? null : JSON.stringify(payload),
+  });
+  let data;
+  try {
+    data = await response.json();
+  } catch (_error) {
+    throw standardApiError("服务返回了无法识别的响应");
+  }
+  if (!response.ok || !data.ok) {
+    if (response.status === 401 && data?.error?.code === "login_required") {
+      applyUser(null);
+    }
+    throw standardApiError(
+      data?.error?.message || httpFallbackMessage(response.status), data?.error?.code);
+  }
+  return data;
+}
+
+function updateStandardCounters() {
+  const lineCount = standardElements.fileList.value.split(/\r?\n/).filter((line) => line.trim()).length;
+  const emptyList = lineCount === 0;
+  const allowsCoverAll = selectedProfileAllowsCoverAll();
+  if (!emptyList) {
+    standardElements.fileCount.textContent = `${lineCount} 行 · 指定清单模式`;
+  } else {
+    standardElements.fileCount.textContent = allowsCoverAll
+      ? "空清单 · 全部交集模式" : "该来源必须填写文件清单";
+  }
+  // 只有标准文件共享支持空清单；其他来源连确认框都不显示
+  const showCoverAll = emptyList && allowsCoverAll;
+  standardElements.coverAllConfirmWrap.hidden = !showCoverAll;
+  if (!showCoverAll) {
+    standardElements.coverAllConfirm.checked = false;
+  } else if (!standardElements.coverAllConfirm.dataset.userTouched) {
+    // 默认勾选「清单为空：覆盖全部交集文件」；用户手动取消后本页内不再自动勾回
+    standardElements.coverAllConfirm.checked = true;
+  }
+  standardElements.messageCount.textContent = `${standardElements.commitMessage.value.length} / 500`;
+}
+
+function setStandardStage(stage) {
+  const order = options.stageOrder;
+  const activeIndex = stage === "done" ? order.length : Math.max(0, order.indexOf(stage));
+  standardElements.stages.forEach((item, index) => {
+    const complete = index < activeIndex;
+    item.classList.toggle("is-active", index === activeIndex);
+    item.classList.toggle("is-complete", complete);
+    // 只有已经走过的步骤才提供“返回”能力，避免把进度伪装成可前进。
+    const icon = item.querySelector(".step-index");
+    if (icon) {
+      icon.classList.toggle("is-back", complete);
+      if (complete) icon.setAttribute("title", "返回任务配置");
+      else icon.removeAttribute("title");
+    }
+  });
+}
+
+function stageForTask(task) {
+  if (task.status === "committed"
+      && (!options.showCleanup || task.cleanup?.status === "cleaned")) return "done";
+  if (["queued", "preparing"].includes(task.status)) return "checkout";
+  if (task.status === "preview_ready") return "preview";
+  if (["commit_queued", "committing"].includes(task.status)) return "commit";
+  if (task.status === "committed") return options.showCleanup ? "cleanup" : "done";
+  if (task.status === "commit_unknown" || task.error?.code?.startsWith("commit_")) return "commit";
+  if (["no_changes", "failed", "expired", "cancelled"].includes(task.status)) {
+    return task.checkout_revision ? "preview" : "checkout";
+  }
+  return "form";
+}
+
+function setStandardStatus(title, detail, { active = false, kind = "idle" } = {}) {
+  const titleElement = standardElements.status.querySelector("strong");
+  const detailElement = standardElements.status.querySelector("span:last-child");
+  titleElement.textContent = title;
+  detailElement.textContent = detail;
+  standardElements.status.dataset.active = String(active);
+  standardElements.stateBadge.dataset.state = kind;
+  standardElements.stateBadge.textContent = title;
+}
+
+function setStandardFormLocked(locked) {
+  [
+    standardElements.svnUrl,
+    standardElements.sourceProfile,
+    standardElements.customerPath,
+    standardElements.fileList,
+    standardElements.coverAllConfirm,
+    standardElements.commitMessage,
+    standardElements.sampleButton,
+  ].forEach((control) => {
+    control.disabled = locked;
+  });
+  standardElements.createButton.disabled = locked || !standardState.profilesReady;
+}
+
+function clearStandardErrors() {
+  standardElements.errorSummary.hidden = true;
+  standardElements.errorSummary.textContent = "";
+  [
+    standardElements.svnUrl,
+    standardElements.sourceProfile,
+    standardElements.customerPath,
+    standardElements.fileList,
+    standardElements.commitMessage,
+  ].forEach((control) => control.removeAttribute("aria-invalid"));
+}
+
+function showStandardError(message, control = null) {
+  standardElements.errorSummary.textContent = message;
+  standardElements.errorSummary.hidden = false;
+  if (control) {
+    control.setAttribute("aria-invalid", "true");
+    control.focus();
+  } else {
+    standardElements.errorSummary.focus();
+  }
+}
+
+function validateStandardForm() {
+  clearStandardErrors();
+  const checks = [
+    [standardElements.svnUrl, "请填写客户 SVN 地址。"],
+    [standardElements.sourceProfile, "请选择可用的标准文件来源。"],
+    [standardElements.customerPath, "请填写客户标准文件 ecology 目录。"],
+    [standardElements.commitMessage, "请填写 SVN 提交说明。"],
+  ];
+  for (const [control, message] of checks) {
+    if (!control.value.trim()) {
+      showStandardError(message, control);
+      return false;
+    }
+  }
+  try {
+    const parsed = new URL(standardElements.svnUrl.value.trim());
+    if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("scheme");
+  } catch (_error) {
+    showStandardError("SVN 地址必须是完整的 http 或 https 地址。", standardElements.svnUrl);
+    return false;
+  }
+  if (!standardElements.fileList.value.trim() && !selectedProfileAllowsCoverAll()) {
+    showStandardError(
+      "该来源必须提供文件清单；只有标准文件共享支持清单留空覆盖全部交集。",
+      standardElements.fileList);
+    return false;
+  }
+  if (!standardElements.fileList.value.trim() && !standardElements.coverAllConfirm.checked) {
+    showStandardError("清单为空时，请确认只覆盖 SVN 与标准目录同时存在的全部文件。", standardElements.coverAllConfirm);
+    return false;
+  }
+  return true;
+}
+
+async function loadStandardProfiles() {
+  try {
+    const data = await standardRequest("/api/v1/standard-files/source-profiles");
+    // 服务端把 allowed_svn_prefixes 一起下发，前端据此从升级清单识别客户 SVN 地址
+    standardState.allowedSvnPrefixes = Array.isArray(data.allowed_svn_prefixes)
+      ? data.allowed_svn_prefixes.map((item) => String(item || "").trim()).filter(Boolean)
+      : [];
+    standardElements.sourceProfile.replaceChildren();
+    const available = data.profiles.filter((profile) => profile.available);
+    if (!available.length) {
+      const option = document.createElement("option");
+      option.value = "";
+      option.textContent = data.configured ? "来源配置当前不可用" : "服务端尚未配置来源";
+      standardElements.sourceProfile.append(option);
+      standardElements.profileAlert.hidden = false;
+      standardElements.sourceProfile.disabled = true;
+      standardElements.createButton.disabled = true;
+      standardElements.sourceProfileDetail.textContent = "服务端配置完成后刷新页面即可使用。";
+      return;
+    }
+    available.forEach((profile) => {
+      const option = document.createElement("option");
+      option.value = profile.id;
+      option.textContent = profile.label;
+      option.dataset.detail = profile.priority;
+      option.dataset.uncPrefix = profile.unc_prefix || "";
+      option.dataset.allowsCoverAll = profile.allows_cover_all ? "1" : "";
+      option.dataset.pathHint = profile.path_hint || "";
+      standardElements.sourceProfile.append(option);
+    });
+    standardState.profilesReady = true;
+    standardElements.profileAlert.hidden = true;
+    standardElements.sourceProfile.disabled = Boolean(standardState.taskId);
+    standardElements.createButton.disabled = Boolean(standardState.taskId);
+    updateSelectedProfileDetail();
+    // 白名单随来源配置一起下发；用户先粘贴清单时在这里补一次客户 SVN 地址
+    if (options.upgrade && upgradeElements) applyAutoCustomerSvnUrl(upgradeElements.input.value);
+  } catch (error) {
+    standardElements.profileAlert.hidden = false;
+    standardElements.profileAlert.querySelector("strong").textContent = "无法读取标准文件来源";
+    standardElements.profileAlert.querySelector("span").textContent = error.message;
+    standardElements.sourceProfile.disabled = true;
+    standardElements.createButton.disabled = true;
+  }
+}
+
+/** 当前所选来源是否允许「清单留空 = 覆盖全部交集」。 */
+function selectedProfileAllowsCoverAll() {
+  return Boolean(
+    standardElements.sourceProfile.selectedOptions[0]?.dataset.allowsCoverAll);
+}
+
+function updateSelectedProfileDetail() {
+  const option = standardElements.sourceProfile.selectedOptions[0];
+  if (option?.dataset.detail) {
+    const hint = option.dataset.pathHint ? `；目录格式：${option.dataset.pathHint}` : "";
+    standardElements.sourceProfileDetail.textContent =
+      `${option.dataset.detail}；允许的共享根：${option.dataset.uncPrefix || "由服务器配置"}${hint}。`;
+  } else {
+    standardElements.sourceProfileDetail.textContent =
+      "网页只显示配置名称，不暴露服务器真实目录。";
+  }
+  // 切换来源会改变清单是否可留空，计数与提示需要同步刷新
+  updateStandardCounters();
+}
+
+/** 去掉从任务描述粘贴来的「标准文件请到 … 下面提取」等说明文字与多余空白。
+ *  词表与服务端 clean_customer_path_text（即桌面版 _clean_share_text）一致，服务端会再做一次。 */
+function cleanCustomerPathText(value) {
+  let text = String(value || "").split(/\s+/).filter(Boolean).join(" ");
+  for (const prefix of ["标准文件请到", "标准文件在", "请到", "文件请到"]) {
+    if (text.startsWith(prefix)) { text = text.slice(prefix.length).trim(); break; }
+  }
+  for (const suffix of ["下面提取", "里提取", "中提取", "提取", "下载"]) {
+    if (text.endsWith(suffix)) { text = text.slice(0, -suffix.length).trim(); break; }
+  }
+  return text.replace(/^"+|"+$/g, "");
+}
+
+function normalizeCustomerPathField() {
+  const cleaned = cleanCustomerPathText(standardElements.customerPath.value);
+  if (cleaned !== standardElements.customerPath.value) standardElements.customerPath.value = cleaned;
+}
+
+/** 从升级清单/任务描述里提取 UNC 客户来源目录（以 \\ecology 结尾）。 */
+function extractUncCustomerPath(value) {
+  const text = String(value || "").replace(/[\u200b\u00a0]/g, " ");
+  // 从 \\ 开始，贪婪截取到 \\ecology（后面不能再跟路径字符，避免命中 \\ECOLOGY_customer）。
+  const match = text.match(/\\\\[^\s"'<>|]*?\\ecology(?![\\A-Za-z0-9_])/i);
+  return match ? match[0] : "";
+}
+
+/** 粘贴升级清单时自动填写客户来源目录；用户手动改过的值不会被覆盖。 */
+function applyAutoCustomerPath(text) {
+  if (!options.upgrade) return false;
+  const path = extractUncCustomerPath(text);
+  if (!path) return false;
+  const current = standardElements.customerPath.value.trim();
+  if (current === path) return false;
+  if (current && current !== standardState.autoCustomerPath) return false;
+  standardElements.customerPath.value = path;
+  standardState.autoCustomerPath = path;
+  standardElements.customerPath.removeAttribute("aria-invalid");
+  return true;
+}
+
+/** 从升级清单里挑出命中服务端白名单的客户 SVN 仓库地址。
+ *  客户仓库地址 = 白名单前缀 + 前缀后的第一段路径（仓库名）。例如
+ *  https://10.1.3.13/svn/J江苏美思德化学股份/src/x/Y.java
+ *  -> https://10.1.3.13/svn/J江苏美思德化学股份
+ *  升级清单里常出现 https\:// 这类转义写法，这里先还原成 https:// */
+function extractCustomerSvnUrl(value) {
+  const prefixes = (standardState.allowedSvnPrefixes || []).filter(Boolean);
+  if (!prefixes.length) return "";
+  const raw = String(value || "")
+    .replace(/[\u200b\u00a0]/g, " ")
+    .replace(/\\\//g, "/")
+    .replace(/\\:/g, ":");
+  const haystack = raw.toLowerCase();
+  const ordered = prefixes.slice().sort((left, right) => right.length - left.length);
+  for (const prefix of ordered) {
+    const needle = String(prefix).toLowerCase();
+    let from = 0;
+    while (true) {
+      const index = haystack.indexOf(needle, from);
+      if (index < 0) break;
+      const rest = raw.slice(index + prefix.length);
+      if (rest.startsWith("/")) {
+        let segment = rest.slice(1).split("/")[0] || "";
+        segment = segment.split(/[\\?#\s"'<>|)]/, 1)[0] || "";
+        if (segment && segment !== "." && segment !== "..") {
+          return `${prefix}/${segment}`;
+        }
+      }
+      from = index + needle.length;
+    }
+  }
+  return "";
+}
+
+/** 粘贴升级清单时自动填写客户 SVN 地址；用户手动改过的值不会被覆盖。 */
+function applyAutoCustomerSvnUrl(text) {
+  if (!options.upgrade || !upgradeElements) return false;
+  const url = extractCustomerSvnUrl(text);
+  if (!url) return false;
+  const current = standardElements.svnUrl.value.trim();
+  if (current === url) return false;
+  if (current && current !== standardState.autoSvnUrl) return false;
+  standardElements.svnUrl.value = url;
+  standardState.autoSvnUrl = url;
+  standardElements.svnUrl.removeAttribute("aria-invalid");
+  return true;
+}
+
+function saveStandardTaskSession() {
+  if (!standardState.taskId || !standardState.accessToken) return;
+  sessionStorage.setItem(options.sessionKey, JSON.stringify({
+    id: standardState.taskId,
+    token: standardState.accessToken,
+  }));
+}
+
+function clearStandardTaskSession() {
+  sessionStorage.removeItem(options.sessionKey);
+}
+
+function restoreStandardTaskSession() {
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(options.sessionKey) || "null");
+    if (saved?.id && saved?.token) {
+      standardState.taskId = saved.id;
+      standardState.accessToken = saved.token;
+      setStandardFormLocked(true);
+      scheduleStandardPoll(0);
+    }
+  } catch (_error) {
+    clearStandardTaskSession();
+  }
+}
+
+async function createStandardTask(event) {
+  event.preventDefault();
+  normalizeCustomerPathField();
+  if (!validateStandardForm()) return;
+  const payload = {
+    svn_url: standardElements.svnUrl.value.trim(),
+    source_profile_id: standardElements.sourceProfile.value,
+    customer_standard_path: standardElements.customerPath.value.trim(),
+    file_list: standardElements.fileList.value,
+    cover_all_confirmed: !standardElements.fileList.value.trim() && standardElements.coverAllConfirm.checked,
+    commit_message: standardElements.commitMessage.value.trim(),
+  };
+  setButtonBusy(standardElements.createButton, true, "正在创建…");
+  clearStandardErrors();
+  try {
+    const data = await standardRequest("/api/v1/standard-files/tasks", { method: "POST", payload });
+    standardState.taskId = data.task.id;
+    standardState.accessToken = data.task.access_token;
+    standardState.confirmationToken = null;
+    standardState.commitIdempotencyKey = null;
+    standardState.previewSignature = null;
+    standardState.autoMarkdownDone = false;
+    standardState.autoMarkdownJobId = null;
+    standardState.pollFailures = 0;
+    saveStandardTaskSession();
+    setStandardFormLocked(true);
+    standardElements.emptyState.hidden = true;
+    setStandardStatus("任务已创建", "正在读取 SVN 上的文件。", { active: true, kind: "active" });
+    setStandardStage("checkout");
+    showNotice("标准文件任务已创建，正在生成安全预览。", "success");
+    scheduleStandardPoll(250);
+  } catch (error) {
+    showStandardError(error.message);
+    showNotice(error.message, "error");
+  } finally {
+    setButtonBusy(standardElements.createButton, false);
+    standardElements.createButton.disabled = Boolean(standardState.taskId) || !standardState.profilesReady;
+  }
+}
+
+function scheduleStandardPoll(delay = 1500) {
+  window.clearTimeout(standardState.pollTimer);
+  standardState.pollTimer = window.setTimeout(pollStandardTask, delay);
+}
+
+function schedulePollForStandardTask(task, activeDelay = 1500) {
+  const active = ["queued", "preparing", "preview_ready", "commit_queued", "committing"].includes(task.status);
+  const terminalCleanupPending = options.showCleanup
+    && ["committed", "no_changes", "failed", "expired", "cancelled", "commit_unknown"]
+    .includes(task.status) && task.cleanup?.status !== "cleaned";
+  if (active) {
+    scheduleStandardPoll(task.status === "preview_ready" ? 5000 : activeDelay);
+  } else if (terminalCleanupPending) {
+    scheduleStandardPoll(30000);
+  }
+}
+
+async function pollStandardTask() {
+  if (!standardState.taskId || !standardState.accessToken) return;
+  try {
+    const data = await standardRequest(
+      `/api/v1/standard-files/tasks/${encodeURIComponent(standardState.taskId)}`,
+      { token: standardState.accessToken },
+    );
+    standardState.pollFailures = 0;
+    standardState.task = data.task;
+    renderStandardTask(data.task);
+    schedulePollForStandardTask(data.task);
+  } catch (error) {
+    standardState.pollFailures += 1;
+    if (error.code === "job_not_found") {
+      showStandardError("任务不存在或服务已重启，请重新创建预览。");
+      releaseStandardTaskState();
+      return;
+    }
+    setStandardStatus("正在重新连接", "暂时无法读取任务状态；系统不会重复创建或提交。", { active: true, kind: "active" });
+    scheduleStandardPoll(Math.min(15000, 1000 * (2 ** Math.min(standardState.pollFailures, 4))));
+  }
+}
+
+function renderStandardSummary(summary = {}) {
+  standardElements.previewSummary.replaceChildren();
+  const fields = [
+    ["清单", summary.requested ?? 0],
+    ["变更", summary.changed ?? 0],
+    ["相同", summary.unchanged ?? 0],
+    ["缺失", summary.missing ?? 0],
+  ];
+  fields.forEach(([label, value]) => {
+    const card = document.createElement("div");
+    const name = document.createElement("span");
+    const count = document.createElement("strong");
+    name.textContent = label;
+    count.textContent = String(value);
+    card.append(name, count);
+    standardElements.previewSummary.append(card);
+  });
+}
+
+function renderStandardPreview(preview, task) {
+  standardElements.previewSection.hidden = false;
+  standardElements.emptyState.hidden = true;
+  standardElements.result.hidden = true;
+  standardState.confirmationToken = preview.confirmation_token || standardState.confirmationToken;
+  const previewSignature = JSON.stringify({
+    revision: task.checkout_revision,
+    canCommit: task.can_commit,
+    summary: preview.summary,
+    items: preview.items,
+    itemsTotal: preview.items_total,
+    itemsTruncated: preview.items_truncated,
+    issues: preview.blocking_issues,
+  });
+  if (standardState.previewSignature === previewSignature) {
+    standardElements.confirmButton.disabled = !task.can_commit;
+    standardElements.cancelButton.disabled = task.status !== "preview_ready";
+    return;
+  }
+  standardState.previewSignature = previewSignature;
+  standardElements.previewRevision.textContent = task.checkout_revision ? `基于版本 r${task.checkout_revision}` : "版本待确认";
+  renderStandardSummary(preview.summary);
+  standardElements.previewItems.replaceChildren();
+  preview.items.forEach((item) => {
+    const row = document.createElement("tr");
+    const path = document.createElement("td");
+    const source = document.createElement("td");
+    const result = document.createElement("td");
+    const tag = document.createElement("span");
+    path.textContent = item.path;
+    source.textContent = item.source;
+    tag.className = "preview-status-tag";
+    tag.dataset.kind = item.result === "已覆盖" ? "changed" : (item.result === "内容相同" ? "same" : "missing");
+    tag.textContent = item.result;
+    result.append(tag);
+    row.append(path, source, result);
+    standardElements.previewItems.append(row);
+  });
+  standardElements.previewIssues.replaceChildren();
+  const previewNotices = [...preview.blocking_issues];
+  if (preview.items_truncated) {
+    previewNotices.push(`交集共有 ${preview.items_total} 个文件，页面仅展示前 1000 个；实际覆盖、校验和提交仍使用完整交集。`);
+  }
+  if (previewNotices.length) {
+    previewNotices.forEach((issue) => {
+      const paragraph = document.createElement("p");
+      paragraph.textContent = issue;
+      standardElements.previewIssues.append(paragraph);
+    });
+    standardElements.previewIssues.hidden = false;
+  } else {
+    standardElements.previewIssues.hidden = true;
+  }
+  standardElements.confirmButton.disabled = !task.can_commit;
+  standardElements.cancelButton.disabled = task.status !== "preview_ready";
+}
+
+function renderStandardEvents(events = []) {
+  standardElements.log.replaceChildren();
+  events.forEach((event) => {
+    const item = document.createElement("li");
+    const timeElement = document.createElement("time");
+    const message = document.createElement("span");
+    const parsed = new Date(event.time);
+    timeElement.dateTime = event.time;
+    timeElement.textContent = Number.isNaN(parsed.getTime()) ? "—" : parsed.toLocaleTimeString("zh-CN", { hour12: false });
+    message.textContent = event.message;
+    item.append(timeElement, message);
+    standardElements.log.append(item);
+  });
+}
+
+function renderStandardResult(task) {
+  standardElements.previewSection.hidden = true;
+  standardElements.emptyState.hidden = true;
+  standardElements.result.hidden = false;
+  standardElements.resultRevision.hidden = true;
+  standardElements.resultUrls.replaceChildren();
+  standardElements.resultUrlHead.hidden = true;
+  standardState.resultUrls = [];
+  const cleanupStatus = task.cleanup?.status || "pending";
+  const cleanupText = !options.showCleanup ? ""
+    : (cleanupStatus === "cleaned"
+      ? "服务器上的临时文件已清理。"
+      : (cleanupStatus === "failed"
+        ? "临时文件清理未完成，后台会继续重试。"
+        : "临时文件正在清理中。"));
+  if (task.status === "committed") {
+    standardElements.result.dataset.kind = "success";
+    standardElements.resultMark.textContent = "✓";
+    standardElements.resultTitle.textContent = "SVN 提交成功";
+    standardElements.resultMessage.textContent = options.showCleanup
+      ? `提交结果已经保存，${cleanupText}请通知相关人员更新 SVN 最新版本。`
+      : "提交结果已经保存，请通知相关人员更新 SVN 最新版本。";
+    if (task.result?.revision) {
+      standardElements.resultRevision.textContent = `Revision r${task.result.revision}`;
+      standardElements.resultRevision.hidden = false;
+    }
+    const urls = task.result?.urls || [];
+    standardState.resultUrls = urls;
+    urls.forEach((url) => {
+      const line = document.createElement("p");
+      line.textContent = url;
+      standardElements.resultUrls.append(line);
+    });
+    if (urls.length) {
+      standardElements.resultUrlCount.textContent = `本次提交 ${urls.length} 个文件`;
+      standardElements.resultUrlHead.hidden = false;
+    }
+  } else if (task.status === "no_changes") {
+    standardElements.result.dataset.kind = "success";
+    standardElements.resultMark.textContent = "✓";
+    standardElements.resultTitle.textContent = "无需提交";
+    standardElements.resultMessage.textContent = options.showCleanup
+      ? `标准文件与仓库内容一致，没有创建新的 SVN 版本；${cleanupText}`
+      : "标准文件与仓库内容一致，没有创建新的 SVN 版本。";
+  } else if (task.status === "commit_unknown") {
+    standardElements.result.dataset.kind = "warning";
+    standardElements.resultMark.textContent = "?";
+    standardElements.resultTitle.textContent = "提交结果需要核验";
+    const unknownCleanupText = !options.showCleanup ? ""
+      : (cleanupStatus === "pending"
+        ? "相关文件会保留 1 小时以便你核对，之后自动清理。"
+        : cleanupText);
+    standardElements.resultMessage.textContent =
+      `${task.error?.message || "请勿重复提交，并在 SVN 日志中核验本次提交说明。"} ${unknownCleanupText}`.trim();
+    const markerLine = document.createElement("p");
+    markerLine.textContent = `核验提交说明：${task.commit_message}`;
+    standardElements.resultUrls.append(markerLine);
+  } else {
+    const cancelled = task.status === "cancelled";
+    standardElements.result.dataset.kind = cancelled ? "neutral" : "error";
+    standardElements.resultMark.textContent = cancelled ? "×" : "!";
+    standardElements.resultTitle.textContent = cancelled ? "任务已取消" : "任务未完成";
+    const baseMessage = task.error?.message || "任务已停止，没有向 SVN 提交任何内容。";
+    standardElements.resultMessage.textContent = `${baseMessage} ${cleanupText}`.trim();
+  }
+}
+
+function renderStandardTask(task) {
+  standardElements.taskReference.hidden = false;
+  standardElements.taskReference.textContent = `任务编号：${task.id}（反馈问题时请提供此编号）`;
+  if (task.status !== "preview_ready" && standardElements.dialog.open) {
+    standardElements.dialog.close();
+  }
+  const active = ["queued", "preparing", "commit_queued", "committing"].includes(task.status);
+  const success = ["preview_ready", "committed", "no_changes"].includes(task.status);
+  const detail = task.error?.message || (
+    task.status === "preview_ready"
+      ? (task.can_commit ? "预览已固定，核对后可进行一次性提交。" : "预览存在阻塞项，当前不能提交。")
+      : (active ? "任务正在服务器上执行。"
+        : (!options.showCleanup ? "任务已结束。"
+          : (task.cleanup?.status === "cleaned" ? "任务已结束，服务器临时文件已清理。"
+            : (task.cleanup?.status === "failed" ? "任务已结束，临时文件清理失败，后台会重试。"
+              : "任务已结束，临时文件等待清理。"))))
+  );
+  setStandardStatus(task.stage_label, detail, {
+    active,
+    kind: active ? "active" : (success ? "success" : (["failed", "expired", "cancelled", "commit_unknown"].includes(task.status) ? "error" : "idle")),
+  });
+  standardElements.progressBar.style.width = `${Math.max(0, Math.min(100, task.progress || 0))}%`;
+  setStandardStage(stageForTask(task));
+  renderStandardEvents(task.events);
+  if (task.preview) renderStandardPreview(task.preview, task);
+  if (["committed", "no_changes", "failed", "expired", "cancelled", "commit_unknown"].includes(task.status)) {
+    renderStandardResult(task);
+  }
+  maybeAutoWriteCombinedUpgradeMarkdown(task);
+}
+
+function openStandardCommitDialog() {
+  const task = standardState.task;
+  if (!task?.can_commit || !standardState.confirmationToken) return;
+  standardElements.dialogSvnUrl.textContent = task.svn_url;
+  standardElements.dialogFileCount.textContent = `${task.preview?.summary?.changed || 0} 个`;
+  standardElements.dialogCommitMessage.textContent = task.commit_message;
+  standardElements.acknowledge.checked = false;
+  standardElements.submitCommitButton.disabled = true;
+  standardElements.dialogError.textContent = "";
+  standardElements.dialogError.hidden = true;
+  standardElements.dialog.showModal();
+}
+
+async function submitStandardCommit() {
+  if (!standardState.taskId || !standardState.accessToken || !standardState.confirmationToken) return;
+  setButtonBusy(standardElements.submitCommitButton, true, "正在提交…");
+  if (!standardState.commitIdempotencyKey) {
+    standardState.commitIdempotencyKey = globalThis.crypto?.randomUUID
+      ? globalThis.crypto.randomUUID().replaceAll("-", "")
+      : `${Date.now()}_${Math.random().toString(36).slice(2)}_commit`;
+  }
+  try {
+    const data = await standardRequest(
+      `/api/v1/standard-files/tasks/${encodeURIComponent(standardState.taskId)}/commit`,
+      {
+        method: "POST",
+        token: standardState.accessToken,
+        payload: {
+          confirmation_token: standardState.confirmationToken,
+          idempotency_key: standardState.commitIdempotencyKey,
+        },
+      },
+    );
+    standardState.confirmationToken = null;
+    standardElements.dialog.close();
+    standardState.task = data.task;
+    renderStandardTask(data.task);
+    showNotice("提交请求已确认，正在复核并写入 SVN。", "success");
+    scheduleStandardPoll(400);
+  } catch (error) {
+    showNotice(error.message, "error");
+    standardElements.dialogError.textContent = `${error.message}。系统正在重新查询任务状态，不会自动重复提交。`;
+    standardElements.dialogError.hidden = false;
+    scheduleStandardPoll(0);
+  } finally {
+    setButtonBusy(standardElements.submitCommitButton, false);
+    standardElements.submitCommitButton.disabled = !standardElements.acknowledge.checked;
+  }
+}
+
+async function cancelStandardTask() {
+  if (!standardState.taskId || !standardState.accessToken) return true;
+  standardElements.cancelButton.disabled = true;
+  try {
+    const data = await standardRequest(
+      `/api/v1/standard-files/tasks/${encodeURIComponent(standardState.taskId)}`,
+      { method: "DELETE", token: standardState.accessToken },
+    );
+    standardState.task = data.task;
+    renderStandardTask(data.task);
+    showNotice("已取消，服务器上的临时文件会自动清理。", "success");
+    schedulePollForStandardTask(data.task, 600);
+    return true;
+  } catch (error) {
+    showNotice(error.message, "error");
+    standardElements.cancelButton.disabled = false;
+    return false;
+  }
+}
+
+function releaseStandardTaskState() {
+  standardElements.taskReference.hidden = true;
+  standardElements.taskReference.textContent = "";
+  window.clearTimeout(standardState.pollTimer);
+  standardState.taskId = null;
+  standardState.accessToken = null;
+  standardState.confirmationToken = null;
+  standardState.commitIdempotencyKey = null;
+  standardState.previewSignature = null;
+  standardState.autoMarkdownDone = false;
+  standardState.autoMarkdownJobId = null;
+  standardState.task = null;
+  clearStandardTaskSession();
+  setStandardFormLocked(false);
+  standardElements.previewSection.hidden = true;
+  standardElements.result.hidden = true;
+  standardElements.emptyState.hidden = false;
+  standardElements.progressBar.style.width = "0%";
+  standardElements.cancelButton.disabled = false;
+  setStandardStatus("等待配置", "填写左侧信息后创建提交预览。", { kind: "idle" });
+  setStandardStage("form");
+}
+
+standardElements.form.addEventListener("submit", createStandardTask);
+standardElements.form.addEventListener("reset", (event) => {
+  const terminal = standardState.task
+    && ["committed", "no_changes", "failed", "expired", "cancelled", "commit_unknown"].includes(standardState.task.status);
+  if (standardState.taskId && !terminal) {
+    event.preventDefault();
+    cancelStandardTask();
+    return;
+  }
+  window.setTimeout(() => {
+    releaseStandardTaskState();
+    clearStandardErrors();
+    updateStandardCounters();
+    resetCombinedUpgradeFormState();
+    standardElements.sourceProfile.disabled = !standardState.profilesReady;
+  }, 0);
+});
+standardElements.fileList.addEventListener("input", updateStandardCounters);
+// 粘贴任务描述原文后立即清理，用户能看到最终生效的路径
+standardElements.customerPath.addEventListener("paste", () => window.setTimeout(normalizeCustomerPathField, 0));
+standardElements.customerPath.addEventListener("change", normalizeCustomerPathField);
+standardElements.coverAllConfirm.addEventListener("change", () => {
+  standardElements.coverAllConfirm.dataset.userTouched = "1";
+  clearStandardErrors();
+});
+standardElements.copyUrlsButton.addEventListener("click", async () => {
+  const count = standardState.resultUrls.length;
+  const copied = await copyPlainText(standardState.resultUrls.join("\n"));
+  if (!count) return;
+  showNotice(copied ? `已复制 ${count} 个文件路径（纯文本）。` : "复制失败，请手工选择后复制。",
+             copied ? "success" : "error");
+});
+standardElements.commitMessage.addEventListener("input", updateStandardCounters);
+standardElements.sourceProfile.addEventListener("change", updateSelectedProfileDetail);
+standardElements.sampleButton.addEventListener("click", () => {
+  standardElements.svnUrl.value = "https://svn.example.com/svn/customer/ecology";
+  standardElements.customerPath.value = "\\\\192.168.7.215\\ECOLOGY_customer\\Y\\示例客户\\QC123456\\ecology";
+  standardElements.fileList.value = STANDARD_SAMPLE;
+  standardElements.commitMessage.value = "QC123456 补充示例标准文件";
+  updateStandardCounters();
+  showNotice("已加载演示字段，请替换为真实仓库与清单。", "info");
+});
+standardElements.confirmButton.addEventListener("click", openStandardCommitDialog);
+standardElements.cancelButton.addEventListener("click", cancelStandardTask);
+standardElements.acknowledge.addEventListener("change", () => {
+  standardElements.submitCommitButton.disabled = !standardElements.acknowledge.checked;
+});
+standardElements.closeDialogButton.addEventListener("click", () => standardElements.dialog.close());
+standardElements.submitCommitButton.addEventListener("click", submitStandardCommit);
+
+// 点击流程步骤小图标可返回“配置任务”，等同于回到上一步重新编辑。
+function currentStandardStageIndex() {
+  const index = standardElements.stages.findIndex((item) => item.classList.contains("is-active"));
+  return index < 0 ? 0 : index;
+}
+
+function isTerminalStandardTask(task) {
+  return Boolean(task) && ["committed", "no_changes", "failed", "expired", "cancelled", "commit_unknown"].includes(task.status);
+}
+
+function standardTaskIsRunning() {
+  return Boolean(standardState.taskId) && !isTerminalStandardTask(standardState.task);
+}
+
+// 进入这些状态后服务端不允许取消，前端也不能假装回退。
+const STANDARD_COMMIT_LOCK = ["commit_queued", "committing", "commit_unknown"];
+
+async function returnToStandardConfig() {
+  if (standardState.taskId && STANDARD_COMMIT_LOCK.includes(standardState.task?.status)) {
+    showNotice("任务已进入提交阶段，无法返回配置。", "warning");
+    return;
+  }
+  // 未结束的任务先请求取消（服务端会拒绝提交阶段的取消），再回到可编辑的表单。
+  if (standardTaskIsRunning()) {
+    const cancelled = await cancelStandardTask();
+    if (!cancelled) return;
+  }
+  if (standardState.taskId && STANDARD_COMMIT_LOCK.includes(standardState.task?.status)) {
+    showNotice("任务已进入提交阶段，无法返回配置。", "warning");
+    return;
+  }
+  releaseStandardTaskState();
+  standardElements.form.scrollIntoView({ behavior: "smooth", block: "start" });
+  showNotice("已返回任务配置，可修改后重新创建预览。", "info");
+}
+
+standardElements.stages.forEach((item, index) => {
+  const icon = item.querySelector(".step-index");
+  if (!icon) return;
+  icon.setAttribute("role", "button");
+  icon.setAttribute("tabindex", "0");
+  const activate = (event) => {
+    event.preventDefault();
+    if (index >= currentStandardStageIndex()) return; // 不能前进，也不能停在当前步骤
+    returnToStandardConfig();
+  };
+  icon.addEventListener("click", activate);
+  icon.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " " || event.key === "Spacebar") activate(event);
+  });
+});
+
+  /** 升级清单提取：复用升级清单接口，把 Markdown 写入本地导出目录。 */
+  function setCombinedUpgradeValue(value) {
+    standardState.suppressCombinedInput = true;
+    upgradeElements.input.value = value;
+    standardState.suppressCombinedInput = false;
+  }
+
+  function setCombinedUpgradeState(kind, message) {
+    upgradeElements.state.dataset.state = kind;
+    upgradeElements.state.textContent = message;
+  }
+
+  function updateCombinedUpgradeButton() {
+    upgradeElements.generate.disabled = !upgradeElements.input.value.trim();
+  }
+
+  function resetCombinedUpgradeResult() {
+    upgradeElements.result.hidden = true;
+    upgradeElements.result.replaceChildren();
+  }
+
+  function resetCombinedUpgradeFormState() {
+    if (!upgradeElements) return;
+    standardState.richHtml = "";
+    standardState.autoMarkdownDone = false;
+    standardState.autoMarkdownJobId = null;
+    setCombinedUpgradeValue("");
+    setCombinedUpgradeState("empty", "等待粘贴");
+    resetCombinedUpgradeResult();
+    updateCombinedUpgradeButton();
+  }
+
+  function renderCombinedUpgradeResult(data) {
+    upgradeElements.result.replaceChildren();
+    const stats = data.stats || {};
+    const lines = [`已写入 Markdown：${data.filename}`];
+    if (data.customer) lines.push(`客户：${data.customer}`);
+    lines.push(`QC：${stats.qc ?? "—"} · 唯一文件：${stats.unique_files ?? "—"}`);
+    (data.warnings || []).forEach((warning) => {
+      if (warning && warning.message) lines.push(`提示：${warning.message}`);
+    });
+    lines.forEach((text) => {
+      const paragraph = document.createElement("p");
+      paragraph.textContent = text;
+      upgradeElements.result.append(paragraph);
+    });
+    upgradeElements.result.hidden = false;
+  }
+
+  function extractQcNumberFromCommitMessage(value) {
+    const match = String(value || "").match(
+      /(?:^|[^A-Za-z0-9])(?:QC|NO)\s*(?:号|编号)?\s*[.:：]?\s*(\d{5,12})(?!\d)/i,
+    );
+    return match ? match[1] : "";
+  }
+
+  async function writeCombinedUpgradeMarkdown(options = {}) {
+    const auto = Boolean(options.auto);
+    const html = standardState.richHtml || upgradeElements.input.value;
+    if (!html.trim()) {
+      if (!auto) {
+        showNotice("请先粘贴升级清单。", "warning");
+        upgradeElements.input.focus();
+      }
+      return;
+    }
+    const profileId = standardElements.sourceProfile.value;
+    if (!profileId) {
+      if (!auto) {
+        showNotice("请先选择可用的标准文件来源。", "warning");
+        standardElements.sourceProfile.focus();
+      }
+      return;
+    }
+    const customerPath = standardElements.customerPath.value.trim();
+    if (!customerPath) {
+      if (!auto) {
+        showNotice("请先填写客户来源目录。", "warning");
+        standardElements.customerPath.focus();
+      }
+      return;
+    }
+    const commitMessage = String(
+      options.commitMessage || standardElements.commitMessage.value || "").trim();
+    if (!extractQcNumberFromCommitMessage(commitMessage)) {
+      if (!auto) {
+        showNotice(
+          "提交说明中未找到有效的 QC 号，请使用例如 no.5081286 或 QC5081286 的格式。",
+          "warning",
+        );
+        standardElements.commitMessage.focus();
+      }
+      return;
+    }
+    resetCombinedUpgradeResult();
+    if (!auto) setButtonBusy(upgradeElements.generate, true, "正在生成…");
+    try {
+      const data = await standardRequest("/api/v1/standard-files/upgrade-markdown", {
+        method: "POST",
+        payload: {
+          html,
+          source_profile_id: profileId,
+          customer_standard_path: customerPath,
+          commit_message: commitMessage,
+        },
+      });
+      renderCombinedUpgradeResult(data);
+      setCombinedUpgradeState("rich", auto ? "已自动写入本地目录" : "已写入本地目录");
+      showNotice(auto
+        ? `已自动生成 ${data.filename} 并覆盖写入本地导出目录。`
+        : `已生成 ${data.filename} 并写入本地导出目录。`, "success");
+    } catch (error) {
+      setCombinedUpgradeState("plain", "生成失败");
+      showNotice(error.message, "error");
+    } finally {
+      if (!auto) setButtonBusy(upgradeElements.generate, false);
+      updateCombinedUpgradeButton();
+    }
+  }
+
+  /** 预览就绪且已同步到本地后，自动把升级清单写入本地导出目录（每次覆盖）。 */
+  function maybeAutoWriteCombinedUpgradeMarkdown(task) {
+    if (!options.upgrade || !upgradeElements || !task) return false;
+    if (!["preview_ready", "no_changes"].includes(task.status)) return false;
+    if (standardState.autoMarkdownJobId !== task.id) {
+      standardState.autoMarkdownJobId = task.id;
+      standardState.autoMarkdownDone = false;
+    }
+    if (standardState.autoMarkdownDone) return false;
+    standardState.autoMarkdownDone = true;
+    void writeCombinedUpgradeMarkdown({
+      auto: true,
+      commitMessage: task.commit_message,
+    });
+    return true;
+  }
+
+  function bindUpgradeWriter() {
+    upgradeElements = {
+      input: document.getElementById(options.upgrade.input),
+      state: document.getElementById(options.upgrade.state),
+      generate: document.getElementById(options.upgrade.generate),
+      clear: document.getElementById(options.upgrade.clear),
+      result: document.getElementById(options.upgrade.result),
+    };
+    function applyAutoStandardFieldsFromUpgrade(text) {
+      const filledUrl = applyAutoCustomerSvnUrl(text);
+      const filledPath = applyAutoCustomerPath(text);
+      if (filledUrl && filledPath) {
+        showNotice("已从升级清单自动填写客户 SVN 地址与客户来源目录。", "success");
+      } else if (filledUrl) {
+        showNotice("已从升级清单自动填写客户 SVN 地址。", "success");
+      } else if (filledPath) {
+        showNotice("已从升级清单自动填写客户来源目录。", "success");
+      }
+    }
+
+    upgradeElements.input.addEventListener("paste", (event) => {
+      const html = event.clipboardData?.getData("text/html") || "";
+      const text = event.clipboardData?.getData("text/plain") || "";
+      if (html) {
+        event.preventDefault();
+        const plain = text || plainTextFromHtml(html);
+        standardState.richHtml = html;
+        setCombinedUpgradeValue(plain);
+        setCombinedUpgradeState("rich", "已保留富文本颜色");
+        resetCombinedUpgradeResult();
+        updateCombinedUpgradeButton();
+        applyAutoStandardFieldsFromUpgrade(plain);
+      } else {
+        window.setTimeout(() => {
+          standardState.richHtml = "";
+          setCombinedUpgradeState("plain", "仅检测到纯文本");
+          applyAutoStandardFieldsFromUpgrade(upgradeElements.input.value);
+        }, 0);
+      }
+    });
+    upgradeElements.input.addEventListener("input", () => {
+      if (standardState.suppressCombinedInput) return;
+      standardState.richHtml = "";
+      resetCombinedUpgradeResult();
+      const hasText = Boolean(upgradeElements.input.value.trim());
+      setCombinedUpgradeState(hasText ? "plain" : "empty", hasText ? "仅检测到纯文本" : "等待粘贴");
+      updateCombinedUpgradeButton();
+      applyAutoStandardFieldsFromUpgrade(upgradeElements.input.value);
+    });
+    upgradeElements.generate.addEventListener("click", writeCombinedUpgradeMarkdown);
+    upgradeElements.clear.addEventListener("click", resetCombinedUpgradeFormState);
+    resetCombinedUpgradeFormState();
+  }
+
+  if (options.upgrade) bindUpgradeWriter();
+
+  return {
+    init() {
+      updateStandardCounters();
+      restoreStandardTaskSession();
+    },
+    loadProfiles: loadStandardProfiles,
+  };
+}
+
+/** 老页面：保留 5 个阶段（含收尾），与升级清单提取页面互相独立。 */
+const standardPage = createStandardPage({
+  idFor: (suffix) => suffix,
+  sessionKey: "lzr-standard-task",
+  stageOrder: ["form", "checkout", "preview", "commit", "cleanup"],
+  showCleanup: true,
+  upgrade: null,
+});
+
+/** 新页面：标准文件提交去掉收尾，并把升级清单提取合并进配置任务。 */
+const combinedPage = createStandardPage({
+  idFor: (suffix) => `combined${suffix.charAt(0).toUpperCase()}${suffix.slice(1)}`,
+  sessionKey: "lzr-standard-task-combined",
+  stageOrder: ["form", "checkout", "preview", "commit"],
+  showCleanup: false,
+  upgrade: {
+    input: "combinedUpgradeHtml",
+    state: "combinedUpgradeState",
+    generate: "combinedUpgradeGenerateButton",
+    clear: "combinedUpgradeClearButton",
+    result: "combinedUpgradeResult",
+  },
+});
+
+const PATH_MAX_REVISIONS = 200;
+const PATH_SORT_LABELS = { rev: "按版本排序", path: "按路径排序", name: "按文件名排序" };
+
+const pathState = {
+  revision: 0,
+  sort: "rev",
+};
+
+const pathElements = {
+  form: document.querySelector("#pathQueryForm"),
+  errorSummary: document.querySelector("#pathErrorSummary"),
+  svnUrl: document.querySelector("#pathSvnUrl"),
+  revisionSpec: document.querySelector("#pathRevisionSpec"),
+  revisionCount: document.querySelector("#pathRevisionCount"),
+  sortMode: document.querySelector("#pathSortMode"),
+  queryButton: document.querySelector("#pathQueryButton"),
+  sortButton: document.querySelector("#pathSortButton"),
+  resetButton: document.querySelector("#pathResetButton"),
+  stateBadge: document.querySelector("#pathStateBadge"),
+  fileCount: document.querySelector("#pathFileCount"),
+  requestedCount: document.querySelector("#pathRequestedCount"),
+  matchedCount: document.querySelector("#pathMatchedCount"),
+  errorCount: document.querySelector("#pathErrorCount"),
+  output: document.querySelector("#pathResultOutput"),
+  warningList: document.querySelector("#pathWarningList"),
+  resultHint: document.querySelector("#pathResultHint"),
+  copyButton: document.querySelector("#pathCopyButton"),
+  downloadButton: document.querySelector("#pathDownloadButton"),
+};
+
+/** 与服务端 parse_revision_spec 一致的计数，仅用于界面提示。 */
+function countRevisionSpec(spec) {
+  const normalized = spec.trim().replace(/，/g, ",").replace(/[－–—]/g, "-");
+  if (!normalized) return 0;
+  const revisions = new Set();
+  normalized.split(/[,\s]+/).forEach((part) => {
+    if (!part) return;
+    if (part.includes("-")) {
+      const [rawStart, rawEnd] = part.split("-", 2);
+      const start = Number.parseInt(rawStart, 10);
+      const end = Number.parseInt(rawEnd, 10);
+      if (!Number.isInteger(start) || !Number.isInteger(end)) return;
+      const low = Math.min(start, end);
+      const high = Math.max(start, end);
+      // 界面只需要数量；超过上限即可停止展开，避免超大区间卡住输入框。
+      for (let value = low; value <= high && revisions.size <= PATH_MAX_REVISIONS; value += 1) {
+        revisions.add(value);
+      }
+      return;
+    }
+    const single = Number.parseInt(part, 10);
+    if (Number.isInteger(single)) revisions.add(single);
+  });
+  return revisions.size;
+}
+
+function updatePathRevisionCount() {
+  const count = countRevisionSpec(pathElements.revisionSpec.value);
+  pathElements.revisionCount.textContent = count > PATH_MAX_REVISIONS
+    ? `超过 ${PATH_MAX_REVISIONS} 个版本上限`
+    : `${count} 个版本`;
+}
+
+function setPathBadge(state, label) {
+  pathElements.stateBadge.dataset.state = state;
+  pathElements.stateBadge.textContent = label;
+}
+
+function clearPathErrors() {
+  pathElements.errorSummary.hidden = true;
+  pathElements.errorSummary.textContent = "";
+  [pathElements.svnUrl, pathElements.revisionSpec, pathElements.sortMode]
+    .forEach((control) => control.removeAttribute("aria-invalid"));
+}
+
+function showPathError(message, control = null) {
+  pathElements.errorSummary.textContent = message;
+  pathElements.errorSummary.hidden = false;
+  if (control) {
+    control.setAttribute("aria-invalid", "true");
+    control.focus();
+  } else {
+    pathElements.errorSummary.focus();
+  }
+}
+
+function renderPathMessages(messages = []) {
+  pathElements.warningList.replaceChildren();
+  if (!messages.length) {
+    pathElements.warningList.hidden = true;
+    return;
+  }
+  messages.forEach((message) => {
+    const item = document.createElement("p");
+    item.className = "warning-item";
+    item.textContent = message;
+    pathElements.warningList.append(item);
+  });
+  pathElements.warningList.hidden = false;
+}
+
+function updatePathSummary(stats = null) {
+  pathElements.fileCount.textContent = stats ? String(stats.file_count) : "—";
+  pathElements.requestedCount.textContent = stats?.revision_count === undefined
+    ? "—" : String(stats.revision_count);
+  pathElements.matchedCount.textContent = stats?.matched_revisions
+    ? String(stats.matched_revisions.length) : "—";
+  pathElements.errorCount.textContent = stats ? String(stats.error_count) : "—";
+}
+
+function setPathResultAvailability() {
+  const hasText = Boolean(pathElements.output.value.trim());
+  pathElements.copyButton.disabled = !hasText;
+  pathElements.downloadButton.disabled = !hasText;
+}
+
+function pathDownloadFilename() {
+  const raw = pathElements.svnUrl.value.trim().replace(/\/+$/, "");
+  let segment = "";
+  if (raw) {
+    try {
+      segment = decodeURIComponent(raw.split("/").pop() || "");
+    } catch (_error) {
+      segment = raw.split("/").pop() || "";
+    }
+  }
+  const safe = segment
+    .replace(/[<>:"/\\|?*\s]/g, "")
+    .replace(/^\.+|\.+$/g, "")
+    .slice(0, 60);
+  return `${safe || "svn"}-revision-paths.txt`;
+}
+
+function validatePathForm() {
+  clearPathErrors();
+  if (!pathElements.svnUrl.value.trim()) {
+    showPathError("请填写 SVN 仓库地址。", pathElements.svnUrl);
+    return false;
+  }
+  try {
+    const parsed = new URL(pathElements.svnUrl.value.trim());
+    if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("scheme");
+  } catch (_error) {
+    showPathError("SVN 仓库地址必须是完整的 http 或 https 地址。", pathElements.svnUrl);
+    return false;
+  }
+  if (!pathElements.revisionSpec.value.trim()) {
+    showPathError("请填写要查询的 SVN 版本号。", pathElements.revisionSpec);
+    return false;
+  }
+  const count = countRevisionSpec(pathElements.revisionSpec.value);
+  if (!count) {
+    showPathError("版本号只能包含数字、逗号、空格和连字符。", pathElements.revisionSpec);
+    return false;
+  }
+  if (count > PATH_MAX_REVISIONS) {
+    showPathError(`单次最多查询 ${PATH_MAX_REVISIONS} 个版本，请缩小版本范围。`, pathElements.revisionSpec);
+    return false;
+  }
+  return true;
+}
+
+function applyPathResult(data, buildHint) {
+  pathElements.output.value = data.text;
+  pathState.sort = data.sort;
+  updatePathSummary(data.stats);
+  renderPathMessages(data.errors || []);
+  pathElements.resultHint.textContent = buildHint(data);
+  setPathResultAvailability();
+}
+
+async function runPathQuery(event) {
+  event.preventDefault();
+  if (!validatePathForm()) return;
+  const revision = (pathState.revision += 1);
+  setButtonBusy(pathElements.queryButton, true, "正在查询…");
+  pathElements.sortButton.disabled = true;
+  setPathBadge("active", "正在查询 SVN");
+  try {
+    const data = await postJson("/api/v1/revision-paths/query", {
+      svn_url: pathElements.svnUrl.value.trim(),
+      revision_spec: pathElements.revisionSpec.value,
+      sort: pathElements.sortMode.value,
+    });
+    if (revision !== pathState.revision) return;
+    applyPathResult(data, (result) => (
+      `共 ${result.stats.file_count} 个文件，命中 ${result.stats.matched_revisions.length} / `
+      + `${result.stats.revision_count} 个版本（${PATH_SORT_LABELS[result.sort]}）。`
+    ));
+    if (!data.stats.file_count) {
+      setPathBadge("warning", "无变更文件");
+      showNotice("这些版本没有查询到变更文件。", "warning");
+    } else if (data.stats.error_count) {
+      setPathBadge("warning", "已完成，有提示");
+      showNotice(`已生成 ${data.stats.file_count} 个文件路径，另有 ${data.stats.error_count} 条提示。`, "warning");
+    } else {
+      setPathBadge("success", "查询完成");
+      showNotice(`已生成 ${data.stats.file_count} 个文件路径。`, "success");
+    }
+  } catch (error) {
+    if (revision !== pathState.revision) return;
+    setPathBadge("error", "查询失败");
+    showPathError(error.message);
+    showNotice(error.message, "error");
+  } finally {
+    setButtonBusy(pathElements.queryButton, false);
+    pathElements.sortButton.disabled = false;
+  }
+}
+
+async function runPathSort() {
+  if (!pathElements.output.value.trim()) {
+    showPathError("请先查询，或在结果区粘贴已有的 (V版本) 路径。", pathElements.output);
+    return;
+  }
+  const revision = (pathState.revision += 1);
+  clearPathErrors();
+  setButtonBusy(pathElements.sortButton, true, "正在排序…");
+  try {
+    const data = await postJson("/api/v1/revision-paths/sort", {
+      text: pathElements.output.value,
+      sort: pathElements.sortMode.value,
+    });
+    if (revision !== pathState.revision) return;
+    applyPathResult(data, (result) => (
+      `已本地排序 ${result.stats.file_count} 条路径（${PATH_SORT_LABELS[result.sort]}），未访问 SVN。`
+    ));
+    setPathBadge("success", "排序完成");
+    showNotice(`已按${PATH_SORT_LABELS[data.sort]}重排 ${data.stats.file_count} 条路径。`, "success");
+  } catch (error) {
+    if (revision !== pathState.revision) return;
+    showPathError(error.message);
+    showNotice(error.message, "error");
+  } finally {
+    setButtonBusy(pathElements.sortButton, false);
+  }
+}
+
+async function copyPathResult() {
+  const text = pathElements.output.value;
+  if (!text.trim()) return;
+  const copied = await copyPlainText(text);
+  showNotice(copied ? "文件路径已复制到剪贴板。" : "复制失败，请手工复制。",
+             copied ? "success" : "error");
+}
+
+function downloadPathResult() {
+  const text = pathElements.output.value;
+  if (!text.trim()) return;
+  const filename = pathDownloadFilename();
+  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+  showNotice(`已下载 ${filename}。`, "success");
+}
+
+pathElements.form.addEventListener("submit", runPathQuery);
+pathElements.form.addEventListener("reset", () => {
+  pathState.revision += 1;
+  window.setTimeout(() => {
+    clearPathErrors();
+    pathElements.output.value = "";
+    pathElements.sortMode.value = "rev";
+    pathState.sort = "rev";
+    updatePathRevisionCount();
+    updatePathSummary();
+    renderPathMessages();
+    setPathResultAvailability();
+    setPathBadge("idle", "尚未查询");
+    pathElements.resultHint.textContent = "填写仓库地址与版本号后开始查询。";
+  }, 0);
+});
+pathElements.revisionSpec.addEventListener("input", () => {
+  clearPathErrors();
+  updatePathRevisionCount();
+});
+pathElements.revisionSpec.addEventListener("keydown", (event) => {
+  if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+    event.preventDefault();
+    pathElements.form.requestSubmit();
+  }
+});
+pathElements.output.addEventListener("input", setPathResultAvailability);
+pathElements.sortButton.addEventListener("click", runPathSort);
+pathElements.copyButton.addEventListener("click", copyPathResult);
+pathElements.downloadButton.addEventListener("click", downloadPathResult);
+
+selectTool(toolFromHash(window.location.hash));
+standardPage.init();
+combinedPage.init();
+updatePathRevisionCount();
+
+// 右上角连接状态：HTTPS 才算加密；本机 http 调试时如实标为未加密
+(() => {
+  const secure = window.location.protocol === "https:";
+  const text = document.querySelector("#serviceStateText");
+  if (text) text.textContent = secure ? "HTTPS 加密连接" : "未加密连接";
+  document.querySelector("#serviceState")?.setAttribute("data-secure", String(secure));
+})();
+
+/* ── 账号与会话 ───────────────────────────────────────────────
+   登录门只是界面引导：服务端对每个接口都独立校验会话，绕过这层
+   拿不到任何数据。 */
+
+const authState = { user: null };
+
+const authElements = {
+  gate: document.querySelector("#authGate"),
+  error: document.querySelector("#authError"),
+  tabLogin: document.querySelector("#tabLogin"),
+  tabRegister: document.querySelector("#tabRegister"),
+  loginForm: document.querySelector("#loginForm"),
+  loginUsername: document.querySelector("#loginUsername"),
+  loginPassword: document.querySelector("#loginPassword"),
+  loginSubmit: document.querySelector("#loginSubmit"),
+  registerForm: document.querySelector("#registerForm"),
+  registerUsername: document.querySelector("#registerUsername"),
+  registerDisplayName: document.querySelector("#registerDisplayName"),
+  registerPassword: document.querySelector("#registerPassword"),
+  registerSubmit: document.querySelector("#registerSubmit"),
+  accountArea: document.querySelector("#accountArea"),
+  accountName: document.querySelector("#accountName"),
+  logoutButton: document.querySelector("#logoutButton"),
+  svnButton: document.querySelector("#svnAccountButton"),
+};
+
+const svnDialogElements = {
+  dialog: document.querySelector("#svnDialog"),
+  error: document.querySelector("#svnDialogError"),
+  status: document.querySelector("#svnDialogStatus"),
+  form: document.querySelector("#svnCredentialForm"),
+  username: document.querySelector("#svnAccountUsername"),
+  password: document.querySelector("#svnAccountPassword"),
+  saveButton: document.querySelector("#svnSaveButton"),
+  clearButton: document.querySelector("#svnClearButton"),
+  closeButton: document.querySelector("#svnCloseButton"),
+  togglePassword: document.querySelector("#svnTogglePassword"),
+};
+let svnDialogReturnFocus = null;
+
+// 两个覆盖层共用背景隔离，避免键盘进入弹窗后面的表单。
+function syncOverlayState() {
+  const svnOpen = !svnDialogElements.dialog.hidden;
+  const overlayOpen = !authElements.gate.hidden || svnOpen;
+  document.querySelector(".sidebar").inert = overlayOpen;
+  document.querySelector(".main-shell").inert = overlayOpen;
+  authElements.gate.inert = svnOpen;
+}
+
+function showAuthError(message, control) {
+  authElements.error.textContent = message;
+  authElements.error.hidden = false;
+  if (control) control.focus(); else authElements.error.focus();
+}
+
+function clearAuthError() {
+  authElements.error.hidden = true;
+  authElements.error.textContent = "";
+}
+
+function selectAuthTab(which) {
+  const login = which === "login";
+  authElements.tabLogin.setAttribute("aria-selected", String(login));
+  authElements.tabRegister.setAttribute("aria-selected", String(!login));
+  authElements.tabLogin.tabIndex = login ? 0 : -1;
+  authElements.tabRegister.tabIndex = login ? -1 : 0;
+  document.querySelector("#authTitle").textContent = login ? "登录工作台" : "创建站点账号";
+  authElements.loginForm.hidden = !login;
+  authElements.registerForm.hidden = login;
+  clearAuthError();
+  (login ? authElements.loginUsername : authElements.registerUsername).focus();
+}
+
+function applyUser(user) {
+  const wasSignedIn = Boolean(authState.user);
+  authState.user = user;
+  const signedIn = Boolean(user);
+  authElements.gate.hidden = signedIn;
+  authElements.accountArea.hidden = !signedIn;
+  document.body.classList.toggle("is-gated", !signedIn);
+  if (!signedIn) {
+    svnDialogElements.dialog.hidden = true;
+    svnDialogElements.password.value = "";
+  }
+  syncOverlayState();
+  if (signedIn) {
+    // 来源列表需要登录才能读取，因此在登录成功后（含刷新页面时的会话恢复）再拉取
+    if (!wasSignedIn) {
+      standardPage.loadProfiles();
+      combinedPage.loadProfiles();
+    }
+    authElements.accountName.textContent = user.display_name || user.username;
+    authElements.svnButton.textContent = user.has_svn_credentials
+      ? "我的 SVN 账号" : "我的 SVN 账号 · 待设置";
+    authElements.svnButton.classList.toggle("needs-attention", !user.has_svn_credentials);
+    if (!wasSignedIn) {
+      document.querySelector(TOOLS[toolFromHash(window.location.hash)].title)?.focus({ preventScroll: true });
+    }
+  } else {
+    selectAuthTab("login");
+  }
+}
+
+async function refreshSession() {
+  try {
+    const response = await fetch("/api/v1/auth/me", { headers: { Accept: "application/json" } });
+    const data = await response.json();
+    applyUser(data.authenticated ? data.user : null);
+  } catch (_error) {
+    applyUser(null);
+  }
+}
+
+async function submitLogin(event) {
+  event.preventDefault();
+  clearAuthError();
+  if (!authElements.loginUsername.value.trim()) {
+    showAuthError("请填写账号。", authElements.loginUsername);
+    return;
+  }
+  setButtonBusy(authElements.loginSubmit, true, "登录中…");
+  try {
+    const data = await postJson("/api/v1/auth/login", {
+      username: authElements.loginUsername.value,
+      password: authElements.loginPassword.value,
+    });
+    authElements.loginPassword.value = "";
+    applyUser(data.user);
+    showNotice(`欢迎回来，${data.user.display_name}。`, "success");
+    if (!data.user.has_svn_credentials) openSvnDialog();
+  } catch (error) {
+    showAuthError(error.message, authElements.loginPassword);
+  } finally {
+    setButtonBusy(authElements.loginSubmit, false);
+  }
+}
+
+async function submitRegister(event) {
+  event.preventDefault();
+  clearAuthError();
+  if (authElements.registerPassword.value.length < 8) {
+    showAuthError("登录密码至少 8 位。", authElements.registerPassword);
+    return;
+  }
+  setButtonBusy(authElements.registerSubmit, true, "注册中…");
+  try {
+    await postJson("/api/v1/auth/register", {
+      username: authElements.registerUsername.value,
+      password: authElements.registerPassword.value,
+      display_name: authElements.registerDisplayName.value,
+    });
+    // 注册接口不建会话，随即用同一组凭据登录，省去二次输入。
+    const data = await postJson("/api/v1/auth/login", {
+      username: authElements.registerUsername.value,
+      password: authElements.registerPassword.value,
+    });
+    authElements.registerPassword.value = "";
+    applyUser(data.user);
+    showNotice("注册成功，请先设置你的 SVN 账号。", "success");
+    openSvnDialog();
+  } catch (error) {
+    showAuthError(error.message, authElements.registerUsername);
+  } finally {
+    setButtonBusy(authElements.registerSubmit, false);
+  }
+}
+
+async function submitLogout() {
+  try {
+    await postJson("/api/v1/auth/logout", {});
+  } catch (_error) {
+    // 登出失败也按已登出处理：本地状态清掉，重新拉一次会话即可。
+  }
+  applyUser(null);
+  showNotice("已退出登录。", "success");
+}
+
+async function openSvnDialog() {
+  svnDialogElements.error.hidden = true;
+  if (svnDialogElements.dialog.hidden) svnDialogReturnFocus = document.activeElement;
+  svnDialogElements.dialog.hidden = false;
+  syncOverlayState();
+  const user = authState.user;
+  svnDialogElements.username.value = user?.svn_username || "";
+  svnDialogElements.password.value = "";
+  svnDialogElements.status.textContent = user?.has_svn_credentials
+    ? "正在读取已保存的凭据…" : "尚未保存 SVN 账号。";
+  svnDialogElements.username.focus();
+  if (!user?.has_svn_credentials) return;
+  // 密码只由这个专用接口返回，/me 与保存接口都不含它
+  try {
+    const data = await requestJson("GET", "/api/v1/auth/svn-credentials", null);
+    svnDialogElements.username.value = data.svn_username || "";
+    svnDialogElements.password.value = data.svn_password || "";
+    svnDialogElements.status.textContent = "以下为当前已保存的凭据，可直接修改后保存。";
+  } catch (error) {
+    svnDialogElements.status.textContent = "读取已保存凭据失败：" + error.message;
+  }
+}
+
+function toggleSvnPasswordVisibility() {
+  const field = svnDialogElements.password;
+  const hidden = field.type === "password";
+  field.type = hidden ? "text" : "password";
+  svnDialogElements.togglePassword.textContent = hidden ? "隐藏" : "显示";
+}
+
+function closeSvnDialog() {
+  svnDialogElements.dialog.hidden = true;
+  svnDialogElements.password.value = "";
+  syncOverlayState();
+  if (svnDialogReturnFocus?.isConnected && !svnDialogReturnFocus.closest("[hidden], [inert]")) {
+    svnDialogReturnFocus.focus({ preventScroll: true });
+  }
+  svnDialogReturnFocus = null;
+}
+
+async function submitSvnCredentials(event) {
+  event.preventDefault();
+  svnDialogElements.error.hidden = true;
+  if (!svnDialogElements.username.value.trim() || !svnDialogElements.password.value) {
+    svnDialogElements.error.textContent = "SVN 账号和密码都需要填写。";
+    svnDialogElements.error.hidden = false;
+    return;
+  }
+  setButtonBusy(svnDialogElements.saveButton, true, "保存中…");
+  try {
+    const data = await requestJson("PUT", "/api/v1/auth/svn-credentials", {
+      svn_username: svnDialogElements.username.value,
+      svn_password: svnDialogElements.password.value,
+    });
+    applyUser(data.user);
+    closeSvnDialog();
+    showNotice("SVN 账号已保存。", "success");
+  } catch (error) {
+    svnDialogElements.error.textContent = error.message;
+    svnDialogElements.error.hidden = false;
+  } finally {
+    setButtonBusy(svnDialogElements.saveButton, false);
+  }
+}
+
+async function clearSvnCredentials() {
+  if (!window.confirm("确定清除已保存的 SVN 账号密码？之后需要重新填写才能查询或提交。")) return;
+  try {
+    const data = await requestJson("DELETE", "/api/v1/auth/svn-credentials", null);
+    applyUser(data.user);
+    openSvnDialog();
+    showNotice("已清除保存的 SVN 账号。", "success");
+  } catch (error) {
+    svnDialogElements.error.textContent = error.message;
+    svnDialogElements.error.hidden = false;
+  }
+}
+
+authElements.tabLogin.addEventListener("click", () => selectAuthTab("login"));
+authElements.tabRegister.addEventListener("click", () => selectAuthTab("register"));
+[authElements.tabLogin, authElements.tabRegister].forEach((tab) => {
+  tab.addEventListener("keydown", (event) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const login = event.key === "Home" || (event.key !== "End" && tab === authElements.tabRegister);
+    selectAuthTab(login ? "login" : "register");
+    (login ? authElements.tabLogin : authElements.tabRegister).focus();
+  });
+});
+authElements.loginForm.addEventListener("submit", submitLogin);
+authElements.registerForm.addEventListener("submit", submitRegister);
+authElements.logoutButton.addEventListener("click", submitLogout);
+authElements.svnButton.addEventListener("click", openSvnDialog);
+document.querySelectorAll("[data-open-svn-account]").forEach((button) => {
+  button.addEventListener("click", openSvnDialog);
+});
+svnDialogElements.form.addEventListener("submit", submitSvnCredentials);
+svnDialogElements.clearButton.addEventListener("click", clearSvnCredentials);
+svnDialogElements.closeButton.addEventListener("click", closeSvnDialog);
+svnDialogElements.togglePassword.addEventListener("click", toggleSvnPasswordVisibility);
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !svnDialogElements.dialog.hidden) {
+    event.preventDefault();
+    closeSvnDialog();
+    return;
+  }
+  const overlay = !svnDialogElements.dialog.hidden ? svnDialogElements.dialog
+    : !authElements.gate.hidden ? authElements.gate : null;
+  if (event.key !== "Tab" || !overlay) return;
+  const controls = Array.from(overlay.querySelectorAll("button, input, select, textarea, a[href], [tabindex]"))
+    .filter((control) => !control.disabled && control.tabIndex >= 0 && control.getClientRects().length);
+  const first = controls[0];
+  const last = controls[controls.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last?.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first?.focus();
+  }
+});
+
+refreshSession();

@@ -1,0 +1,43 @@
+﻿# 构建中间件
+work/
+build/
+*.spec
+!SVN_Sync_Tool.spec
+*.pyc
+*.pyo
+__pycache__/
+
+# 操作系统
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE
+.vscode/
+.idea/
+.venv/
+.venv-macos/
+.venv-web/
+.wheelhouse/
+*.swp
+*.swo
+*~
+
+dist/
+README.assets/
+outputs/*.app/
+
+# Windows 一键启停脚本的 PID 与日志
+run/
+
+# Web 账号存储：含明文 SVN 密码，默认在仓库外（~/.config/svn_sync_tool/），
+# 这里再兜一层，防止有人把 SVN_SYNC_WEB_USER_STORE 指到仓库内
+web_users.json
+web_users.json.tmp
+*web_users*.json
+
+# 由 svn-sync-deploy 在服务器上写入的线上版本标记
+.deployed.json
+
+# Web 诊断日志必须存放在部署目录之外
+web.jsonl*

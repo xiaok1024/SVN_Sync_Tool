@@ -1,0 +1,2281 @@
+# -*- coding: utf-8 -*-
+"""Web 端 SVN 标准文件提交任务。
+
+浏览器只提交仓库地址、个人凭据和文件清单。标准/历史来源由服务端配置，
+每个任务使用独立的稀疏工作副本和 SVN config-dir；提交完成后立即清理。
+"""
+
+from __future__ import annotations
+
+import errno
+import hashlib
+import json
+import logging
+import ntpath
+import os
+import re
+import secrets
+import shutil
+import stat
+import tempfile
+import threading
+import time
+import urllib.parse
+import unicodedata
+import uuid
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
+
+try:  # tomllib 是 Python 3.11+ 的标准库；3.10（如 Ubuntu 22.04）回退到 tomli
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - 取决于运行时 Python 版本
+    import tomli as tomllib
+
+from svn_standard_file_core import StandardFileService
+from svn_sync_core import SyncEngine, redact_sensitive_text
+from svn_sync_workflow import (
+    get_repository_head_revision,
+    list_repository_files,
+    prepare_sparse_working_copy,
+)
+from web_svn_common import (
+    WebSvnEngine,
+    WebSvnError,
+    normalize_svn_url,
+    read_allowed_svn_prefixes,
+    supports_password_from_stdin,
+)
+from web_logging import log_event, exception_fields
+from web_upgrade_service import (
+    UpgradeWebError,
+    extract_upgrade_list,
+    generate_upgrade_markdown,
+)
+
+
+JOB_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+MAX_FILE_LIST_BYTES = 512 * 1024
+MAX_FILE_LINES = 1000
+MAX_FILE_PATHS = 1000
+MAX_REPOSITORY_FILES = 1000000
+MAX_PREVIEW_ITEMS = 1000
+MAX_FILE_LINE_BYTES = 8192
+MAX_COMMIT_MESSAGE = 500
+SVN_WC_SIZE_MULTIPLIER = 2
+SVN_WC_FILE_OVERHEAD = 64 * 1024
+ACTIVE_STATES = {"queued", "preparing", "preview_ready", "commit_queued", "committing"}
+TERMINAL_STATES = {"committed", "no_changes", "failed", "expired", "cancelled", "commit_unknown"}
+DEFAULT_STANDARD_UNC_PREFIX = r"\\192.168.7.215\ECOLOGY_customer"
+DEFAULT_HISTORICAL_UNC_PREFIX = r"\\192.168.7.108\ECOLOGY_customer"
+
+# 已知共享白名单。服务只校验「主机+共享在名单内」，不内置客户落在哪台的映射——
+# 客户与主机的对应关系来自各任务的 customer-env-info.md，由调用方传完整路径。
+# 三台历史主机共用同一套 history 账号（已实测），因此凭据按角色分两组即可。
+DEFAULT_STANDARD_UNC_PREFIXES = (
+    DEFAULT_STANDARD_UNC_PREFIX,
+)
+DEFAULT_HISTORICAL_UNC_PREFIXES = (
+    DEFAULT_HISTORICAL_UNC_PREFIX,                      # Windows
+    r"\\192.168.7.173\ecology-customer",               # Samba 4.10.16
+    r"\\192.168.7.173\ecology-customer2",
+)
+
+_WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
+_QC_NUMBER_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:QC|NO)\s*(?:\u53f7|\u7f16\u53f7)?\s*[.:\uff1a]?\s*(\d{5,12})(?!\d)",
+    re.IGNORECASE,
+)
+
+
+def extract_qc_number(commit_message):
+    """Extract the QC number from an SVN commit message."""
+    match = _QC_NUMBER_RE.search(str(commit_message or ""))
+    return match.group(1) if match else ""
+
+
+def _is_unc_path(value):
+    r"""是否为 ``\\server\share`` 形式的 UNC 路径。"""
+    text = unicodedata.normalize("NFC", str(value or "").strip().strip('"'))
+    return bool(re.match(r"^\\\\[^\\/]+\\[^\\/]+(?:[\\/].*)?$", text))
+
+
+def _is_windows_absolute_path(value):
+    """是否为 Windows 盘符或 UNC 绝对路径。"""
+    text = unicodedata.normalize("NFC", str(value or "").strip().strip('"'))
+    return bool(_WINDOWS_DRIVE_RE.match(text) or _is_unc_path(text))
+
+
+def _join_path_root(root, *parts):
+    """按根路径的写法拼接，避免 Windows/Linux 分隔符混用。"""
+    text = str(root or "")
+    if _is_windows_absolute_path(text):
+        return ntpath.join(text, *[str(part) for part in parts])
+    if text.startswith("/"):
+        return str(PurePosixPath(text).joinpath(*parts))
+    return os.path.join(text, *[str(part) for part in parts])
+
+
+def _rmtree_force(path):
+    """Remove a directory tree, clearing read-only attributes when Windows requires it."""
+    def clear_readonly_and_retry(func, target, exc_info):
+        try:
+            os.chmod(target, stat.S_IWRITE)
+        except OSError:
+            pass
+        func(target)
+
+    shutil.rmtree(path, onerror=clear_readonly_and_retry)
+
+
+class StandardWebError(WebSvnError):
+    """标准文件任务的业务错误；结构与其他 Web SVN 功能保持一致。"""
+
+
+def _same_unc_prefix(left, right):
+    """比较两个 UNC 前缀：统一 NFC、斜杠方向、大小写与结尾反斜杠。"""
+    def norm(value):
+        text = unicodedata.normalize("NFC", str(value or "").strip().strip('"'))
+        return text.replace("/", "\\").rstrip("\\").lower()
+    return bool(norm(left)) and norm(left) == norm(right)
+
+
+@dataclass(frozen=True)
+class SourceProfile:
+    profile_id: str
+    label: str
+    standard_path: str = ""
+    historical_path: str = ""
+    unc_prefix: str = DEFAULT_STANDARD_UNC_PREFIX
+    # 该角色允许的全部 \\主机\共享；留空时退化为只认 unc_prefix 一个
+    extra_unc_prefixes: tuple = ()
+    # 多共享时的本地挂载根；实际目录为 <mount_root>/<主机>/<共享>
+    mount_root: str = ""
+    smb_credentials_file: str = ""
+
+    @property
+    def unc_prefixes(self):
+        """该来源允许的全部共享根，首个为默认展示值。"""
+        seen, result = set(), []
+        for value in (self.unc_prefix, *self.extra_unc_prefixes):
+            text = str(value or "").strip()
+            key = text.replace("/", "\\").rstrip("\\").lower()
+            if text and key not in seen:
+                seen.add(key)
+                result.append(text)
+        return tuple(result)
+
+    @property
+    def is_standard_share(self):
+        """是否为固定标准共享根（服务端配置的固定标准共享）。
+
+        两条策略都由前缀推导而非配置项决定，避免有人在 JSON 里把非标准
+        共享错配成可以覆盖全部交集。
+        """
+        return _same_unc_prefix(self.unc_prefix, DEFAULT_STANDARD_UNC_PREFIX)
+
+    def match_prefix(self, value):
+        r"""返回 ``value`` 命中的共享根；不在白名单内返回 ``None``。
+
+        Windows 还接受直接粘贴服务端配置的本地来源根（通常是盘符或 UNC）；
+        这样配置了 ``standard_path=D:\...`` 后，页面粘贴同一路径即可命中。
+        """
+        normalized = unicodedata.normalize("NFC", str(value or "").strip().strip('"'))
+        normalized = normalized.replace("/", "\\").rstrip("\\").lower()
+        prefixes = list(self.unc_prefixes)
+        if os.name == "nt" and self.standard_path:
+            local_prefix = str(self.standard_path).strip().rstrip("\\/")
+            if local_prefix:
+                prefixes.append(local_prefix)
+        for prefix in prefixes:
+            key = unicodedata.normalize("NFC", prefix).replace("/", "\\").rstrip("\\").lower()
+            if normalized == key or normalized.startswith(key + "\\"):
+                return prefix
+        return None
+
+    def local_root_for(self, prefix):
+        """把命中的共享根映射到本地目录。
+
+        配了 mount_root 时按 ``<root>/<主机>/<共享>`` 推导（挂载脚本用同一规则）；
+        否则退回单共享时代的 standard_path。Windows 下 standard_path 可直接是
+        盘符目录或 UNC 共享根。
+        """
+        if self.mount_root:
+            parts = unicodedata.normalize("NFC", prefix).replace("/", "\\").strip("\\").split("\\")
+            if len(parts) >= 2:
+                return _join_path_root(self.mount_root, parts[0], parts[1])
+        return self.standard_path
+
+    @property
+    def credentials_sections(self):
+        """凭据文件中本来源可用的节名，按优先级排列。
+
+        历史共享同时接受 ``[history]``（现有文件采用）与 ``[historical]``，
+        避免两台机器上的文件因命名不同而读不到。
+        """
+        if self.is_standard_share:
+            return ("standard",)
+        return ("history", "historical")
+
+    @property
+    def allows_cover_all(self):
+        """只有标准共享根允许「清单留空 = 覆盖全部交集」。
+
+        其他来源（如历史文件共享）内容不受标准化管控，必须逐个列出文件，
+        否则可能把大量非预期文件覆盖进客户仓库。
+        """
+        return self.is_standard_share
+
+    @property
+    def available(self):
+        if self.standard_path and os.path.isdir(self.standard_path):
+            return True
+        if os.name == "nt" and any(
+                _is_unc_path(prefix) and os.path.isdir(prefix) for prefix in self.unc_prefixes):
+            return True
+        if self.mount_root and any(
+                _mount_ready(self.local_root_for(prefix)) for prefix in self.unc_prefixes):
+            return True
+        return bool(self.unc_prefix and self.smb_credentials_file
+                    and os.path.isfile(self.smb_credentials_file))
+
+    def public_dict(self):
+        return {
+            "id": self.profile_id,
+            "label": self.label,
+            "available": self.available,
+            "has_standard": bool(self.standard_path),
+            "has_historical": False,
+            "accepts_customer_path": bool(self.unc_prefix),
+            "unc_prefix": self.unc_prefix,
+            "unc_prefixes": list(self.unc_prefixes),
+            "allows_cover_all": self.allows_cover_all,
+            "path_hint": ("固定共享根\\分组\\客户\\QC编号\\ecology"
+                          if self.is_standard_share
+                          else "固定共享根\\分组\\客户\\目录\\ecology"),
+            "priority": ("固定标准共享根；每个任务选择客户 QC 的 ecology 目录"
+                         if self.is_standard_share
+                         else "历史文件共享根；必须提供文件清单，不支持覆盖全部交集"),
+        }
+
+
+def _configured_path(value, label="Web 标准文件来源"):
+    text = os.path.expanduser(str(value or "").strip())
+    if not text:
+        return ""
+    if not os.path.isabs(text):
+        raise ValueError("%s必须配置为绝对路径" % label)
+    return os.path.realpath(text)
+
+
+def _mount_ready(path):
+    """挂载槽位是否真的可用。
+
+    CIFS 掉线后挂载点目录仍然存在，只是空的；单看 isdir 会把「共享断开」误报成
+    「客户目录不存在」。是挂载点、或目录非空才算就绪（测试用的临时目录不是挂载点，
+    靠后一条判断）。
+    """
+    if not path or not os.path.isdir(path):
+        return False
+    if os.path.ismount(path):
+        return True
+    try:
+        with os.scandir(path) as entries:
+            return any(True for _ in entries)
+    except OSError:
+        return False
+
+
+def _discover_smb_credentials_file(env, allow_workspace_default=False):
+    explicit = (env.get("SVN_SYNC_WEB_SMB_CREDENTIALS_FILE")
+                or env.get("E9_SMB_CREDENTIALS_FILE"))
+    if explicit:
+        return _configured_path(explicit)
+    secrets_root = str(env.get("E9_SECRETS_ROOT", "") or "").strip()
+    if secrets_root:
+        return _configured_path(Path(secrets_root).expanduser() / "e9-smb-credentials.toml")
+    config_value = str(env.get("E9_PATHS_FILE", "") or "").strip()
+    config_path = Path(config_value).expanduser() if config_value else None
+    if config_path is None and allow_workspace_default:
+        # 这个兜底只在开发机的固定目录布局下成立（.../ecology/tooling/e9/本项目）。
+        # 部署到 /opt/svn-sync-tool 之类的浅路径时父级不够深，此处必须容错，
+        # 否则模块导入阶段就会 IndexError，整个服务起不来。
+        project_root = Path(__file__).resolve().parent
+        if len(project_root.parents) >= 3:
+            config_path = (
+                project_root.parents[2] / "workspaces" / "e9" / "ecology-9-dev"
+                / ".ai-data" / "local" / "e9-paths.json"
+            )
+    if not config_path or not config_path.is_file():
+        return ""
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return ""
+    root = payload.get("secrets.root") if isinstance(payload, dict) else ""
+    return (_configured_path(Path(root).expanduser() / "e9-smb-credentials.toml")
+            if isinstance(root, str) and root.strip() else "")
+
+
+SOURCE_CONFIG_ENV = "SVN_SYNC_WEB_SOURCE_CONFIG"
+
+
+def _default_source_config_path():
+    """当前项目 conf 目录下的默认来源配置文件，可用环境变量覆盖。"""
+    return Path(__file__).resolve().parent / "conf" / "web-sources.toml"
+
+
+def _resolve_source_config_path(env, allow_default=True):
+    explicit = str(env.get(SOURCE_CONFIG_ENV, "") or "").strip()
+    if explicit:
+        return Path(os.path.expanduser(explicit)).resolve()
+    if not allow_default:
+        return None
+    candidate = _default_source_config_path()
+    return candidate.resolve() if candidate.is_file() else None
+
+
+def _config_string_list(value, field):
+    """读取 TOML 字符串数组，并兼容旧的逗号分隔环境变量写法。"""
+    if value in (None, ""):
+        return ()
+    if isinstance(value, str):
+        return tuple(part.strip() for part in value.split(",") if part.strip())
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("%s 必须是字符串数组" % field)
+    result = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError("%s 必须是字符串数组" % field)
+        text = item.strip()
+        if text:
+            result.append(text)
+    return tuple(result)
+
+
+def _infer_profile_role(value):
+    role = str(value.get("role", "") or "").strip().lower()
+    if role:
+        if role not in {"standard", "historical"}:
+            raise ValueError("来源 Profile role 只支持 standard 或 historical")
+        return role
+    configured_prefix = str(value.get("unc_prefix", "") or "").strip()
+    if configured_prefix and any(
+            _same_unc_prefix(configured_prefix, prefix)
+            for prefix in DEFAULT_HISTORICAL_UNC_PREFIXES):
+        return "historical"
+    return "standard"
+
+
+def _parse_source_config(payload, env):
+    """把 TOML 配置转换成不可变的运行期来源列表。
+
+    文件在 :func:`load_source_config` 中只读取一次。这里不读取任何凭据内容，
+    只保存凭据文件路径；SMB/SVN 密码仍由任务运行时从独立凭据文件读取。
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("来源配置文件根节点必须是 TOML 表")
+    server = payload.get("server", {})
+    if not isinstance(server, dict):
+        raise ValueError("来源配置 server 必须是 TOML 表")
+    raw_profiles = payload.get("profiles", [])
+    if not isinstance(raw_profiles, list):
+        raise ValueError("来源配置 profiles 必须是数组")
+
+    default_mount_root = _configured_path(
+        server.get("mount_root"), "server.mount_root")
+    default_credentials_file = _configured_path(
+        server.get("smb_credentials_file"), "server.smb_credentials_file")
+    if not default_credentials_file:
+        # 兼容已有的 e9-paths.json / E9_SECRETS_ROOT 发现方式；只保存路径。
+        default_credentials_file = _discover_smb_credentials_file(env)
+    allowed_svn_prefixes = _config_string_list(
+        server.get("allowed_svn_prefixes", payload.get("allowed_svn_prefixes")),
+        "server.allowed_svn_prefixes",
+    )
+
+    profiles = []
+    for index, value in enumerate(raw_profiles):
+        field = "profiles[%d]" % index
+        if not isinstance(value, dict):
+            raise ValueError("%s 必须是 TOML 表" % field)
+        profile_id = str(value.get("id", "")).strip().lower()
+        if not PROFILE_ID_RE.fullmatch(profile_id):
+            raise ValueError("%s.id 格式不正确" % field)
+        role = _infer_profile_role(value)
+        raw_path = value.get("standard_path")
+        if raw_path in (None, "") and role == "historical":
+            raw_path = value.get("historical_path", "")
+        standard_path = _configured_path(raw_path, "%s.standard_path" % field)
+        default_unc_prefix = (
+            DEFAULT_HISTORICAL_UNC_PREFIX
+            if role == "historical"
+            else DEFAULT_STANDARD_UNC_PREFIX
+        )
+        unc_prefix = str(value.get("unc_prefix", default_unc_prefix) or "").strip()
+        if "extra_unc_prefixes" in value:
+            extra_unc_prefixes = _config_string_list(
+                value.get("extra_unc_prefixes"), "%s.extra_unc_prefixes" % field)
+        elif role == "historical":
+            extra_unc_prefixes = tuple(
+                prefix for prefix in DEFAULT_HISTORICAL_UNC_PREFIXES
+                if not _same_unc_prefix(prefix, unc_prefix)
+            )
+        else:
+            extra_unc_prefixes = ()
+        mount_root = (
+            _configured_path(value.get("mount_root"), "%s.mount_root" % field)
+            if "mount_root" in value
+            else default_mount_root
+        )
+        credentials_file = (
+            _configured_path(value.get("smb_credentials_file"),
+                             "%s.smb_credentials_file" % field)
+            if value.get("smb_credentials_file")
+            else default_credentials_file
+        )
+        profiles.append(SourceProfile(
+            profile_id=profile_id,
+            label=str(value.get("label", "")).strip() or profile_id,
+            standard_path=standard_path,
+            historical_path="",
+            unc_prefix=unc_prefix,
+            extra_unc_prefixes=extra_unc_prefixes,
+            mount_root=mount_root,
+            smb_credentials_file=credentials_file,
+        ))
+    if len({profile.profile_id for profile in profiles}) != len(profiles):
+        raise ValueError("来源 Profile id 不能重复")
+    return tuple(profiles), allowed_svn_prefixes
+
+
+def _parse_workspace_config(payload):
+    """解析 SVN 提交成功后的本地导出配置。
+
+    ``export_root`` 为空表示不导出；该配置与来源列表一样只在服务启动时
+    读取一次，修改配置文件后必须重启 Web 服务才会生效。
+    """
+    if not isinstance(payload, dict):
+        return {"export_root": "", "overwrite": True}
+    workspace = payload.get("workspace", {})
+    if not isinstance(workspace, dict):
+        raise ValueError("来源配置 workspace 必须是 TOML 表")
+    raw_root = str(workspace.get("export_root", "") or "").strip()
+    export_root = ""
+    if raw_root:
+        expanded = os.path.expanduser(raw_root)
+        if not os.path.isabs(expanded):
+            raise ValueError("workspace.export_root 必须配置为绝对路径")
+        export_root = expanded
+    overwrite = workspace.get("overwrite", True)
+    if not isinstance(overwrite, bool):
+        raise ValueError("workspace.overwrite 必须是布尔值")
+    return {"export_root": export_root, "overwrite": overwrite}
+
+
+def _load_legacy_source_profiles(env):
+    """旧环境变量兼容路径；仅在未找到来源配置文件时使用。"""
+    raw = str(env.get("SVN_SYNC_WEB_SOURCE_PROFILES", "") or "").strip()
+    profiles = []
+    default_unc_prefix = str(
+        env.get("SVN_SYNC_WEB_STANDARD_UNC_PREFIX", DEFAULT_STANDARD_UNC_PREFIX) or "").strip()
+    default_credentials_file = _discover_smb_credentials_file(
+        env, allow_workspace_default=env is os.environ)
+    # 多共享时的本地挂载根；挂载脚本按 <root>/<主机>/<共享> 落盘，此处规则一致
+    mount_root = _configured_path(env.get("SVN_SYNC_WEB_MOUNT_ROOT"))
+    if raw:
+        try:
+            values = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("SVN_SYNC_WEB_SOURCE_PROFILES 不是有效 JSON") from exc
+        if not isinstance(values, list):
+            raise ValueError("SVN_SYNC_WEB_SOURCE_PROFILES 必须是 JSON 数组")
+        for value in values:
+            if not isinstance(value, dict):
+                raise ValueError("来源 Profile 必须是对象")
+            profile_id = str(value.get("id", "")).strip().lower()
+            if not PROFILE_ID_RE.fullmatch(profile_id):
+                raise ValueError("来源 Profile id 格式不正确")
+            profiles.append(SourceProfile(
+                profile_id=profile_id,
+                label=str(value.get("label", "")).strip() or profile_id,
+                standard_path=_configured_path(value.get("standard_path")),
+                historical_path="",
+                unc_prefix=str(value.get("unc_prefix", default_unc_prefix) or "").strip(),
+                smb_credentials_file=_configured_path(
+                    value.get("smb_credentials_file") or default_credentials_file),
+            ))
+    else:
+        standard_path = _configured_path(env.get("SVN_SYNC_WEB_STANDARD_PATH"))
+        if standard_path or mount_root or default_credentials_file:
+            profiles.append(SourceProfile(
+                profile_id="default",
+                label=str(env.get("SVN_SYNC_WEB_SOURCE_LABEL", "E9 标准文件共享")
+                          or "").strip() or "E9 标准文件共享",
+                standard_path=standard_path,
+                unc_prefix=default_unc_prefix,
+                mount_root=mount_root,
+                smb_credentials_file=default_credentials_file,
+            ))
+        # 历史文件共享：三台主机共九个共享，内容不受标准化管控，必须逐个列文件
+        historical_path = _configured_path(env.get("SVN_SYNC_WEB_HISTORICAL_PATH"))
+        historical_prefix = str(env.get(
+            "SVN_SYNC_WEB_HISTORICAL_UNC_PREFIX", DEFAULT_HISTORICAL_UNC_PREFIX) or "").strip()
+        if historical_path or mount_root or default_credentials_file:
+            profiles.append(SourceProfile(
+                profile_id="historical",
+                label=str(env.get("SVN_SYNC_WEB_HISTORICAL_LABEL", "E9 历史文件共享")
+                          or "").strip() or "E9 历史文件共享",
+                standard_path=historical_path,
+                unc_prefix=historical_prefix,
+                extra_unc_prefixes=tuple(
+                    v for v in DEFAULT_HISTORICAL_UNC_PREFIXES if v != historical_prefix),
+                mount_root=mount_root,
+                smb_credentials_file=_configured_path(
+                    env.get("SVN_SYNC_WEB_HISTORICAL_SMB_CREDENTIALS_FILE")
+                    or default_credentials_file),
+            ))
+    if len({profile.profile_id for profile in profiles}) != len(profiles):
+        raise ValueError("来源 Profile id 不能重复")
+    return tuple(profiles)
+
+
+def load_source_config(environ=None, config_path=None, allow_default=True):
+    """读取来源配置文件；该函数只应在服务启动阶段调用一次。
+
+    优先使用显式路径或 ``SVN_SYNC_WEB_SOURCE_CONFIG``，否则读取当前项目
+    ``conf/web-sources.toml``。若配置文件不存在，则兼容
+    读取旧环境变量。返回的 profiles 会被 ``StandardJobManager`` 持有为缓存，
+    文件后续变化不会影响当前进程，必须重启服务才生效。
+    """
+    env = os.environ if environ is None else environ
+    path = (Path(os.path.expanduser(str(config_path))).resolve()
+            if config_path is not None
+            else _resolve_source_config_path(env, allow_default=allow_default))
+    if path is not None:
+        if not path.is_file():
+            raise ValueError("来源配置文件不存在: %s" % path)
+        try:
+            payload = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+            raise ValueError("来源配置文件无法读取: %s" % path) from exc
+        profiles, allowed_svn_prefixes = _parse_source_config(payload, env)
+        return {
+            "profiles": profiles,
+            "allowed_svn_prefixes": allowed_svn_prefixes,
+            "workspace": _parse_workspace_config(payload),
+            "config_path": str(path),
+        }
+
+    return {
+        "profiles": _load_legacy_source_profiles(env),
+        "allowed_svn_prefixes": (),
+        "workspace": _parse_workspace_config({}),
+        "config_path": "",
+    }
+
+
+def load_source_profiles(environ=None, config_path=None, allow_default=True):
+    """兼容旧调用点：返回启动期来源 Profile 列表。"""
+    return list(load_source_config(
+        environ, config_path, allow_default=allow_default)["profiles"])
+
+
+def _iso(timestamp):
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _token_hash(value):
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
+
+
+def _path_hash(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _directory_size(path):
+    total = 0
+    for root, directories, filenames in os.walk(path, followlinks=False):
+        directories[:] = [name for name in directories
+                          if not os.path.islink(os.path.join(root, name))]
+        for filename in filenames:
+            try:
+                total += os.lstat(os.path.join(root, filename)).st_size
+            except OSError:
+                continue
+    return total
+
+
+def _strip_version_suffix(value):
+    return re.sub(r"\([Vv]\d+\)(?:\s*[-—].*)?\s*$", "", value).strip()
+
+
+def parse_web_file_list(file_list, _svn_url=None):
+    """解析 Web 清单；这里只接受 ``ecology`` 下的普通相对文件路径。"""
+    value = str(file_list or "")
+    if len(value.encode("utf-8")) > MAX_FILE_LIST_BYTES:
+        raise StandardWebError("file_list_too_large", "文件清单超过 512 KiB 限制", 413)
+    raw_lines = value.splitlines()
+    if len(raw_lines) > MAX_FILE_LINES:
+        raise StandardWebError("too_many_files", "文件清单最多支持 1000 行")
+
+    relative_paths = []
+    for raw_line in raw_lines:
+        line = unicodedata.normalize("NFC", raw_line.strip())
+        if not line:
+            continue
+        if len(line.encode("utf-8")) > MAX_FILE_LINE_BYTES:
+            raise StandardWebError("file_line_too_long", "文件清单中存在过长行")
+        if line.startswith("[") or line.startswith("$/") or "://" in line:
+            raise StandardWebError(
+                "invalid_file_path", "文件清单只接受 ecology 目录下的相对文件路径")
+        if line.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:[\\/]", line):
+            raise StandardWebError(
+                "local_path_not_allowed", "文件清单不能包含绝对路径或网络共享路径")
+        relative = line.replace("\\", "/")
+        if relative.lower().startswith("ecology/"):
+            raise StandardWebError(
+                "invalid_file_path", "文件路径应相对于 ecology 目录，请去掉开头的 ecology/")
+        parts = PurePosixPath(relative).parts
+        if (not parts or relative.endswith("/") or any(part in {"", ".", ".."} for part in parts)
+                or any(ord(char) < 32 or ord(char) == 127 for char in relative)):
+            raise StandardWebError("invalid_file_path", "文件路径不能包含控制字符")
+        relative_paths.append("/".join(parts))
+    unique = list(dict.fromkeys(relative_paths))
+    if len(unique) > MAX_FILE_PATHS:
+        raise StandardWebError("too_many_files", "手工填写的文件清单最多支持 1000 个文件")
+    return unique
+
+
+def clean_customer_path_text(value):
+    """去掉从任务描述粘贴来的装饰文字，只留路径。
+
+    常见原文形如「标准文件请到\\\\…\\QC5017093\\ecology下面提取」，首尾还可能带空行、
+    空格。只处理首尾的固定说明词与空白，路径本身不动；词表复用桌面版
+    ``SyncEngine._clean_share_text``，两端行为一致。
+    """
+    text = " ".join(str(value or "").split())
+    return SyncEngine._clean_share_text(text).strip().strip('"')
+
+
+def parse_customer_standard_path(value, unc_prefix=DEFAULT_STANDARD_UNC_PREFIX,
+                                 require_qc_segment=True):
+    """验证固定共享根下的四段目录并返回安全后缀。
+
+    标准共享根要求第三段是 ``QC<数字>``；历史文件共享的第三段是普通目录名
+    （如 ``历史文件``），因此由调用方通过 ``require_qc_segment`` 指定。
+    两者都强制四段、以 ``ecology`` 结尾，并拒绝空段、``.``/``..`` 与含
+    ``%``、``:`` 的段，防止越出固定共享根。
+    """
+    text = unicodedata.normalize("NFC", str(value or "").strip().strip('"'))
+    prefix = unicodedata.normalize("NFC", str(unc_prefix or "").strip()).rstrip("\\/")
+    if (not text or len(text.encode("utf-8")) > 2048
+            or any(ord(char) < 32 or ord(char) == 127 for char in text)):
+        raise StandardWebError("invalid_customer_path", "请填写有效的客户标准文件 ecology 目录")
+    normalized = text.replace("/", "\\").rstrip("\\")
+    if not prefix:
+        raise StandardWebError("source_profile_unavailable", "服务端未配置标准共享根", 503)
+    prefix_normalized = unicodedata.normalize("NFC", prefix).replace("/", "\\").rstrip("\\")
+    if not normalized.lower().startswith(prefix_normalized.lower() + "\\"):
+        raise StandardWebError(
+            "customer_path_not_allowed", "客户目录不在服务端允许的共享根下", 403)
+    suffix = normalized[len(prefix_normalized):].lstrip("\\")
+    parts = suffix.split("\\")
+    if (len(parts) != 4 or any(part in {"", ".", ".."} for part in parts)
+            or any("%" in part or ":" in part for part in parts)
+            or parts[3].lower() != "ecology"):
+        raise StandardWebError(
+            "invalid_customer_path",
+            "客户目录格式应为 固定共享根\\分组\\客户\\%s\\ecology"
+            % ("QC编号" if require_qc_segment else "目录"))
+    if require_qc_segment and not re.fullmatch(r"QC\d+", parts[2], flags=re.I):
+        raise StandardWebError(
+            "invalid_customer_path",
+            "标准文件共享的第三段必须是 QC 编号，例如 QC123456")
+    return "/".join(parts)
+
+
+@dataclass
+class StandardJob:
+    job_id: str
+    access_token_hash: str
+    created_at: float
+    expires_at: float
+    svn_url: str
+    username: str
+    password: str | None
+    profile_id: str
+    source_relative: str
+    source_unc_prefix: str
+    selection_mode: str
+    relative_paths: list[str]
+    commit_message: str
+    job_dir: Path
+    wc_dir: Path
+    config_dir: Path
+    state: str = "queued"
+    stage_label: str = "等待处理"
+    progress: int = 0
+    can_commit: bool = False
+    checkout_revision: int | None = None
+    repo_uuid: str = ""
+    repo_root: str = ""
+    preview_items: list[dict] = field(default_factory=list)
+    preview_summary: dict = field(default_factory=dict)
+    blocking_issues: list[str] = field(default_factory=list)
+    status_entries: list[dict] = field(default_factory=list)
+    commit_targets: list[str] = field(default_factory=list)
+    preview_fingerprint: str = ""
+    confirmation_token_hash: str = ""
+    confirmation_token: str = ""
+    commit_idempotency_key: str = ""
+    revision: int | None = None
+    committed_urls: list[str] = field(default_factory=list)
+    committed_paths: list[str] = field(default_factory=list)
+    error: dict | None = None
+    cleanup_status: str = "pending"
+    cleanup_attempts: int = 0
+    actor: str = ""
+    request_id: str = ""
+    last_event_at: float = field(default_factory=time.monotonic, repr=False)
+    cancel_requested: bool = False
+    finished_at: float | None = None
+    events: list[dict] = field(default_factory=list)
+    lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+
+    def event(self, message):
+        self.events.append({"time": _iso(time.time()), "message": message})
+        if len(self.events) > 80:
+            del self.events[:-80]
+        now = time.monotonic()
+        self.diagnostic("task_event", message=message,
+                        stage_elapsed_ms=round((now - self.last_event_at) * 1000))
+        self.last_event_at = now
+
+    def diagnostic(self, event, **fields):
+        log_event(event, secrets=(self.password,), job_id=self.job_id,
+                  request_id=self.request_id, actor=self.actor, state=self.state,
+                  stage=self.stage_label, revision=self.revision,
+                  checkout_revision=self.checkout_revision, cleanup_status=self.cleanup_status,
+                  elapsed_ms=round((time.time() - self.created_at) * 1000),
+                  file_count=len(self.relative_paths),
+                  changed_count=self.preview_summary.get("changed", 0), **fields)
+
+
+class StandardJobManager:
+    def __init__(
+            self,
+            profiles=None,
+            temp_root=None,
+            allowed_svn_prefixes=(),
+            max_workers=2,
+            max_live_jobs=10,
+            preview_ttl=15 * 60,
+            result_ttl=24 * 60 * 60,
+            cleanup_interval=15,
+            min_free_bytes=2 * 1024 * 1024 * 1024,
+            max_root_bytes=5 * 1024 * 1024 * 1024,
+            max_job_bytes=1024 * 1024 * 1024,
+            require_password_stdin=True,
+            engine_factory=WebSvnEngine,
+            allow_file_urls=False,
+            export_root=None,
+            export_overwrite=True,
+    ):
+        self.profiles = {profile.profile_id: profile for profile in (profiles or [])}
+        self.temp_root = Path(
+            temp_root or (Path(tempfile.gettempdir()) / "lzr-svn-standard-jobs-v1"))
+        self.allowed_svn_prefixes = tuple(prefix.rstrip("/") for prefix in allowed_svn_prefixes if prefix)
+        self.max_live_jobs = max_live_jobs
+        self.preview_ttl = preview_ttl
+        self.result_ttl = result_ttl
+        self.cleanup_interval = cleanup_interval
+        self.min_free_bytes = min_free_bytes
+        self.max_root_bytes = max_root_bytes
+        self.max_job_bytes = max_job_bytes
+        self.require_password_stdin = require_password_stdin
+        self.engine_factory = engine_factory
+        self.allow_file_urls = allow_file_urls
+        self.export_root = Path(export_root) if export_root else None
+        self.export_overwrite = bool(export_overwrite)
+        self.jobs = {}
+        self._jobs_lock = threading.RLock()
+        self._capacity_lock = threading.Lock()
+        self._capacity_reservations = {}
+        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="lzr-standard")
+        self._work_slots = threading.BoundedSemaphore(max_workers)
+        self._stop_event = threading.Event()
+        self._cleanup_thread = None
+        self._root_lock_handle = None
+        self._source_mount_engine = SyncEngine()
+        self._source_mount_lock = threading.Lock()
+        self._started = False
+        self.temp_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            self.temp_root.chmod(0o700)
+        except OSError:
+            pass
+
+    @classmethod
+    def from_environment(cls, environ=None):
+        """创建启动期实例，并在这里一次性读取来源配置文件。
+
+        ``profiles`` 是进程级缓存；请求处理不会重新读取配置文件，修改文件后
+        必须重启 Web 服务才会生效。
+        """
+        env = os.environ if environ is None else environ
+        source_config = load_source_config(env, allow_default=True)
+        prefixes = (source_config["allowed_svn_prefixes"]
+                    or read_allowed_svn_prefixes(env))
+        workspace = source_config.get("workspace") or {}
+        return cls(
+            source_config["profiles"],
+            allowed_svn_prefixes=prefixes,
+            export_root=workspace.get("export_root", ""),
+            export_overwrite=workspace.get("overwrite", True),
+        )
+
+    def start(self):
+        with self._jobs_lock:
+            if self._started:
+                return
+            self._acquire_root_lock()
+            self._started = True
+        self._cleanup_orphan_directories()
+        self._cleanup_thread = threading.Thread(
+            target=self._cleanup_loop, name="lzr-standard-cleanup", daemon=True)
+        self._cleanup_thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._cleanup_thread and self._cleanup_thread.is_alive():
+            # 根目录锁必须同时覆盖清理线程；清理尚未退出时绝不能让新实例接管。
+            self._cleanup_thread.join()
+        with self._jobs_lock:
+            jobs = list(self.jobs.values())
+        for job in jobs:
+            with job.lock:
+                if job.state in {"queued", "preparing"}:
+                    job.cancel_requested = True
+        try:
+            # 根目录锁必须覆盖仍在运行的 worker。否则 reload/滚动重启时，
+            # 新进程会把旧 worker 正在使用的目录误判为 orphan 并删除。
+            self._executor.shutdown(wait=True, cancel_futures=True)
+            for job in jobs:
+                with job.lock:
+                    self._release_capacity_reservation(job)
+                    self._clear_credentials(job)
+                    self._delete_job_directory(job)
+        finally:
+            with self._source_mount_lock:
+                self._source_mount_engine._cleanup_temp_mounts()
+            self._release_root_lock()
+
+    def _acquire_root_lock(self):
+        lock_path = self.temp_root / ".lzr-standard-manager.lock"
+        handle = open(lock_path, "a+b")
+        try:
+            if os.name == "nt":
+                import msvcrt
+                if handle.tell() == 0:
+                    handle.write(b"0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, ImportError):
+            handle.close()
+            raise RuntimeError("标准文件临时任务目录正被另一个 Web 进程使用") from None
+        self._root_lock_handle = handle
+
+    def _release_root_lock(self):
+        handle = self._root_lock_handle
+        if not handle:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except (OSError, ImportError):
+            pass
+        handle.close()
+        self._root_lock_handle = None
+
+    def public_profiles(self):
+        values = [profile.public_dict() for profile in self.profiles.values()]
+        # allowed_svn_prefixes 只是仓库 URL 前缀（__init__ 已去掉尾部斜杠），
+        # 不含本地路径与凭据：前端据此从升级清单里识别客户 SVN 地址。
+        return {
+            "ok": True,
+            "configured": bool(values),
+            "profiles": values,
+            "allowed_svn_prefixes": list(self.allowed_svn_prefixes),
+        }
+
+    def _cleanup_loop(self):
+        while not self._stop_event.wait(self.cleanup_interval):
+            try:
+                self.cleanup_expired()
+            except Exception as exc:
+                log_event("cleanup_loop_failed", level=logging.ERROR, **exception_fields(exc))
+
+    def _write_marker(self, job_id, job_dir, created_at):
+        marker = job_dir / ".lzr-standard-job.json"
+        marker.write_text(json.dumps({
+            "schema": 1,
+            "job_id": job_id,
+            "created_at": _iso(created_at),
+        }, ensure_ascii=False), encoding="utf-8")
+
+    def _safe_job_directory(self, job_id, job_dir):
+        if not JOB_ID_RE.fullmatch(job_id) or job_dir.name != job_id:
+            return False
+        try:
+            root = self.temp_root.resolve(strict=True)
+            target = job_dir.resolve(strict=True)
+        except OSError:
+            return False
+        if self.temp_root.is_symlink() or job_dir.is_symlink() or target.parent != root:
+            return False
+        if root in {Path(root.anchor), Path.home().resolve()}:
+            return False
+        marker = job_dir / ".lzr-standard-job.json"
+        if not marker.is_file() or marker.is_symlink():
+            return False
+        try:
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        return payload.get("schema") == 1 and payload.get("job_id") == job_id
+
+    def _delete_job_directory(self, job):
+        if job.cleanup_status == "cleaned" and not job.job_dir.exists():
+            return True
+        job.cleanup_attempts += 1
+        started = time.monotonic()
+        job.diagnostic("cleanup_started", attempt=job.cleanup_attempts)
+        if not job.job_dir.exists():
+            job.cleanup_status = "cleaned"
+            job.event("服务器临时文件已清理")
+            job.diagnostic("cleanup_succeeded", attempt=job.cleanup_attempts,
+                           duration_ms=round((time.monotonic() - started) * 1000),
+                           reason="already_absent")
+            return True
+        if not self._safe_job_directory(job.job_id, job.job_dir):
+            job.cleanup_status = "failed"
+            job.diagnostic("cleanup_failed", level=logging.ERROR,
+                           attempt=job.cleanup_attempts, reason="unsafe_job_directory")
+            return False
+        try:
+            _rmtree_force(job.job_dir)
+        except OSError as exc:
+            job.cleanup_status = "failed"
+            job.diagnostic("cleanup_failed", level=logging.ERROR,
+                           attempt=job.cleanup_attempts,
+                           duration_ms=round((time.monotonic() - started) * 1000),
+                           **exception_fields(exc))
+            return False
+        job.cleanup_status = "cleaned"
+        job.event("服务器临时文件已清理")
+        job.diagnostic("cleanup_succeeded", attempt=job.cleanup_attempts,
+                       duration_ms=round((time.monotonic() - started) * 1000))
+        return True
+
+    def _cleanup_orphan_directories(self):
+        with self._jobs_lock:
+            try:
+                children = list(self.temp_root.iterdir())
+            except OSError:
+                return
+            active_ids = set(self.jobs)
+            for child in children:
+                if child.name in active_ids or not child.is_dir() or child.is_symlink():
+                    continue
+                if not JOB_ID_RE.fullmatch(child.name):
+                    continue
+                if self._safe_job_directory(child.name, child):
+                    started = time.monotonic()
+                    log_event("orphan_cleanup_started", job_id=child.name)
+                    try:
+                        _rmtree_force(child)
+                    except OSError as exc:
+                        log_event("orphan_cleanup_failed", level=logging.ERROR,
+                                  job_id=child.name, **exception_fields(exc))
+                    else:
+                        log_event("orphan_cleanup_succeeded", job_id=child.name,
+                                  duration_ms=round((time.monotonic() - started) * 1000))
+
+    def _clear_credentials(self, job):
+        job.password = None
+        job.username = ""
+
+    def _safe_error_message(self, job, value):
+        message = redact_sensitive_text(str(value or ""), (job.password or "",))
+        replacements = {
+            str(job.job_dir): "<临时任务目录>",
+            str(job.wc_dir): "<临时工作副本>",
+            str(job.config_dir): "<任务配置目录>",
+        }
+        profile = self.profiles.get(job.profile_id)
+        if profile:
+            if profile.standard_path:
+                replacements[profile.standard_path] = "<标准文件来源>"
+            if profile.historical_path:
+                replacements[profile.historical_path] = "<历史文件来源>"
+        for original, replacement in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
+            message = message.replace(original, replacement)
+        return message.strip()[:1000] or "任务处理失败"
+
+    def _fail_job(self, job, code, error):
+        with job.lock:
+            job.state = "failed"
+            job.stage_label = "任务失败"
+            job.progress = 100
+            job.can_commit = False
+            job.error = {"code": code, "message": self._safe_error_message(job, error)}
+            job.finished_at = time.time()
+            job.diagnostic("task_failed", level=logging.ERROR, error_code=code,
+                           **exception_fields(error))
+            job.event("任务已停止，临时目录正在清理")
+            self._clear_credentials(job)
+            self._delete_job_directory(job)
+
+    def _check_cancelled(self, job):
+        with job.lock:
+            expired = time.time() > job.expires_at
+            if not job.cancel_requested and not expired:
+                return
+            was_commit_queued = job.state == "commit_queued"
+            job.state = "expired" if expired else "cancelled"
+            if expired and was_commit_queued:
+                job.stage_label = "提交排队超时"
+            else:
+                job.stage_label = "任务已超时" if expired else "已取消"
+            job.progress = 100
+            job.finished_at = time.time()
+            self._clear_credentials(job)
+            self._delete_job_directory(job)
+        raise StandardWebError(
+            "job_expired" if expired else "job_cancelled",
+            ("提交排队超时" if was_commit_queued else "任务准备超时")
+            if expired else "任务已取消",
+            409,
+        )
+
+    def _reserve_estimated_capacity(self, job, estimated_bytes, label):
+        estimated = max(0, int(estimated_bytes or 0))
+        with self._capacity_lock:
+            if self._capacity_reservations.get(job.job_id, 0):
+                raise RuntimeError("临时容量预留状态不一致")
+            job_size = _directory_size(job.job_dir)
+            root_size = _directory_size(self.temp_root)
+            reserved = sum(self._capacity_reservations.values())
+            if estimated > self.max_job_bytes or job_size + estimated > self.max_job_bytes:
+                raise RuntimeError("%s会使临时工作副本超过单任务容量限制" % label)
+            if root_size + reserved + estimated > self.max_root_bytes:
+                raise RuntimeError("%s会使临时任务根目录超过容量限制" % label)
+            try:
+                free_bytes = shutil.disk_usage(self.temp_root).free
+            except OSError as exc:
+                raise RuntimeError("无法检查临时磁盘容量") from exc
+            if reserved + estimated > max(0, free_bytes - self.min_free_bytes):
+                raise RuntimeError("%s超过当前临时磁盘安全余量" % label)
+            self._capacity_reservations[job.job_id] = estimated
+
+    def _release_capacity_reservation(self, job):
+        with self._capacity_lock:
+            self._capacity_reservations.pop(job.job_id, None)
+
+    def _check_actual_capacity(self, job):
+        with self._capacity_lock:
+            self._capacity_reservations.pop(job.job_id, None)
+            reserved = sum(self._capacity_reservations.values())
+            if _directory_size(job.job_dir) > self.max_job_bytes:
+                raise RuntimeError("临时工作副本超过单任务容量限制")
+            if _directory_size(self.temp_root) + reserved > self.max_root_bytes:
+                raise RuntimeError("临时任务根目录超过容量限制")
+            try:
+                free_bytes = shutil.disk_usage(self.temp_root).free
+            except OSError as exc:
+                raise RuntimeError("无法检查临时磁盘容量") from exc
+            if free_bytes - reserved < self.min_free_bytes:
+                raise RuntimeError("临时磁盘剩余空间不足，已停止任务")
+
+    def _prepare_safety_check(self, job, index, phase, remote_size=None):
+        self._check_cancelled(job)
+        if phase == "checkout_before":
+            # depth-empty checkout 之前先独占预留该任务剩余的完整硬上限；远端
+            # 根属性随后还会在真正 checkout 前严格门禁。
+            remaining = max(0, self.max_job_bytes - _directory_size(job.job_dir))
+            self._reserve_estimated_capacity(job, remaining, "临时工作副本元数据")
+        if phase == "checkout_after":
+            self._check_actual_capacity(job)
+        if phase == "remote" and remote_size is not None:
+            # SVN 工作副本通常同时保存工作文件与 pristine，再预留少量元数据。
+            estimate = remote_size * SVN_WC_SIZE_MULTIPLIER + SVN_WC_FILE_OVERHEAD
+            self._reserve_estimated_capacity(job, estimate, "仓库文件")
+        if phase == "after":
+            # 每个文件后都复核，避免小清单绕过容量限制。
+            self._check_actual_capacity(job)
+
+    def _check_source_capacity(self, job, items):
+        source_bytes = 0
+        for item in items:
+            try:
+                source_bytes += os.path.getsize(item.source_file)
+            except (OSError, TypeError) as exc:
+                raise RuntimeError("无法检查标准来源文件大小: %s" % item.rel_path) from exc
+        self._reserve_estimated_capacity(job, source_bytes, "标准来源文件")
+
+    def _check_capacity(self):
+        self.cleanup_expired()
+        with self._jobs_lock:
+            live_count = sum(1 for job in self.jobs.values() if job.state in ACTIVE_STATES)
+        if live_count >= self.max_live_jobs:
+            raise StandardWebError("too_many_jobs", "当前待处理任务较多，请稍后再试", 429)
+        try:
+            disk = shutil.disk_usage(self.temp_root)
+        except OSError as exc:
+            raise StandardWebError("capacity_unavailable", "无法检查临时磁盘容量", 503) from exc
+        if disk.free < self.min_free_bytes or _directory_size(self.temp_root) >= self.max_root_bytes:
+            raise StandardWebError("capacity_exhausted", "临时磁盘空间不足，请稍后再试", 503)
+
+    @staticmethod
+    def _read_smb_credentials(profile):
+        path = Path(profile.smb_credentials_file)
+        if not path.is_file():
+            raise RuntimeError("服务端 SMB 凭据配置不可用")
+        try:
+            payload = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+            raise RuntimeError("服务端 SMB 凭据配置无法读取") from exc
+        # 每个来源读自己的节：标准共享读 [standard]，历史共享读 [history]/[historical]。
+        # 早期只有一个共享时这里写死读 standard，两个来源并存后会串账号。
+        section = None
+        for name in profile.credentials_sections:
+            candidate = payload.get(name)
+            if isinstance(candidate, dict):
+                section = candidate
+                break
+        if section is None:
+            # 仅配了 [standard] 的旧文件仍可用
+            section = payload.get("standard")
+        if not isinstance(section, dict):
+            raise RuntimeError(
+                "服务端 SMB 凭据缺少 %s 配置"
+                % " 或 ".join(profile.credentials_sections))
+        username = str(section.get("username") or "test").strip().strip("`'\" ")
+        password = str(section.get("password") or "").strip().strip("`'\" ")
+        if not username or not password or any(char in username + password for char in "\r\n\x00"):
+            raise RuntimeError("服务端 SMB 凭据配置不完整")
+        return username, password
+
+    def _profile_source_root(self, profile, unc_prefix=""):
+        # 多共享时按命中的共享根取各自挂载点；单共享沿用 standard_path。
+        prefix = unc_prefix or profile.unc_prefix
+        local_root = profile.local_root_for(prefix)
+        if os.name == "nt" and profile.standard_path:
+            # Windows 本地部署：standard_path 就是实际来源根（盘符或 UNC）。
+            # 不再走 macOS mount_smbfs，也不要求先挂载。
+            if os.path.isdir(profile.standard_path):
+                return Path(profile.standard_path).resolve(strict=True)
+            raise RuntimeError("服务端标准文件来源目录不存在或不可访问")
+        if profile.mount_root:
+            # Linux 部署：共享由 systemd 预先挂好，服务不自行挂载；掉线要明确报出来
+            if _mount_ready(local_root):
+                return Path(local_root).resolve(strict=True)
+            raise RuntimeError("服务端共享 %s 当前未挂载或已断开" % prefix)
+        if local_root and os.path.isdir(local_root):
+            return Path(local_root).resolve(strict=True)
+        if os.name == "nt" and _is_unc_path(prefix):
+            # Windows 原生支持 UNC，直接访问；共享不可用时给出明确错误。
+            if os.path.isdir(prefix):
+                return Path(prefix).resolve(strict=True)
+            raise RuntimeError("服务端共享 %s 当前不可访问" % prefix)
+        with self._source_mount_lock:
+            if local_root and os.path.isdir(local_root):
+                return Path(local_root).resolve(strict=True)
+            unc = prefix.replace("/", "\\").lstrip("\\")
+            parts = unc.split("\\")
+            if len(parts) != 2 or not all(parts):
+                raise RuntimeError("服务端固定 SMB 共享根配置不正确")
+            existing = self._source_mount_engine._find_existing_smb_mount(
+                parts[0], parts[1])
+            if existing and os.path.isdir(existing):
+                return Path(existing).resolve(strict=True)
+            username, password = self._read_smb_credentials(profile)
+            self._source_mount_engine.smb_user = username
+            self._source_mount_engine.smb_pass = password
+            try:
+                mounted = self._source_mount_engine._mount_smb_macos(
+                    prefix, readonly=True, no_prompt=True)
+            except Exception as exc:
+                raise RuntimeError("无法连接服务端标准文件共享") from exc
+            finally:
+                self._source_mount_engine.smb_user = ""
+                self._source_mount_engine.smb_pass = ""
+                username = ""
+                password = ""
+            return Path(mounted).resolve(strict=True)
+
+    def _resolve_customer_source_path(self, profile, source_unc_prefix, source_relative):
+        """把「共享根 + 来源后缀」解析成真实的本机标准目录。
+
+        标准文件提交和升级清单 Markdown 落盘共用同一条路径校验，避免两处各写一份
+        可能被绕过的越界判断。
+        """
+        root = self._profile_source_root(profile, source_unc_prefix or "")
+        if source_relative == ".":
+            candidate = root / "ecology" if (root / "ecology").is_dir() else root
+        else:
+            candidate = root.joinpath(*source_relative.split("/"))
+        try:
+            resolved = candidate.resolve(strict=True)
+            inside = os.path.commonpath([str(root), str(resolved)]) == str(root)
+        except (OSError, ValueError):
+            inside = False
+        if not inside or not resolved.is_dir():
+            raise RuntimeError("客户标准文件 ecology 目录不存在或超出固定共享根")
+        return resolved
+
+    def _customer_source_path(self, job, profile):
+        return self._resolve_customer_source_path(
+            profile, getattr(job, "source_unc_prefix", ""), job.source_relative)
+
+    @staticmethod
+    def _safe_markdown_filename(filename):
+        """只接受服务器生成的单个 .md 文件名，杜绝目录穿越与特殊字符。"""
+        text = str(filename or "")
+        if not text or text != os.path.basename(text):
+            return False
+        if text.rstrip(" .") != text or text in {".", ".."}:
+            return False
+        if not re.fullmatch(r'[^<>:"/\\|?*\x00-\x1f]+\.md', text, flags=re.I):
+            return False
+        return len(text.encode("utf-8")) <= 240
+
+    def write_upgrade_markdown(
+            self, *, html, profile_id, customer_standard_path, commit_message="",
+            actor="", request_id=""):
+        r"""把粘贴近来的升级清单转成 Markdown，写入本地导出目录。
+
+        目标目录按客户来源目录去掉 QC 编号段和 ecology 段：
+          <export_root>\分组\客户\upgrade-file-list-ai-<QC号>.md
+        解析与生成完全复用 Web 升级清单服务，不重复实现颜色识别和 Markdown 组装。
+        """
+        profile = self.profiles.get(str(profile_id or "").strip())
+        if not profile:
+            raise StandardWebError("source_profile_not_found", "标准文件来源配置不存在", 404)
+        if not profile.is_standard_share:
+            raise StandardWebError(
+                "standard_source_required",
+                "升级清单 Markdown 只接受标准文件来源配置", 403)
+        if not profile.available:
+            raise StandardWebError("source_profile_unavailable", "标准文件来源当前不可用", 503)
+
+        raw_customer_path = clean_customer_path_text(customer_standard_path)
+        if not raw_customer_path:
+            raise StandardWebError("invalid_customer_path", "请填写客户标准文件 ecology 目录")
+        matched_prefix = profile.match_prefix(raw_customer_path)
+        if not matched_prefix:
+            raise StandardWebError(
+                "customer_path_not_allowed",
+                "客户目录不在该来源允许的共享根内", 403)
+        source_relative = parse_customer_standard_path(
+            raw_customer_path, matched_prefix, require_qc_segment=True)
+
+        if not self.export_root:
+            raise StandardWebError(
+                "export_root_unavailable",
+                "未配置本地导出目录（workspace.export_root），无法生成 Markdown", 503)
+        try:
+            target_dir = self._local_export_target(
+                SimpleNamespace(source_relative=source_relative),
+                include_ecology=False)
+        except Exception as exc:
+            raise StandardWebError(
+                "local_target_unavailable",
+                "无法从客户来源目录推导本地导出路径，请检查共享根与分组层级", 503) from exc
+
+        # 解析与 Markdown 生成复用 Web 升级清单服务，错误统一转成标准文件错误。
+        try:
+            extracted = extract_upgrade_list(html)
+            generated = generate_upgrade_markdown(extracted["list_text"], "md")
+        except UpgradeWebError as exc:
+            raise StandardWebError(exc.code, exc.message, exc.status_code) from None
+
+        qc_number = extract_qc_number(commit_message)
+        if not qc_number:
+            raise StandardWebError(
+                "invalid_qc_number",
+                "提交说明中未找到有效的 QC 号，请使用例如 no.5081286 或 QC5081286 的格式",
+                422)
+        filename = "upgrade-file-list-ai-%s.md" % qc_number
+        if not self._safe_markdown_filename(filename):
+            raise StandardWebError(
+                "invalid_result_filename", "生成的 Markdown 文件名不合法")
+        payload = str(generated.get("content", "")).encode("utf-8")
+        target = target_dir / filename
+        if os.path.islink(target):
+            raise StandardWebError(
+                "target_not_writable", "目标 Markdown 文件不可写入，请联系维护者", 409)
+
+        temp_path = target_dir / (".lzr-upgrade-%s.tmp" % secrets.token_hex(8))
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            descriptor = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, target)
+        except OSError as exc:
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except OSError:
+                pass
+            denied = isinstance(exc, PermissionError) or getattr(exc, "errno", None) in (
+                errno.EACCES, errno.EPERM, errno.EROFS)
+            log_event("upgrade_markdown_write_failed", level=logging.WARNING,
+                      actor=actor, request_id=request_id,
+                      error_code="local_write_denied" if denied else "write_failed",
+                      **exception_fields(exc))
+            if denied:
+                raise StandardWebError(
+                    "local_write_denied",
+                    "本地导出目录没有写权限：当前 Windows 账号无法写入该目录。"
+                    "请检查目录权限后重试。", 503) from exc
+            raise StandardWebError(
+                "write_failed", "写入本地导出目录失败，请检查磁盘空间和目录权限后重试", 503) from exc
+
+        stats = generated.get("stats") or {}
+        unique_files = stats.get("unique_files")
+        if unique_files is None:
+            unique_files = stats.get("file_entries", 0)
+        log_event("upgrade_markdown_written", actor=actor, request_id=request_id,
+                  file_count=unique_files, status=200)
+        return {
+            "ok": True,
+            "written": True,
+            "filename": filename,
+            "customer": generated.get("customer", ""),
+            "bytes": len(payload),
+            "stats": stats,
+            "warnings": list(generated.get("warnings", [])),
+        }
+
+    @staticmethod
+    def _safe_source_file(source_root, relative):
+        root = Path(source_root).resolve(strict=True)
+        candidate = root.joinpath(*relative.split("/"))
+        try:
+            resolved = candidate.resolve(strict=True)
+            return (resolved.is_file() and not candidate.is_symlink()
+                    and os.path.commonpath([str(root), str(resolved)]) == str(root))
+        except (OSError, ValueError):
+            return False
+
+    def create_job(
+            self, *, svn_url, username, password, profile_id, file_list, commit_message,
+            customer_standard_path="", cover_all_confirmed=False, actor="", request_id=""):
+        if self.require_password_stdin and not supports_password_from_stdin():
+            raise StandardWebError(
+                "svn_password_stdin_unsupported",
+                "当前 SVN CLI 不支持安全的 stdin 密码输入，已拒绝创建任务",
+                503,
+            )
+        profile = self.profiles.get(str(profile_id or "").strip())
+        if not profile:
+            raise StandardWebError("source_profile_not_found", "标准文件来源配置不存在", 404)
+        if not profile.available:
+            raise StandardWebError("source_profile_unavailable", "标准文件来源当前不可用", 503)
+        clean_url = normalize_svn_url(
+            svn_url, self.allowed_svn_prefixes, allow_file_urls=self.allow_file_urls,
+            error_type=StandardWebError)
+        clean_username = str(username or "").strip()
+        clean_password = str(password or "")
+        if (not clean_username or len(clean_username) > 256 or "\n" in clean_username
+                or "\r" in clean_username or "\x00" in clean_username):
+            raise StandardWebError("invalid_username", "请填写有效的 SVN 账号")
+        if (not clean_password or len(clean_password) > 1024 or "\n" in clean_password
+                or "\r" in clean_password or "\x00" in clean_password):
+            raise StandardWebError("invalid_password", "请填写有效的 SVN 密码")
+        message = str(commit_message or "").strip()
+        if (not message or len(message) > MAX_COMMIT_MESSAGE
+                or any(ord(char) < 32 for char in message)):
+            raise StandardWebError("invalid_commit_message", "提交说明不能为空且最多 500 个字符")
+        raw_customer_path = clean_customer_path_text(customer_standard_path)
+        if raw_customer_path:
+            # 白名单只判「主机+共享」，不内置客户落在哪台的映射；
+            # 客户与主机的对应由调用方按 customer-env-info.md 填写完整路径。
+            matched_prefix = profile.match_prefix(raw_customer_path)
+            if not matched_prefix:
+                raise StandardWebError(
+                    "customer_path_not_allowed",
+                    "客户目录不在该来源允许的共享根内", 403)
+            source_relative = parse_customer_standard_path(
+                raw_customer_path, matched_prefix,
+                require_qc_segment=profile.is_standard_share)
+        else:
+            matched_prefix = profile.unc_prefix
+            source_relative = "."
+        if profile.mount_root and not (os.name == "nt" and profile.standard_path):
+            # 建任务时就拒绝，而不是等后台检出后再以「目录不存在」失败。
+            # Windows 直接使用 standard_path / UNC，不要求预先挂载。
+            if not _mount_ready(profile.local_root_for(matched_prefix)):
+                raise StandardWebError(
+                    "source_share_unmounted",
+                    "服务端共享 %s 当前未挂载或已断开，请稍后再试；持续出现请联系维护者"
+                    % matched_prefix, 503)
+        relative_paths = parse_web_file_list(file_list)
+        selection_mode = "listed" if relative_paths else "intersection"
+        if selection_mode == "intersection" and not profile.allows_cover_all:
+            raise StandardWebError(
+                "file_list_required",
+                "该来源必须提供文件清单；只有标准文件共享支持清单留空覆盖全部交集")
+        if selection_mode == "intersection" and cover_all_confirmed is not True:
+            raise StandardWebError(
+                "cover_all_confirmation_required",
+                "文件清单为空时必须确认只覆盖 SVN 与标准目录同时存在的全部文件")
+        self._check_capacity()
+
+        job_id = uuid.uuid4().hex
+        access_token = secrets.token_urlsafe(32)
+        created_at = time.time()
+        job_dir = self.temp_root / job_id
+        job = StandardJob(
+            job_id=job_id,
+            access_token_hash=_token_hash(access_token),
+            created_at=created_at,
+            expires_at=created_at + self.preview_ttl,
+            svn_url=clean_url,
+            username=clean_username,
+            password=clean_password,
+            profile_id=profile.profile_id,
+            source_relative=source_relative,
+            source_unc_prefix=matched_prefix,
+            selection_mode=selection_mode,
+            relative_paths=relative_paths,
+            commit_message=message,
+            job_dir=job_dir,
+            wc_dir=job_dir / "wc",
+            config_dir=job_dir / "svn-config",
+            actor=actor or clean_username,
+            request_id=request_id,
+        )
+        with self._jobs_lock:
+            live_count = sum(1 for current in self.jobs.values()
+                             if current.state in ACTIVE_STATES)
+            if live_count >= self.max_live_jobs:
+                self._clear_credentials(job)
+                raise StandardWebError(
+                    "too_many_jobs", "当前待处理任务较多，请稍后再试", 429)
+            # 目录创建、marker 写入与任务登记必须在同一把锁内完成，避免
+            # 定时 orphan 清理误删尚未登记的新任务目录。
+            try:
+                job_dir.mkdir(mode=0o700)
+                try:
+                    job_dir.chmod(0o700)
+                except OSError:
+                    pass
+                self._write_marker(job_id, job_dir, created_at)
+                self.jobs[job_id] = job
+            except Exception:
+                self._clear_credentials(job)
+                try:
+                    job_dir.rmdir()
+                except OSError:
+                    pass
+                raise
+        job.event("任务已创建，等待临时检出")
+        try:
+            self._executor.submit(self._prepare_job, job_id)
+        except RuntimeError:
+            with self._jobs_lock:
+                self.jobs.pop(job_id, None)
+            self._clear_credentials(job)
+            self._delete_job_directory(job)
+            raise StandardWebError(
+                "job_queue_unavailable", "任务队列当前不可用，请稍后再试", 503) from None
+        return {
+            "ok": True,
+            "task": {
+                "id": job_id,
+                "access_token": access_token,
+                "status": "queued",
+                "expires_at": _iso(job.expires_at),
+            },
+        }
+
+    def _new_engine(self, job):
+        if not job.password or not job.username:
+            raise StandardWebError("credentials_expired", "任务凭据已过期，请重新创建预览", 409)
+        return self.engine_factory(job.username, job.password, job.config_dir)
+
+    @staticmethod
+    def _repository_identity(engine, wc_dir):
+        rc, output = engine._run_svn_bytes(
+            "info", "--xml", ".", cwd=wc_dir, force_utf8=True, timeout=60)
+        if rc != 0:
+            raise RuntimeError("无法读取 SVN 仓库信息: " + output.strip())
+        try:
+            root = ET.fromstring(output)
+            return (
+                (root.findtext(".//repository/uuid") or "").strip(),
+                (root.findtext(".//repository/root") or "").strip(),
+            )
+        except ET.ParseError as exc:
+            raise RuntimeError("SVN 仓库信息格式不正确") from exc
+
+    @staticmethod
+    def _read_node_properties(engine, wc_dir, relative):
+        rc, output = engine._run_svn_bytes(
+            "proplist", "--xml", relative + "@",
+            cwd=wc_dir, force_utf8=True, timeout=60)
+        if rc != 0:
+            raise RuntimeError("读取 SVN 属性失败: " + output.strip())
+        try:
+            root = ET.fromstring(output)
+        except ET.ParseError as exc:
+            raise RuntimeError("SVN 属性格式不正确") from exc
+        return {
+            node.get("name", ""): "present"
+            for node in root.findall(".//property")
+            if node.get("name")
+        }
+
+    @staticmethod
+    def _read_status_entries(engine, wc_dir):
+        rc, output = engine._run_svn_bytes(
+            "status", "--xml", ".", cwd=wc_dir, force_utf8=True, timeout=60)
+        if rc != 0:
+            raise RuntimeError("读取 SVN 状态失败: " + output.strip())
+        root_path = Path(wc_dir).resolve()
+        entries = []
+        try:
+            nodes = ET.fromstring(output).findall(".//entry")
+        except ET.ParseError as exc:
+            raise RuntimeError("SVN 状态格式不正确") from exc
+        for node in nodes:
+            status = node.find("wc-status")
+            if status is None:
+                continue
+            item = status.get("item", "")
+            props = status.get("props", "none")
+            if item in {"", "normal", "none", "external"} and props in {"", "none", "normal"}:
+                continue
+            raw_path = node.get("path", "")
+            candidate = Path(raw_path)
+            if not candidate.is_absolute():
+                candidate = root_path / candidate
+            candidate = candidate.resolve(strict=False)
+            try:
+                relative = candidate.relative_to(root_path).as_posix()
+            except ValueError as exc:
+                raise RuntimeError("SVN 状态包含工作副本外路径") from exc
+            if relative in {"", "."}:
+                continue
+            properties = {}
+            if props not in {"", "none", "normal"}:
+                properties = StandardJobManager._read_node_properties(
+                    engine, wc_dir, relative)
+            entries.append({
+                "path": relative,
+                "item": item,
+                "props": props,
+                "kind": "directory" if candidate.is_dir() else "file",
+                "properties": properties,
+            })
+        return sorted(entries, key=lambda entry: (entry["path"].count("/"), entry["path"]))
+
+    @staticmethod
+    def _allowed_status_paths(relative_paths):
+        allowed = set(relative_paths)
+        for relative in relative_paths:
+            parts = PurePosixPath(relative).parts
+            for index in range(1, len(parts)):
+                allowed.add("/".join(parts[:index]))
+        return allowed
+
+    def _validate_status(self, job, entries):
+        allowed = self._allowed_status_paths(job.relative_paths)
+        unsafe = []
+        for entry in entries:
+            if entry["path"] not in allowed:
+                unsafe.append(entry["path"])
+                continue
+            if entry["item"] not in {"modified", "replaced"}:
+                unsafe.append(entry["path"])
+                continue
+            if entry["props"] not in {"", "none", "normal"}:
+                unsafe.append(entry["path"])
+        if unsafe:
+            raise RuntimeError("检测到预期清单之外或不安全的 SVN 变更: " + ", ".join(unsafe[:8]))
+        changed_files = {entry["path"] for entry in entries if entry["kind"] == "file"}
+        expected_changed = {
+            item["path"] for item in job.preview_items if item["result"] == "已覆盖"
+        }
+        if changed_files != expected_changed:
+            missing = sorted(expected_changed - changed_files)
+            extra = sorted(changed_files - expected_changed)
+            details = []
+            if missing:
+                details.append("缺少 " + ", ".join(missing[:5]))
+            if extra:
+                details.append("多出 " + ", ".join(extra[:5]))
+            raise RuntimeError("SVN 变更与覆盖预览不一致: " + "；".join(details))
+
+    def _fingerprint(self, job, entries):
+        files = []
+        for item in job.preview_items:
+            if item["result"] != "已覆盖":
+                continue
+            target = job.wc_dir.joinpath(*item["path"].split("/"))
+            files.append((item["path"], _path_hash(target)))
+        payload = {
+            "job_id": job.job_id,
+            "repo_uuid": job.repo_uuid,
+            "repo_root": job.repo_root,
+            "revision": job.checkout_revision,
+            "message": job.commit_message,
+            "status": entries,
+            "files": files,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            .encode("utf-8")).hexdigest()
+
+    def _set_no_changes(self, job):
+        with job.lock:
+            self._check_cancelled(job)
+            job.state = "no_changes"
+            job.stage_label = "无需提交"
+            job.progress = 100
+            job.can_commit = False
+            job.preview_summary = {
+                "requested": len(job.relative_paths),
+                "changed": 0,
+                "unchanged": len(job.relative_paths),
+                "missing": 0,
+            }
+            job.finished_at = time.time()
+            job.event("标准文件与仓库内容一致，无需创建新版本")
+            self._clear_credentials(job)
+            self._delete_job_directory(job)
+
+    def _prepare_job(self, job_id):
+        job = self.jobs.get(job_id)
+        if not job:
+            return
+        engine = None
+        with self._work_slots:
+            try:
+                with job.lock:
+                    job.state = "preparing"
+                    job.stage_label = "正在临时检出"
+                    job.progress = 12
+                    job.event("正在创建独立稀疏工作副本")
+                self._check_cancelled(job)
+                engine = self._new_engine(job)
+                profile = self.profiles[job.profile_id]
+                source_root = self._customer_source_path(job, profile)
+                self._sync_local_checkout(job, engine)
+                revision = None
+                if job.selection_mode == "intersection":
+                    revision = get_repository_head_revision(engine, job.svn_url)
+                    job.checkout_revision = revision
+                    with job.lock:
+                        job.stage_label = "正在计算交集文件"
+                        job.progress = 18
+                        job.event("清单为空，正在计算最新 SVN 与标准目录的文件交集")
+                    repository_files = set(list_repository_files(
+                        engine, job.svn_url, revision, MAX_REPOSITORY_FILES))
+                    # 标准目录可能包含数万甚至更多文件。无需遍历整个来源树；
+                    # 只检查当前 SVN 最新版本中的候选文件是否在标准目录存在，
+                    # 既保持交集语义，也避免目录规模本身触发无意义的上限。
+                    selected = sorted(
+                        relative for relative in repository_files
+                        if self._safe_source_file(source_root, relative)
+                    )
+                    job.relative_paths = selected
+                    job.event("已识别 %d 个两端同时存在的文件" % len(selected))
+                if not job.relative_paths:
+                    self._set_no_changes(job)
+                    return
+                sparse_options = {
+                    "safety_check": lambda index, phase, remote_size: self._prepare_safety_check(
+                        job, index, phase, remote_size),
+                }
+                if revision is not None:
+                    sparse_options["revision"] = revision
+                checkout = prepare_sparse_working_copy(
+                    engine, job.svn_url, str(job.wc_dir), job.relative_paths,
+                    **sparse_options)
+                job.checkout_revision = checkout.revision
+                job.repo_uuid, job.repo_root = self._repository_identity(engine, job.wc_dir)
+                if _directory_size(job.job_dir) > self.max_job_bytes:
+                    raise RuntimeError("临时工作副本超过单任务容量限制")
+                self._check_cancelled(job)
+
+                with job.lock:
+                    job.stage_label = "正在匹配标准文件"
+                    job.progress = 38
+                    job.event("临时检出完成，开始匹配服务端标准来源")
+                service = StandardFileService(engine)
+                remote_missing = set(checkout.missing_paths)
+                source_missing = {
+                    relative for relative in job.relative_paths
+                    if not self._safe_source_file(source_root, relative)
+                }
+                missing_paths = remote_missing | source_missing
+                valid_paths = [path for path in job.relative_paths if path not in missing_paths]
+                if valid_paths:
+                    items, parsed_count, _details = service.scan(
+                        valid_paths,
+                        job.svn_url,
+                        str(job.wc_dir),
+                        "upgrade",
+                        str(source_root),
+                        "",
+                        allow_existing=True,
+                    )
+                else:
+                    items, parsed_count = [], 0
+                if parsed_count != len(valid_paths):
+                    raise RuntimeError("部分文件路径无法解析")
+                job.preview_items = [{
+                    "path": item.rel_path,
+                    "source": "客户标准文件",
+                    "result": item.status,
+                    "detail": item.detail,
+                } for item in items]
+                for relative in sorted(missing_paths):
+                    if relative in remote_missing and relative in source_missing:
+                        detail = "SVN 与客户标准目录中均不存在"
+                    elif relative in remote_missing:
+                        detail = "该文件在当前 SVN 最新版本中不存在"
+                    else:
+                        detail = "该文件在客户标准目录中不存在"
+                    job.preview_items.append({
+                        "path": relative,
+                        "source": "未匹配",
+                        "result": "不处理",
+                        "detail": detail,
+                    })
+                missing = sorted(missing_paths)
+                ready = [item for item in items if item.status == "待覆盖"]
+                unchanged = [item for item in items if item.status == "内容相同"]
+                self._check_cancelled(job)
+                if missing:
+                    job.blocking_issues.append(
+                        "%d 个清单文件并非 SVN 与客户标准目录同时存在，已阻止整个任务" % len(missing))
+                    with job.lock:
+                        self._check_cancelled(job)
+                        job.state = "preview_ready"
+                        job.stage_label = "预览存在阻塞项"
+                        job.progress = 70
+                        job.can_commit = False
+                        job.preview_summary = {
+                            "requested": len(job.relative_paths), "changed": 0,
+                            "unchanged": len(unchanged), "missing": len(missing),
+                        }
+                        job.expires_at = time.time() + self.preview_ttl
+                        job.event("预览已生成；仅允许两端同时存在的文件，任务未执行覆盖")
+                        self._clear_credentials(job)
+                        self._delete_job_directory(job)
+                        job.event("阻塞预览无需保留工作副本，临时目录已清理")
+                    return
+                if not ready:
+                    self._set_no_changes(job)
+                    return
+
+                with job.lock:
+                    job.stage_label = "正在覆盖并生成预览"
+                    job.progress = 58
+                    job.event("标准文件已匹配，正在写入临时工作副本")
+                self._check_source_capacity(job, ready)
+                try:
+                    self._check_cancelled(job)
+                    covered, errors = service.cover(ready)
+                    if errors or len(covered) != len(ready):
+                        raise RuntimeError("标准文件覆盖未全部成功，已阻止提交")
+                except Exception:
+                    self._release_capacity_reservation(job)
+                    raise
+                self._check_actual_capacity(job)
+                self._check_cancelled(job)
+                for preview in job.preview_items:
+                    if preview["path"] in {item.rel_path for item in covered}:
+                        preview["result"] = "已覆盖"
+
+                ok, output, _status = service.prepare_commit(str(job.wc_dir), covered)
+                if not ok:
+                    if output == "目标目录没有可提交的 SVN 变更" and not missing:
+                        self._set_no_changes(job)
+                        return
+                    raise RuntimeError(output)
+                self._check_cancelled(job)
+                status_entries = self._read_status_entries(engine, job.wc_dir)
+                self._validate_status(job, status_entries)
+                fingerprint = self._fingerprint(job, status_entries)
+                confirmation_token = secrets.token_urlsafe(32)
+                job.status_entries = status_entries
+                job.commit_targets = [entry["path"] for entry in status_entries]
+                job.preview_fingerprint = fingerprint
+                job.confirmation_token = confirmation_token
+                job.confirmation_token_hash = (
+                    _token_hash(confirmation_token))
+                job.preview_summary = {
+                    "requested": len(items),
+                    "changed": len(covered),
+                    "unchanged": len(unchanged),
+                    "missing": len(missing),
+                }
+                self._check_cancelled(job)
+                with job.lock:
+                    self._check_cancelled(job)
+                    job.state = "preview_ready"
+                    job.stage_label = "提交预览已就绪"
+                    job.progress = 72
+                    job.can_commit = True
+                    job.expires_at = time.time() + self.preview_ttl
+                    job.event("提交预览已生成，等待用户确认")
+                if _directory_size(job.job_dir) > self.max_job_bytes:
+                    raise RuntimeError("临时工作副本超过单任务容量限制")
+            except StandardWebError as exc:
+                if exc.code not in {"job_cancelled", "job_expired"}:
+                    self._fail_job(job, exc.code, exc.message)
+            except Exception as exc:
+                self._fail_job(job, "prepare_failed", exc)
+            finally:
+                self._release_capacity_reservation(job)
+                if engine:
+                    engine.release_credentials()
+
+    def _authorized_job(self, job_id, access_token):
+        if not JOB_ID_RE.fullmatch(str(job_id or "")):
+            raise StandardWebError("job_not_found", "任务不存在或已过期", 404)
+        with self._jobs_lock:
+            job = self.jobs.get(job_id)
+        if not job or not secrets.compare_digest(
+                job.access_token_hash, _token_hash(access_token)):
+            raise StandardWebError("job_not_found", "任务不存在或已过期", 404)
+        return job
+
+    def snapshot(self, job_id, access_token):
+        job = self._authorized_job(job_id, access_token)
+        with job.lock:
+            if job.state == "preview_ready" and time.time() > job.expires_at:
+                self._expire_job(job)
+            task = {
+                "id": job.job_id,
+                "status": job.state,
+                "stage_label": job.stage_label,
+                "progress": job.progress,
+                "can_commit": job.can_commit,
+                "created_at": _iso(job.created_at),
+                "expires_at": _iso(job.expires_at),
+                "svn_url": job.svn_url,
+                "commit_message": job.commit_message,
+                "checkout_revision": job.checkout_revision,
+                "selection_mode": job.selection_mode,
+                "preview": None,
+                "result": None,
+                "error": job.error,
+                "cleanup": {"status": job.cleanup_status},
+                "events": list(job.events),
+            }
+            if job.state in {"preview_ready", "commit_queued", "committing"}:
+                task["preview"] = {
+                    "confirmation_token": job.confirmation_token if job.state == "preview_ready" else "",
+                    "summary": dict(job.preview_summary),
+                    "items": list(job.preview_items[:MAX_PREVIEW_ITEMS]),
+                    "items_total": len(job.preview_items),
+                    "items_truncated": len(job.preview_items) > MAX_PREVIEW_ITEMS,
+                    "blocking_issues": list(job.blocking_issues),
+                }
+            if job.state in {"committed", "no_changes", "commit_unknown"}:
+                task["result"] = {
+                    "revision": job.revision,
+                    "urls": list(job.committed_urls),
+                    "paths": list(job.committed_paths),
+                    "no_changes": job.state == "no_changes",
+                    "uncertain": job.state == "commit_unknown",
+                }
+            return {"ok": True, "task": task}
+
+    def request_commit(self, job_id, access_token, confirmation_token, idempotency_key):
+        job = self._authorized_job(job_id, access_token)
+        key = str(idempotency_key or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,100}", key):
+            raise StandardWebError("invalid_idempotency_key", "提交幂等键格式不正确")
+        with job.lock:
+            if job.commit_idempotency_key:
+                if secrets.compare_digest(job.commit_idempotency_key, key):
+                    return self.snapshot(job_id, access_token)
+                raise StandardWebError("commit_already_requested", "该任务已经发起过提交", 409)
+            if job.state != "preview_ready" or not job.can_commit:
+                raise StandardWebError("job_not_ready", "任务当前不能提交", 409)
+            if time.time() > job.expires_at:
+                self._expire_job(job)
+                raise StandardWebError("preview_expired", "提交预览已过期，请重新创建任务", 409)
+            if not job.confirmation_token_hash or not secrets.compare_digest(
+                    job.confirmation_token_hash, _token_hash(confirmation_token)):
+                raise StandardWebError("invalid_confirmation", "提交确认令牌不正确", 403)
+            job.commit_idempotency_key = key
+            job.confirmation_token_hash = ""
+            job.confirmation_token = ""
+            job.state = "commit_queued"
+            job.stage_label = "等待 SVN 提交"
+            job.progress = 78
+            job.can_commit = False
+            # 用户在有效预览内确认后，从此刻起获得完整的一段提交排队时间，
+            # 不沿用可能只剩几秒的预览到期时间。
+            job.expires_at = time.time() + self.preview_ttl
+            job.event("用户已确认预览，提交请求已进入队列")
+        try:
+            self._executor.submit(self._commit_job, job_id)
+        except RuntimeError:
+            self._fail_job(job, "job_queue_unavailable", "提交队列当前不可用，请重新创建任务")
+            raise StandardWebError(
+                "job_queue_unavailable", "提交队列当前不可用，请重新创建任务", 503) from None
+        return self.snapshot(job_id, access_token)
+
+    @staticmethod
+    def _local_export_parts(job):
+        r"""按客户来源目录推导本地导出相对路径。
+
+        客户来源目录固定为 共享根\J\客户\QC编号\ecology，本地按约定去掉 QC 编号段：
+          \\192.168.7.215\ECOLOGY_customer\J\J江苏美思德\QC5081286\ecology
+          -> <export_root>\J\J江苏美思德\ecology
+        无法安全推导时返回空列表。
+        """
+        relative_parts = [
+            part for part in str(job.source_relative or "").split("/")
+            if part and part not in {".", ".."}
+        ]
+        if not relative_parts:
+            return []
+        qc_index = None
+        if (len(relative_parts) >= 3
+                and re.fullmatch(r"QC\d+", relative_parts[-2], flags=re.I)):
+            qc_index = len(relative_parts) - 2
+        export_parts = [
+            part for index, part in enumerate(relative_parts) if index != qc_index
+        ]
+        if not export_parts or any(
+                not re.fullmatch(r'[^<>":/\\|?*\x00-\x1f]+', part)
+                for part in export_parts):
+            return []
+        return export_parts
+
+    def _local_export_target(self, job, *, include_ecology=True):
+        """返回本地导出目录，并保证不会越出 export_root。
+
+        Markdown 文件按约定放在 ``分组\客户`` 下，因此调用方传
+        ``include_ecology=False``；SVN 文件导出仍保留 ``ecology`` 段。
+        """
+        if not self.export_root:
+            raise RuntimeError("未配置本地导出根目录")
+        parts = self._local_export_parts(job)
+        if not include_ecology and parts and parts[-1].lower() == "ecology":
+            parts = parts[:-1]
+        if not parts:
+            raise RuntimeError("无法从客户来源目录推导本地导出路径")
+        root = self.export_root.resolve()
+        target = root.joinpath(*parts)
+        try:
+            resolved = target.resolve()
+            inside = os.path.commonpath([str(root), str(resolved)]) == str(root)
+        except (OSError, ValueError):
+            inside = False
+        if not inside:
+            raise RuntimeError("本地导出路径超出配置根目录")
+        return target
+
+    def _sync_local_checkout(self, job, engine):
+        """把本次客户 SVN 目录检出或更新到本地导出目录。
+
+        本地尚未拉取时执行 checkout，已有工作副本时执行 update；
+        不论本次是否需要提交 SVN，都保证本地目录存在且与远程一致。
+        本步骤失败不中断标准文件对比预览，只记录诊断供人工处理；失败信息
+        只保留 SVN 输出，不经由任务错误体暴露服务端路径。
+        """
+        if not self.export_root:
+            return False
+        try:
+            target = Path(self._local_export_target(job))
+        except Exception as exc:
+            job.diagnostic("local_sync_skipped", level=logging.WARNING,
+                           **exception_fields(exc))
+            job.event("本地同步已跳过：无法从客户来源目录推导本地导出路径")
+            return False
+        action = "更新" if (target / ".svn").exists() else "拉取"
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with job.lock:
+                job.stage_label = "正在同步本地 SVN 目录"
+                job.event("正在%s本地目录 %s" % (action, target))
+            if action == "更新":
+                rc, output = engine._run_svn_bytes(
+                    "update", "--ignore-externals", str(target),
+                    force_utf8=True, timeout=600)
+            else:
+                # 目标目录可能已有历史导出的同名文件；--force 让其纳入本地工作副本，
+                # 由 SVN 决定是否需要更新，避免因目录非空而拉取失败。
+                rc, output = engine._run_svn_bytes(
+                    "checkout", "--force", "--ignore-externals",
+                    job.svn_url, str(target), force_utf8=True, timeout=600)
+        except Exception as exc:
+            job.diagnostic("local_sync_failed", level=logging.ERROR,
+                           target=str(target), **exception_fields(exc))
+            job.event("本地%s失败，不影响 SVN 预览与提交" % action)
+            return False
+        if rc != 0:
+            job.diagnostic("local_sync_failed", level=logging.ERROR, target=str(target),
+                           message=(output or "").strip())
+            job.event("本地%s失败，不影响 SVN 预览与提交" % action)
+            return False
+        job.event("本地目录%s完成：%s" % (action, target))
+        return True
+
+    def _export_committed_files(self, job):
+        """把本次已提交的文件复制到本地导出目录。
+
+        只复制提交清单里真实存在的普通文件；导出失败不回滚 SVN 提交，
+        避免把“提交成功、本地复制失败”误报为提交失败。
+        """
+        if not self.export_root:
+            return
+        export_parts = self._local_export_parts(job) or [job.job_id]
+        target_root = self.export_root.joinpath(*export_parts)
+        try:
+            source_root = Path(job.wc_dir).resolve(strict=True)
+        except OSError as exc:
+            job.diagnostic("export_failed", level=logging.ERROR,
+                           reason="work_copy_missing", **exception_fields(exc))
+            job.event("本地导出失败：临时工作副本已不存在")
+            return
+        exported = 0
+        skipped = 0
+        for relative in job.commit_targets:
+            clean = str(relative or "").replace("\\", "/").strip("/")
+            parts = [part for part in clean.split("/") if part]
+            if not parts or any(part in {".", ".."} for part in parts):
+                skipped += 1
+                continue
+            source = source_root.joinpath(*parts)
+            try:
+                resolved_source = source.resolve(strict=True)
+            except OSError:
+                skipped += 1
+                continue
+            try:
+                inside = os.path.commonpath(
+                    [str(source_root), str(resolved_source)]) == str(source_root)
+            except ValueError:
+                inside = False
+            if not resolved_source.is_file() or not inside:
+                skipped += 1
+                continue
+            target = target_root.joinpath(*parts)
+            try:
+                if target.exists() and not self.export_overwrite:
+                    skipped += 1
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(resolved_source, target)
+            except OSError as exc:
+                skipped += 1
+                job.diagnostic("export_failed", level=logging.ERROR,
+                               path=clean, **exception_fields(exc))
+                continue
+            exported += 1
+        job.event("已导出 %d 个文件到 %s（跳过 %d 个）"
+                  % (exported, target_root, skipped))
+
+    def _commit_job(self, job_id):
+        job = self.jobs.get(job_id)
+        if not job:
+            return
+        engine = None
+        commit_started = False
+        with self._work_slots:
+            try:
+                self._check_cancelled(job)
+                engine = self._new_engine(job)
+                with job.lock:
+                    job.state = "committing"
+                    job.stage_label = "正在复核并提交 SVN"
+                    job.progress = 86
+                    job.event("正在复核工作副本，预览发生变化将自动阻止提交")
+                current_status = self._read_status_entries(engine, job.wc_dir)
+                self._validate_status(job, current_status)
+                if not secrets.compare_digest(
+                        job.preview_fingerprint, self._fingerprint(job, current_status)):
+                    raise StandardWebError(
+                        "preview_stale", "提交预览已发生变化，已阻止提交", 409)
+                service = StandardFileService(engine)
+                if hasattr(engine, "reset_commit_tracking"):
+                    engine.reset_commit_tracking()
+                ok, output, revision, urls, paths = service.commit_selected_paths(
+                    str(job.wc_dir), job.commit_targets, job.commit_message)
+                commit_started = bool(getattr(engine, "commit_process_started", False))
+                if not ok:
+                    self._fail_job(job, "commit_failed", output or "SVN 提交失败")
+                    return
+                with job.lock:
+                    job.state = "committed"
+                    job.stage_label = "SVN 提交成功"
+                    job.progress = 100
+                    job.revision = revision
+                    job.committed_urls = urls
+                    job.committed_paths = paths
+                    job.finished_at = time.time()
+                    job.event("SVN 提交成功")
+                    self._clear_credentials(job)
+                try:
+                    self._sync_local_checkout(job, engine)
+                    self._export_committed_files(job)
+                except Exception as exc:
+                    job.diagnostic("export_failed", level=logging.ERROR,
+                                   **exception_fields(exc))
+                    job.event("本地导出失败；SVN 提交已成功，请手动核对本地目录")
+                with job.lock:
+                    job.event("临时工作副本正在清理")
+                    self._delete_job_directory(job)
+            except TimeoutError as exc:
+                commit_started = commit_started or bool(
+                    getattr(engine, "commit_process_started", False))
+                with job.lock:
+                    job.state = "commit_unknown" if commit_started else "failed"
+                    job.stage_label = "提交结果待人工核验" if commit_started else "任务失败"
+                    job.progress = 100
+                    job.error = {
+                        "code": "commit_unknown" if commit_started else "commit_timeout",
+                        "message": "SVN 提交已启动但返回超时，请勿重复提交；请按本次提交说明在仓库日志中核验。"
+                        if commit_started else self._safe_error_message(job, exc),
+                    }
+                    job.finished_at = time.time()
+                    job.diagnostic("commit_uncertain" if commit_started else "commit_timeout",
+                                   level=logging.ERROR, **exception_fields(exc))
+                    job.event("提交结果无法确认，系统不会自动重试")
+                    self._clear_credentials(job)
+            except StandardWebError as exc:
+                if exc.code not in {"job_cancelled", "job_expired"}:
+                    self._fail_job(job, exc.code, exc.message)
+            except Exception as exc:
+                commit_started = commit_started or bool(
+                    getattr(engine, "commit_process_started", False))
+                if commit_started:
+                    with job.lock:
+                        job.state = "commit_unknown"
+                        job.stage_label = "提交结果待人工核验"
+                        job.progress = 100
+                        job.error = {
+                            "code": "commit_unknown",
+                            "message": "SVN 提交已启动但结果无法确认，请勿重复提交；请在仓库日志中核验本次提交说明。",
+                        }
+                        job.finished_at = time.time()
+                        job.diagnostic("commit_uncertain", level=logging.ERROR,
+                                       **exception_fields(exc))
+                        job.event("提交结果无法确认，系统不会自动重试")
+                        self._clear_credentials(job)
+                else:
+                    self._fail_job(job, "commit_failed", exc)
+            finally:
+                if engine:
+                    engine.release_credentials()
+
+    def _expire_job(self, job):
+        if job.state != "preview_ready":
+            return
+        job.state = "expired"
+        job.stage_label = "预览已过期"
+        job.progress = 100
+        job.can_commit = False
+        job.finished_at = time.time()
+        job.event("预览等待超时，临时目录已清理")
+        self._clear_credentials(job)
+        self._delete_job_directory(job)
+
+    def cancel(self, job_id, access_token):
+        job = self._authorized_job(job_id, access_token)
+        with job.lock:
+            if job.state in {"commit_queued", "committing", "committed", "commit_unknown"}:
+                raise StandardWebError("job_busy", "任务已进入提交阶段，不能取消", 409)
+            if job.state in {"cancelled", "expired", "failed", "no_changes"}:
+                return self.snapshot(job_id, access_token)
+            if job.state == "queued":
+                job.cancel_requested = True
+                job.state = "cancelled"
+                job.stage_label = "已取消"
+                job.progress = 100
+                job.finished_at = time.time()
+                job.event("排队任务已取消，临时目录已清理")
+                self._clear_credentials(job)
+                self._delete_job_directory(job)
+            elif job.state == "preparing":
+                job.cancel_requested = True
+                job.stage_label = "正在取消"
+                job.event("已收到取消请求，将在当前安全步骤结束后清理")
+            else:
+                job.state = "cancelled"
+                job.stage_label = "已取消"
+                job.progress = 100
+                job.can_commit = False
+                job.finished_at = time.time()
+                job.event("任务已取消，临时目录已清理")
+                self._clear_credentials(job)
+                self._delete_job_directory(job)
+        return self.snapshot(job_id, access_token)
+
+    def cleanup_expired(self):
+        now = time.time()
+        remove_ids = []
+        with self._jobs_lock:
+            jobs = list(self.jobs.values())
+        for job in jobs:
+            acquired = job.lock.acquire(blocking=False)
+            if not acquired:
+                continue
+            try:
+                if job.state == "preview_ready" and now > job.expires_at:
+                    self._expire_job(job)
+                if job.state in {"queued", "preparing"} and now > job.expires_at:
+                    job.cancel_requested = True
+                    job.event("任务准备超时，将在当前安全步骤结束后清理")
+                if job.state == "commit_queued" and now > job.expires_at:
+                    job.cancel_requested = True
+                    job.event("提交排队超时，将在获得执行槽后停止并清理")
+                if job.state == "commit_unknown" and job.finished_at and now - job.finished_at > 3600:
+                    self._delete_job_directory(job)
+                if (job.state in TERMINAL_STATES and job.state != "commit_unknown"
+                        and job.cleanup_status == "failed"):
+                    self._delete_job_directory(job)
+                if (job.state in TERMINAL_STATES and job.finished_at
+                        and now - job.finished_at > self.result_ttl):
+                    self._delete_job_directory(job)
+                    remove_ids.append(job.job_id)
+            finally:
+                job.lock.release()
+        if remove_ids:
+            with self._jobs_lock:
+                for job_id in remove_ids:
+                    self.jobs.pop(job_id, None)
+        self._cleanup_orphan_directories()

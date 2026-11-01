@@ -1,0 +1,1819 @@
+# -*- coding: utf-8 -*-
+
+import json
+import os
+import shutil
+import stat
+import subprocess
+import tempfile
+import threading
+import time
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from unittest import mock
+
+import web_standard_service
+from svn_standard_file_core import iter_standard_file_lines, parse_file_input
+from web_standard_service import (
+    DEFAULT_HISTORICAL_UNC_PREFIX,
+    DEFAULT_HISTORICAL_UNC_PREFIXES,
+    DEFAULT_STANDARD_UNC_PREFIX,
+    SourceProfile,
+    StandardJob,
+    extract_qc_number,
+    StandardJobManager,
+    StandardWebError,
+    WebSvnEngine,
+    load_source_config,
+    load_source_profiles,
+    parse_customer_standard_path,
+    parse_web_file_list,
+)
+from svn_sync_workflow import SparseCheckoutResult, prepare_sparse_working_copy
+
+
+def wait_for_job(manager, job_id, access_token, terminal_states, timeout=20):
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        last = manager.snapshot(job_id, access_token)["task"]
+        if last["status"] in terminal_states:
+            return last
+        time.sleep(0.05)
+    raise AssertionError("任务未在限定时间内完成: %r" % (last,))
+
+
+class StandardWebParsingTest(unittest.TestCase):
+    def test_extract_qc_number_uses_explicit_qc_or_no_marker(self):
+        self.assertEqual(
+            extract_qc_number(
+                "no.5081286 E9.00补丁：KB900220905升至KB900260901"),
+            "5081286",
+        )
+        self.assertEqual(extract_qc_number("QC5081286 标准文件"), "5081286")
+        self.assertEqual(extract_qc_number("No: 5081286 标准文件"), "5081286")
+        self.assertEqual(extract_qc_number("QC号：5081286 标准文件"), "5081286")
+        self.assertEqual(extract_qc_number("KB900220905 仅包含知识库编号"), "")
+
+    def test_source_profile_discovers_credentials_from_e9_paths_registry(self):
+        with tempfile.TemporaryDirectory() as root:
+            secrets_root = Path(root, "secrets")
+            secrets_root.mkdir()
+            credentials = secrets_root / "e9-smb-credentials.toml"
+            credentials.write_text("[standard]\n", encoding="utf-8")
+            config = Path(root, "e9-paths.json")
+            config.write_text(json.dumps({"secrets.root": str(secrets_root)}), encoding="utf-8")
+            profiles = load_source_profiles(
+                {"E9_PATHS_FILE": str(config)}, allow_default=False)
+            # 现在会同时产出标准共享与历史文件共享两个来源
+            by_id = {profile.profile_id: profile for profile in profiles}
+            self.assertEqual(set(by_id), {"default", "historical"})
+            for profile in profiles:
+                self.assertEqual(
+                    profile.smb_credentials_file, os.path.realpath(credentials))
+                self.assertTrue(profile.available)
+            self.assertTrue(by_id["default"].allows_cover_all)
+            self.assertFalse(by_id["historical"].allows_cover_all)
+            self.assertIn("192.168.7.108", by_id["historical"].unc_prefix)
+
+    def test_default_source_config_path_is_project_conf_file(self):
+        expected = (
+            Path(web_standard_service.__file__).resolve().parent
+            / "conf" / "web-sources.toml"
+        )
+        self.assertEqual(
+            web_standard_service._default_source_config_path().resolve(),
+            expected.resolve(),
+        )
+
+    def test_source_config_file_loads_profiles_and_svn_whitelist(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root, "标准文件")
+            source.mkdir()
+            config_path = Path(root, "web-sources.toml")
+            config_path.write_text(
+                "[server]\n"
+                "allowed_svn_prefixes = [\"https://svn.example.com/svn/\"]\n"
+                "[[profiles]]\n"
+                'id = "default"\n'
+                'label = "E9 标准文件共享"\n'
+                'role = "standard"\n'
+                "standard_path = %s\n"
+                "unc_prefix = %s\n"
+                % (json.dumps(str(source), ensure_ascii=False),
+                   json.dumps(DEFAULT_STANDARD_UNC_PREFIX)),
+                encoding="utf-8",
+            )
+            loaded = load_source_config(
+                {"SVN_SYNC_WEB_SOURCE_CONFIG": str(config_path)})
+            self.assertEqual(loaded["config_path"], str(config_path.resolve()))
+            self.assertEqual(
+                loaded["allowed_svn_prefixes"],
+                ("https://svn.example.com/svn/",))
+            self.assertEqual([profile.profile_id for profile in loaded["profiles"]], ["default"])
+            profile = loaded["profiles"][0]
+            self.assertEqual(profile.label, "E9 标准文件共享")
+            self.assertEqual(profile.standard_path, os.path.realpath(source))
+            self.assertTrue(profile.allows_cover_all)
+
+    def test_source_config_default_path_is_loaded_at_startup(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root, "默认标准文件")
+            source.mkdir()
+            config_path = Path(root, "web-sources.toml")
+            config_path.write_text(
+                "[server]\n"
+                "[[profiles]]\n"
+                'id = "default"\n'
+                'label = "默认路径来源"\n'
+                'role = "standard"\n'
+                "standard_path = %s\n"
+                "unc_prefix = %s\n"
+                % (json.dumps(str(source), ensure_ascii=False),
+                   json.dumps(DEFAULT_STANDARD_UNC_PREFIX)),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                    mock.patch.object(
+                        web_standard_service,
+                        "_default_source_config_path",
+                        return_value=config_path):
+                manager = StandardJobManager.from_environment()
+            self.assertEqual(manager.profiles["default"].label, "默认路径来源")
+            self.assertEqual(
+                manager.profiles["default"].standard_path,
+                os.path.realpath(source),
+            )
+
+    def test_source_config_file_errors_are_reported(self):
+        with tempfile.TemporaryDirectory() as root:
+            missing = Path(root, "missing.toml")
+            with self.assertRaisesRegex(ValueError, "不存在"):
+                load_source_profiles(config_path=missing)
+            invalid = Path(root, "invalid.toml")
+            invalid.write_text("[[profiles]\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "无法读取"):
+                load_source_profiles(config_path=invalid)
+
+    def test_source_config_is_cached_until_restart(self):
+        with tempfile.TemporaryDirectory() as root:
+            config_path = Path(root, "web-sources.toml")
+            source = Path(root, "标准文件")
+            source.mkdir()
+            config_path.write_text(
+                "[server]\n"
+                "[[profiles]]\n"
+                'id = "default"\n'
+                'label = "启动时名称"\n'
+                'role = "standard"\n'
+                "standard_path = %s\n"
+                "unc_prefix = %s\n"
+                % (json.dumps(str(source), ensure_ascii=False),
+                   json.dumps(DEFAULT_STANDARD_UNC_PREFIX)),
+                encoding="utf-8",
+            )
+            manager = StandardJobManager.from_environment(
+                {"SVN_SYNC_WEB_SOURCE_CONFIG": str(config_path)})
+            self.assertEqual(manager.profiles["default"].label, "启动时名称")
+            config_path.write_text(
+                "[server]\n"
+                "[[profiles]]\n"
+                'id = "default"\n'
+                'label = "修改后名称"\n'
+                'role = "standard"\n'
+                "standard_path = %s\n"
+                "unc_prefix = %s\n"
+                % (json.dumps(str(source), ensure_ascii=False),
+                   json.dumps(DEFAULT_STANDARD_UNC_PREFIX)),
+                encoding="utf-8",
+            )
+            self.assertEqual(manager.profiles["default"].label, "启动时名称")
+            reloaded = load_source_profiles(config_path=config_path)
+            self.assertEqual(reloaded[0].label, "修改后名称")
+
+    def test_profile_loading_survives_a_shallow_install_path(self):
+        """部署到 /opt/<服务名> 这类浅路径时不能因父级不足而崩在导入阶段。"""
+        import web_standard_service as module
+        with tempfile.TemporaryDirectory() as shallow:
+            fake = Path(shallow, "svn-sync-tool")
+            fake.mkdir()
+            with mock.patch.object(module, "__file__", str(fake / "web_standard_service.py")):
+                # 不显式配置任何凭据来源，强制走目录推导的兜底分支
+                self.assertEqual(
+                    module._discover_smb_credentials_file({}, allow_workspace_default=True), "")
+
+    def test_repository_relative_path_maps_checkout_root_and_keeps_spaces(self):
+        root = "https://svn.example.com/svn/Y示例客户/ecology"
+        relative, local = parse_file_input(
+            "$/Y示例客户/ecology/sql/for Oracle/demo.sql(V12) - 说明", root)
+        self.assertEqual(relative, "sql/for Oracle/demo.sql")
+        self.assertIsNone(local)
+        encoded, _local = parse_file_input(
+            "https://svn.example.com/svn/Y%E7%A4%BA%E4%BE%8B%E5%AE%A2%E6%88%B7/ecology/"
+            "sql/for%20Oracle/%E6%BC%94%E7%A4%BA.sql(V12)",
+            root,
+        )
+        self.assertEqual(encoded, "sql/for Oracle/演示.sql")
+
+    def test_color_marker_on_separate_line_skips_black_file(self):
+        lines = list(iter_standard_file_lines([
+            "QC123456 示例任务",
+            "[red]",
+            "src/Keep.java(V1)",
+            "[black]",
+            "src/Skip.java(V1)",
+            "src/Untagged.java(V1)",
+        ]))
+        self.assertEqual(lines, ["src/Keep.java(V1)", "src/Untagged.java(V1)"])
+
+    def test_web_parser_only_accepts_ecology_relative_files_and_blank_means_all(self):
+        parsed = parse_web_file_list(
+            "src/A.java\nWEB-INF/prop/demo file.properties\nsrc\\B.java")
+        self.assertEqual(parsed, [
+            "src/A.java", "WEB-INF/prop/demo file.properties", "src/B.java"])
+        self.assertEqual(parse_web_file_list("\n  \n"), [])
+        with self.assertRaisesRegex(StandardWebError, "绝对路径"):
+            parse_web_file_list("/tmp/ecology/src/A.java")
+        for unsupported in (
+                "[red]\nsrc/A.java",
+                "$/customer/ecology/src/A.java(V1)",
+                "https://svn.example.com/svn/customer/ecology/src/A.java",
+                "ecology/src/A.java",
+                "../src/A.java"):
+            with self.subTest(unsupported=unsupported):
+                with self.assertRaises(StandardWebError):
+                    parse_web_file_list(unsupported)
+
+    def test_customer_standard_path_is_limited_to_fixed_share_and_qc_ecology(self):
+        prefix = r"\\192.168.7.215\ECOLOGY_customer"
+        value = prefix + r"\Y\Y示例客户\QC123456\ecology"
+        self.assertEqual(
+            parse_customer_standard_path(value, prefix),
+            "Y/Y示例客户/QC123456/ecology",
+        )
+        for invalid in (
+                r"\\192.168.7.216\ECOLOGY_customer\Y\客户\QC1\ecology",
+                prefix + r"\Y\客户\..\ecology",
+                prefix + r"\Y\客户\QC1\other",
+                prefix + r"\Y\客户\QC1\ecology\src"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(StandardWebError):
+                    parse_customer_standard_path(invalid, prefix)
+
+
+class HistoricalShareRulesTest(unittest.TestCase):
+    """历史文件共享（\\192.168.7.108）与标准共享（\\192.168.7.215）的差异。"""
+
+    def _profile(self, prefix):
+        return SourceProfile("p", "来源", standard_path="", unc_prefix=prefix)
+
+    def test_only_the_standard_share_may_cover_all(self):
+        self.assertTrue(self._profile(DEFAULT_STANDARD_UNC_PREFIX).allows_cover_all)
+        self.assertFalse(self._profile(DEFAULT_HISTORICAL_UNC_PREFIX).allows_cover_all)
+        # 任何其他共享同样不允许
+        self.assertFalse(self._profile(r"\\192.168.7.9\ECOLOGY_customer").allows_cover_all)
+
+    def test_prefix_comparison_ignores_case_slash_and_trailing_separator(self):
+        for variant in (r"\\192.168.7.215\ecology_customer",
+                        "//192.168.7.215/ECOLOGY_customer",
+                        r"\\192.168.7.215\ECOLOGY_customer" + "\\"):
+            with self.subTest(variant=variant):
+                self.assertTrue(self._profile(variant).allows_cover_all)
+
+    def test_historical_path_accepts_named_third_segment(self):
+        value = DEFAULT_HISTORICAL_UNC_PREFIX + r"\Z\Z中电投资\历史文件\ecology"
+        self.assertEqual(
+            parse_customer_standard_path(
+                value, DEFAULT_HISTORICAL_UNC_PREFIX, require_qc_segment=False),
+            "Z/Z中电投资/历史文件/ecology")
+
+    def test_standard_share_still_requires_a_qc_segment(self):
+        value = DEFAULT_STANDARD_UNC_PREFIX + r"\Z\Z中电投资\历史文件\ecology"
+        with self.assertRaisesRegex(StandardWebError, "QC 编号"):
+            parse_customer_standard_path(
+                value, DEFAULT_STANDARD_UNC_PREFIX, require_qc_segment=True)
+
+    def test_historical_path_still_rejects_traversal_and_wrong_shape(self):
+        prefix = DEFAULT_HISTORICAL_UNC_PREFIX
+        for invalid in (
+                prefix + r"\Z\客户\..\ecology",
+                prefix + r"\Z\客户\历史文件\other",
+                prefix + r"\Z\客户\历史文件\ecology\src",
+                prefix + r"\Z\客户\ecology",
+                r"\\192.168.7.215\ECOLOGY_customer\Z\客户\历史文件\ecology"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(StandardWebError):
+                    parse_customer_standard_path(invalid, prefix, require_qc_segment=False)
+
+    def test_each_share_reads_its_own_credentials_section(self):
+        """两个共享账号可能不同，不能都去读 [standard]。"""
+        with tempfile.TemporaryDirectory() as root:
+            creds = Path(root, "smb.toml")
+            creds.write_text(
+                '[standard]\nusername = "std-user"\npassword = "std-pass"\n'
+                '[history]\nusername = "hist-user"\npassword = "hist-pass"\n',
+                encoding="utf-8")
+            standard = SourceProfile(
+                "default", "标准", unc_prefix=DEFAULT_STANDARD_UNC_PREFIX,
+                smb_credentials_file=str(creds))
+            historical = SourceProfile(
+                "historical", "历史", unc_prefix=DEFAULT_HISTORICAL_UNC_PREFIX,
+                smb_credentials_file=str(creds))
+            self.assertEqual(standard.credentials_sections, ("standard",))
+            self.assertEqual(historical.credentials_sections, ("history", "historical"))
+            read = StandardJobManager._read_smb_credentials
+            self.assertEqual(read(standard), ("std-user", "std-pass"))
+            self.assertEqual(read(historical), ("hist-user", "hist-pass"))
+
+    def test_missing_section_falls_back_to_standard(self):
+        """只配了 [standard] 的旧文件仍然可用。"""
+        with tempfile.TemporaryDirectory() as root:
+            creds = Path(root, "smb.toml")
+            creds.write_text(
+                '[standard]\nusername = "only"\npassword = "one"\n', encoding="utf-8")
+            historical = SourceProfile(
+                "historical", "历史", unc_prefix=DEFAULT_HISTORICAL_UNC_PREFIX,
+                smb_credentials_file=str(creds))
+            self.assertEqual(
+                StandardJobManager._read_smb_credentials(historical), ("only", "one"))
+
+    def test_history_role_covers_the_supported_hosts(self):
+        """客户落在哪台主机不可推断，白名单内的共享都要放行。"""
+        profile = SourceProfile(
+            "historical", "历史", unc_prefix=DEFAULT_HISTORICAL_UNC_PREFIXES[0],
+            extra_unc_prefixes=DEFAULT_HISTORICAL_UNC_PREFIXES[1:],
+            mount_root="/mnt/ecology")
+        self.assertEqual(len(profile.unc_prefixes), 3)
+        hosts = {p.strip("\\").split("\\")[0] for p in profile.unc_prefixes}
+        self.assertEqual(hosts, {"192.168.7.108", "192.168.7.173"})
+
+    def test_match_prefix_accepts_each_known_share_and_rejects_others(self):
+        profile = SourceProfile(
+            "historical", "历史", unc_prefix=DEFAULT_HISTORICAL_UNC_PREFIXES[0],
+            extra_unc_prefixes=DEFAULT_HISTORICAL_UNC_PREFIXES[1:],
+            mount_root="/mnt/ecology")
+        cases = [
+            (r"\\192.168.7.108\ECOLOGY_customer\Z\Z中电投资\历史文件\ecology", True),
+            (r"\\192.168.7.173\ecology-customer\Z\客户\历史文件\ecology", True),
+            (r"\\192.168.7.173\ecology-customer2\Z\客户\历史文件\ecology", True),
+            # 106 暂不支持，必须被拒
+            (r"\\192.168.7.106\客户升级记录s上海\ECOLOGY_customer\S上海某客户\历史文件\ecology", False),
+            (r"\\192.168.7.99\ECOLOGY_customer\Z\客户\历史文件\ecology", False),
+            (r"\\192.168.7.215\ECOLOGY_customer\Z\客户\QC1\ecology", False),
+        ]
+        for value, allowed in cases:
+            with self.subTest(value=value):
+                self.assertEqual(bool(profile.match_prefix(value)), allowed)
+
+    def test_local_root_follows_the_mount_layout(self):
+        """挂载脚本按 <root>/<主机>/<共享> 落盘，服务必须用同一规则反查。"""
+        profile = SourceProfile(
+            "historical", "历史", unc_prefix=DEFAULT_HISTORICAL_UNC_PREFIXES[0],
+            extra_unc_prefixes=DEFAULT_HISTORICAL_UNC_PREFIXES[1:],
+            mount_root="/mnt/ecology")
+        matched = profile.match_prefix(
+            r"\\192.168.7.173\ecology-customer2\Z\客户\历史文件\ecology")
+        self.assertEqual(
+            profile.local_root_for(matched),
+            "/mnt/ecology/192.168.7.173/ecology-customer2")
+
+    def test_dropped_mount_is_reported_instead_of_missing_customer_directory(self):
+        """CIFS 掉线后挂载点还在但是空的：必须报「共享未挂载」，且不阻塞其他共享。"""
+        from web_standard_service import _mount_ready
+        with tempfile.TemporaryDirectory() as root:
+            ready = Path(root, "192.168.7.108", "ECOLOGY_customer")
+            ready.mkdir(parents=True)
+            (ready / "Z").mkdir()
+            dropped = Path(root, "192.168.7.173", "ecology-customer")
+            dropped.mkdir(parents=True)
+            self.assertTrue(_mount_ready(str(ready)))
+            self.assertFalse(_mount_ready(str(dropped)))
+            self.assertFalse(_mount_ready(str(Path(root, "192.168.7.173", "ecology-customer2"))))
+
+            profile = SourceProfile(
+                "historical", "历史", unc_prefix=DEFAULT_HISTORICAL_UNC_PREFIXES[0],
+                extra_unc_prefixes=DEFAULT_HISTORICAL_UNC_PREFIXES[1:],
+                mount_root=root)
+            self.assertTrue(profile.available, "只要有一个共享在线，来源就可用")
+            manager = StandardJobManager(
+                profiles=[profile], temp_root=Path(root, "jobs"),
+                allow_file_urls=True, require_password_stdin=False)
+            try:
+                with self.assertRaises(StandardWebError) as caught:
+                    manager.create_job(
+                        svn_url="file:///tmp/repo", username="u", password="p",
+                        profile_id="historical", file_list="a.java", commit_message="m",
+                        customer_standard_path=r"\\192.168.7.173\ecology-customer\Z\客户\历史文件\ecology")
+                self.assertEqual(caught.exception.code, "source_share_unmounted")
+                self.assertEqual(caught.exception.status_code, 503)
+                with self.assertRaises(RuntimeError) as runtime:
+                    manager._profile_source_root(profile, DEFAULT_HISTORICAL_UNC_PREFIXES[1])
+                self.assertIn("未挂载", str(runtime.exception))
+                self.assertEqual(
+                    manager._profile_source_root(profile, DEFAULT_HISTORICAL_UNC_PREFIXES[0]),
+                    ready.resolve())
+            finally:
+                manager.stop()
+
+    def test_pasted_task_description_decorations_are_stripped(self):
+        """任务描述原文可直接粘贴：首尾说明词与空行、空格自动去掉，路径本身不动。"""
+        from web_standard_service import clean_customer_path_text
+        path = r"\\192.168.7.215\ECOLOGY_customer\J\J江苏金陵科技集团有限公司新疆\QC5017093\ecology"
+        raw = "\n  标准文件请到" + path + "下面提取  \n\n"
+        self.assertEqual(clean_customer_path_text(raw), path)
+        self.assertEqual(clean_customer_path_text("标准文件请到 " + path + " 下面提取"), path)
+        self.assertEqual(clean_customer_path_text(path), path, "干净输入原样保留")
+        self.assertEqual(
+            parse_customer_standard_path(clean_customer_path_text(raw), DEFAULT_STANDARD_UNC_PREFIX),
+            "J/J江苏金陵科技集团有限公司新疆/QC5017093/ecology")
+
+    def test_four_segment_shape_holds_across_all_history_hosts(self):
+        """三台的层级都是四段以 ecology 结尾，校验规则可以统一。"""
+        for prefix, suffix in (
+                (r"\\192.168.7.108\ECOLOGY_customer", r"\Z\Z中电投资\历史文件\ecology"),
+                (r"\\192.168.7.173\ecology-customer", r"\Z\客户\历史文件\ecology"),
+                (r"\\192.168.7.173\ecology-customer2", r"\Z\客户\历史文件\ecology")):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(
+                    len(parse_customer_standard_path(
+                        prefix + suffix, prefix, require_qc_segment=False).split("/")),
+                    4)
+
+    def test_public_dict_exposes_the_cover_all_policy(self):
+        standard = self._profile(DEFAULT_STANDARD_UNC_PREFIX).public_dict()
+        historical = self._profile(DEFAULT_HISTORICAL_UNC_PREFIX).public_dict()
+        self.assertTrue(standard["allows_cover_all"])
+        self.assertFalse(historical["allows_cover_all"])
+        self.assertIn("QC编号", standard["path_hint"])
+        self.assertNotIn("QC编号", historical["path_hint"])
+
+
+class WindowsSourcePathTest(unittest.TestCase):
+    """Windows 部署下来源根支持盘符与 UNC 路径。"""
+
+    def test_unc_path_requires_server_and_share(self):
+        is_unc = web_standard_service._is_unc_path
+        self.assertTrue(is_unc(r"\\server\share"))
+        self.assertTrue(is_unc(r"\\server\share\QC1\ecology"))
+        self.assertTrue(is_unc("\\\\server\\share/QC1"))
+        self.assertFalse(is_unc(r"\\server"))
+        self.assertFalse(is_unc(r"\\server\\"))
+        self.assertFalse(is_unc(r"D:\ecology"))
+        self.assertFalse(is_unc("/mnt/ecology"))
+
+    def test_windows_absolute_path_accepts_drive_and_unc(self):
+        abspath = web_standard_service._is_windows_absolute_path
+        self.assertTrue(abspath(r"D:\ecology"))
+        self.assertTrue(abspath("c:/ecology"))
+        self.assertTrue(abspath(r"\\srv\share\x"))
+        self.assertFalse(abspath("ecology"))
+        self.assertFalse(abspath("/mnt/ecology"))
+
+    def test_join_path_root_keeps_root_style_separators(self):
+        join = web_standard_service._join_path_root
+        self.assertEqual(join(r"D:\mnt", "host", "share"), r"D:\mnt\host\share")
+        self.assertEqual(join(r"\\srv\share", "host"), r"\\srv\share\host")
+        self.assertEqual(join("/mnt", "host", "share"), "/mnt/host/share")
+
+    @unittest.skipUnless(os.name == "nt", "Windows 才直接使用盘符/UNC 来源根")
+    def test_windows_profile_matches_configured_standard_path(self):
+        with tempfile.TemporaryDirectory() as root:
+            profile = SourceProfile("default", "Windows 来源", standard_path=root)
+            self.assertEqual(profile.match_prefix(root), root)
+            nested = os.path.join(root, "QC123456", "ecology")
+            self.assertEqual(profile.match_prefix(nested), root)
+
+    @unittest.skipUnless(os.name == "nt", "Windows 才需要清除目录中的只读属性")
+    def test_force_rmtree_removes_readonly_working_copy_files(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = Path(root, "job", ".svn", "pristine")
+            target.mkdir(parents=True)
+            readonly = target / "demo.svn-base"
+            readonly.write_text("content", encoding="utf-8")
+            os.chmod(readonly, stat.S_IREAD)
+
+            web_standard_service._rmtree_force(Path(root, "job"))
+
+            self.assertFalse(Path(root, "job").exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows 才直接使用盘符/UNC 来源根")
+    def test_windows_profile_source_root_uses_standard_path_without_mount(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as base:
+            profile = SourceProfile("default", "Windows 来源", standard_path=root)
+            manager = StandardJobManager(
+                profiles=[profile], temp_root=base, min_free_bytes=0,
+                require_password_stdin=False)
+            mount = mock.Mock(return_value="X:/should-not-be-used")
+            manager._source_mount_engine._mount_smb_macos = mount
+            try:
+                self.assertEqual(
+                    manager._profile_source_root(profile), Path(root).resolve())
+                self.assertEqual(mount.call_count, 0)
+            finally:
+                manager.stop()
+
+
+class WebSvnCredentialIsolationTest(unittest.TestCase):
+    def test_password_uses_stdin_and_never_enters_argv_or_config_files(self):
+        with tempfile.TemporaryDirectory() as root:
+            engine = WebSvnEngine("demo-user", "secret-value", root)
+            command = engine._build_svn_cmd("status", ".")
+            self.assertNotIn("secret-value", command)
+            self.assertIn("--password-from-stdin", command)
+            self.assertIn("--no-auth-cache", command)
+            self.assertEqual(command[command.index("--config-dir") + 1], root)
+            self.assertEqual(engine._svn_password_input(), b"secret-value")
+            for filename in ("config", "servers"):
+                self.assertNotIn(
+                    "secret-value", Path(root, filename).read_text(encoding="utf-8"))
+
+
+class StandardJobSafetyTest(unittest.TestCase):
+    def make_manager(self, root, source):
+        return StandardJobManager(
+            profiles=[SourceProfile("default", "测试来源", standard_path=source)],
+            temp_root=root,
+            min_free_bytes=0,
+            max_root_bytes=1024 * 1024 * 1024,
+            require_password_stdin=False,
+        )
+
+    def test_public_profiles_expose_allowed_svn_prefixes(self):
+        """前端要按白名单从升级清单里识别客户 SVN 地址；只下发 URL 前缀，
+        不带任何本地路径或凭据。"""
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as source:
+            Path(source, "ecology").mkdir()
+            manager = StandardJobManager(
+                profiles=[SourceProfile("default", "测试来源", standard_path=source)],
+                temp_root=root, min_free_bytes=0,
+                max_root_bytes=1024 * 1024 * 1024, require_password_stdin=False,
+                allowed_svn_prefixes=("https://10.1.3.13/svn/", "http://10.1.3.12:80/svn/"))
+            try:
+                payload = manager.public_profiles()
+                self.assertEqual(
+                    payload["allowed_svn_prefixes"],
+                    ["https://10.1.3.13/svn", "http://10.1.3.12:80/svn"])
+                self.assertNotIn("standard_path", json.dumps(payload, ensure_ascii=False))
+            finally:
+                manager.stop()
+
+    def test_empty_list_requires_explicit_intersection_confirmation(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as source:
+            Path(source, "ecology").mkdir()
+            manager = self.make_manager(root, source)
+            try:
+                with self.assertRaisesRegex(StandardWebError, "必须确认"):
+                    manager.create_job(
+                        svn_url="https://svn.example.com/svn/customer/ecology",
+                        username="user",
+                        password="password",
+                        profile_id="default",
+                        file_list="",
+                        cover_all_confirmed=False,
+                        commit_message="QC123456 标准文件",
+                    )
+                self.assertFalse(manager.jobs)
+            finally:
+                manager.stop()
+
+    def test_historical_share_rejects_empty_file_list_end_to_end(self):
+        """非标准共享即便勾了确认，也不能靠空清单覆盖全部交集。"""
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as source:
+            Path(source, "ecology").mkdir()
+            manager = StandardJobManager(
+                profiles=[SourceProfile(
+                    "historical", "历史文件共享", standard_path=source,
+                    unc_prefix=DEFAULT_HISTORICAL_UNC_PREFIX)],
+                temp_root=root, min_free_bytes=0,
+                max_root_bytes=1024 * 1024 * 1024, require_password_stdin=False)
+            try:
+                with self.assertRaises(StandardWebError) as caught:
+                    manager.create_job(
+                        svn_url="https://svn.example.com/svn/customer/ecology",
+                        username="user", password="password",
+                        profile_id="historical",
+                        customer_standard_path=(
+                            DEFAULT_HISTORICAL_UNC_PREFIX
+                            + r"\Z\Z中电投资\历史文件\ecology"),
+                        file_list="",
+                        cover_all_confirmed=True,   # 勾了也不放行
+                        commit_message="QC123456 历史文件",
+                    )
+                self.assertEqual(caught.exception.code, "file_list_required")
+                self.assertFalse(manager.jobs)
+            finally:
+                manager.stop()
+
+    def test_customer_source_suffix_maps_under_configured_share_root(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as source:
+            target = Path(source, "Y", "Y示例客户", "QC123456", "ecology")
+            target.mkdir(parents=True)
+            profile = SourceProfile("default", "测试来源", standard_path=source)
+            manager = StandardJobManager(
+                profiles=[profile], temp_root=root, min_free_bytes=0,
+                require_password_stdin=False)
+            try:
+                job = mock.Mock(source_relative="Y/Y示例客户/QC123456/ecology")
+                self.assertEqual(manager._customer_source_path(job, profile), target.resolve())
+            finally:
+                manager.stop()
+
+    def test_smb_profile_mount_is_read_only_noninteractive_and_clears_credentials(self):
+        if os.name == "nt":
+            self.skipTest("Windows 原生访问 UNC，不经过 macOS mount_smbfs 通道")
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as mounted:
+            profile = SourceProfile(
+                "default", "测试共享", standard_path="",
+                smb_credentials_file="/private/not-read-in-test.toml")
+            manager = StandardJobManager(
+                profiles=[profile], temp_root=root, min_free_bytes=0,
+                require_password_stdin=False)
+            manager._source_mount_engine._find_existing_smb_mount = mock.Mock(
+                return_value=None)
+            manager._source_mount_engine._mount_smb_macos = mock.Mock(
+                return_value=mounted)
+            try:
+                with mock.patch.object(
+                        manager, "_read_smb_credentials",
+                        return_value=("fixed-user", "fixed-password")):
+                    self.assertEqual(
+                        manager._profile_source_root(profile), Path(mounted).resolve())
+                manager._source_mount_engine._mount_smb_macos.assert_called_once_with(
+                    profile.unc_prefix, readonly=True, no_prompt=True)
+                self.assertEqual(manager._source_mount_engine.smb_user, "")
+                self.assertEqual(manager._source_mount_engine.smb_pass, "")
+            finally:
+                manager.stop()
+
+    def test_job_marker_and_public_snapshot_do_not_persist_credentials_or_paths(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as source:
+            Path(source, "ecology", "src").mkdir(parents=True)
+            Path(source, "ecology", "src", "A.java").write_text("x", encoding="utf-8")
+            manager = self.make_manager(root, source)
+            try:
+                manager._executor.submit = mock.Mock()
+                result = manager.create_job(
+                    svn_url="https://svn.example.com/svn/customer/ecology",
+                    username="private-user",
+                    password="private-password",
+                    profile_id="default",
+                    file_list="src/A.java",
+                    commit_message="QC123456 标准文件",
+                )
+                task_id = result["task"]["id"]
+                token = result["task"]["access_token"]
+                marker = Path(root, task_id, ".lzr-standard-job.json").read_text(encoding="utf-8")
+                self.assertNotIn("private-user", marker)
+                self.assertNotIn("private-password", marker)
+                self.assertNotIn(source, marker)
+                snapshot = json.dumps(manager.snapshot(task_id, token), ensure_ascii=False)
+                self.assertNotIn("private-user", snapshot)
+                self.assertNotIn("private-password", snapshot)
+                self.assertNotIn(source, snapshot)
+                # 提交说明原样保留，不再追加内部标记
+                self.assertIn("QC123456 标准文件", snapshot)
+                self.assertNotIn("LZR-WEB", snapshot)
+                profiles = json.dumps(manager.public_profiles(), ensure_ascii=False)
+                self.assertNotIn(source, profiles)
+            finally:
+                job = next(iter(manager.jobs.values()), None)
+                if job:
+                    manager._delete_job_directory(job)
+                manager.stop()
+
+    def test_large_preview_keeps_full_job_state_but_caps_browser_rows(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as source:
+            Path(source, "ecology").mkdir()
+            manager = self.make_manager(root, source)
+            manager._executor.submit = mock.Mock()
+            try:
+                created = manager.create_job(
+                    svn_url="https://svn.example.com/svn/customer/ecology",
+                    username="user", password="password", profile_id="default",
+                    file_list="src/A.java", commit_message="QC123456 标准文件")
+                job = manager.jobs[created["task"]["id"]]
+                with job.lock:
+                    job.state = "preview_ready"
+                    job.preview_items = [
+                        {"path": "src/%06d.java" % index, "source": "客户标准文件",
+                         "result": "已覆盖", "detail": ""}
+                        for index in range(1200)
+                    ]
+                preview = manager.snapshot(
+                    job.job_id, created["task"]["access_token"])["task"]["preview"]
+                self.assertEqual(preview["items_total"], 1200)
+                self.assertTrue(preview["items_truncated"])
+                self.assertEqual(len(preview["items"]), 1000)
+                self.assertEqual(len(job.preview_items), 1200)
+            finally:
+                manager.stop()
+
+    def test_confirmation_is_single_use_and_idempotent(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as source:
+            Path(source, "ecology").mkdir()
+            manager = self.make_manager(root, source)
+            try:
+                manager._executor.submit = mock.Mock()
+                created = manager.create_job(
+                    svn_url="https://svn.example.com/svn/customer/ecology",
+                    username="user",
+                    password="password",
+                    profile_id="default",
+                    file_list="src/A.java",
+                    commit_message="QC123456 标准文件",
+                )
+                job_id = created["task"]["id"]
+                access_token = created["task"]["access_token"]
+                job = manager.jobs[job_id]
+                confirmation = "confirm-token"
+                with job.lock:
+                    job.state = "preview_ready"
+                    job.can_commit = True
+                    job.confirmation_token = confirmation
+                    from web_standard_service import _token_hash
+                    job.confirmation_token_hash = _token_hash(confirmation)
+                manager._executor.submit.reset_mock()
+                key = "idempotency_key_123456"
+                manager.request_commit(job_id, access_token, confirmation, key)
+                manager.request_commit(job_id, access_token, confirmation, key)
+                self.assertEqual(manager._executor.submit.call_count, 1)
+                with self.assertRaisesRegex(StandardWebError, "已经发起"):
+                    manager.request_commit(
+                        job_id, access_token, confirmation, "different_key_123456")
+            finally:
+                job = next(iter(manager.jobs.values()), None)
+                if job:
+                    manager._delete_job_directory(job)
+                manager.stop()
+
+    def test_orphan_cleanup_requires_valid_marker_and_skips_symlink(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as source:
+            manager = self.make_manager(root, source)
+            try:
+                valid_id = "a" * 32
+                valid = Path(root, valid_id)
+                valid.mkdir()
+                manager._write_marker(valid_id, valid, time.time())
+                invalid = Path(root, "b" * 32)
+                invalid.mkdir()
+                outside = Path(root).parent / ("outside-standard-job-" + os.path.basename(root))
+                outside.mkdir(exist_ok=True)
+                symlink = Path(root, "c" * 32)
+                try:
+                    try:
+                        symlink.symlink_to(outside, target_is_directory=True)
+                    except (OSError, NotImplementedError):
+                        # Windows 建符号链接需要开发者模式或管理员特权。
+                        self.skipTest("当前环境不允许创建符号链接")
+                    manager._cleanup_orphan_directories()
+                    self.assertFalse(valid.exists())
+                    self.assertTrue(invalid.exists())
+                    self.assertTrue(symlink.is_symlink())
+                    self.assertTrue(outside.exists())
+                finally:
+                    if symlink.is_symlink():
+                        symlink.unlink()
+                    shutil.rmtree(outside, ignore_errors=True)
+            finally:
+                manager.stop()
+
+    def test_single_instance_lock_prevents_cross_process_orphan_cleanup(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as source:
+            first = self.make_manager(root, source)
+            second = self.make_manager(root, source)
+            try:
+                first.start()
+                with self.assertRaisesRegex(RuntimeError, "另一个 Web 进程"):
+                    second.start()
+            finally:
+                first.stop()
+                second.stop()
+
+    def test_stop_keeps_root_lock_until_running_worker_finishes(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as source:
+            Path(source, "ecology", "src").mkdir(parents=True)
+            Path(source, "ecology", "src", "A.java").write_text("x", encoding="utf-8")
+            first = self.make_manager(root, source)
+            second = self.make_manager(root, source)
+            worker_started = threading.Event()
+            release_worker = threading.Event()
+
+            def blocked_prepare(_job_id):
+                worker_started.set()
+                release_worker.wait(5)
+
+            first._prepare_job = blocked_prepare
+            stop_thread = None
+            try:
+                first.start()
+                first.create_job(
+                    svn_url="https://svn.example.com/svn/customer/ecology",
+                    username="user",
+                    password="password",
+                    profile_id="default",
+                    file_list="src/A.java",
+                    commit_message="QC123456 标准文件",
+                )
+                self.assertTrue(worker_started.wait(5))
+                stop_thread = threading.Thread(target=first.stop)
+                stop_thread.start()
+                time.sleep(0.05)
+                self.assertTrue(stop_thread.is_alive())
+                with self.assertRaisesRegex(RuntimeError, "另一个 Web 进程"):
+                    second.start()
+                release_worker.set()
+                stop_thread.join(5)
+                self.assertFalse(stop_thread.is_alive())
+                second.start()
+            finally:
+                release_worker.set()
+                if stop_thread and stop_thread.is_alive():
+                    stop_thread.join(5)
+                first.stop()
+                second.stop()
+
+    def test_stop_keeps_root_lock_until_cleanup_thread_finishes(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as source:
+            first = self.make_manager(root, source)
+            second = self.make_manager(root, source)
+            join_started = threading.Event()
+            release_cleanup = threading.Event()
+
+            class BlockingCleanupThread:
+                timeout = "unset"
+
+                @staticmethod
+                def is_alive():
+                    return True
+
+                def join(self, timeout=None):
+                    self.timeout = timeout
+                    join_started.set()
+                    if timeout is None:
+                        release_cleanup.wait(5)
+
+            cleanup_thread = BlockingCleanupThread()
+            stop_thread = None
+            try:
+                first.start()
+                first._cleanup_thread = cleanup_thread
+                stop_thread = threading.Thread(target=first.stop)
+                stop_thread.start()
+                self.assertTrue(join_started.wait(5))
+                self.assertIsNone(cleanup_thread.timeout)
+                self.assertTrue(stop_thread.is_alive())
+                with self.assertRaisesRegex(RuntimeError, "另一个 Web 进程"):
+                    second.start()
+                release_cleanup.set()
+                stop_thread.join(5)
+                self.assertFalse(stop_thread.is_alive())
+                second.start()
+            finally:
+                release_cleanup.set()
+                if stop_thread and stop_thread.is_alive():
+                    stop_thread.join(5)
+                first.stop()
+                second.stop()
+
+    def test_orphan_cleanup_cannot_delete_job_during_atomic_creation(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as source:
+            Path(source, "ecology", "src").mkdir(parents=True)
+            Path(source, "ecology", "src", "A.java").write_text("x", encoding="utf-8")
+            manager = self.make_manager(root, source)
+            manager._executor.submit = mock.Mock()
+            marker_written = threading.Event()
+            resume_create = threading.Event()
+            cleanup_done = threading.Event()
+            original_write_marker = manager._write_marker
+
+            def blocked_marker(*args):
+                original_write_marker(*args)
+                marker_written.set()
+                resume_create.wait(5)
+
+            def run_cleanup():
+                try:
+                    manager._cleanup_orphan_directories()
+                finally:
+                    cleanup_done.set()
+
+            try:
+                with mock.patch.object(manager, "_write_marker", side_effect=blocked_marker):
+                    with ThreadPoolExecutor(max_workers=1) as pool:
+                        future = pool.submit(
+                            manager.create_job,
+                            svn_url="https://svn.example.com/svn/customer/ecology",
+                            username="user",
+                            password="password",
+                            profile_id="default",
+                            file_list="src/A.java",
+                            commit_message="QC123456 标准文件",
+                        )
+                        self.assertTrue(marker_written.wait(5))
+                        cleanup_thread = threading.Thread(target=run_cleanup)
+                        cleanup_thread.start()
+                        self.assertFalse(cleanup_done.wait(0.1))
+                        resume_create.set()
+                        created = future.result(timeout=5)
+                        cleanup_thread.join(5)
+                job_id = created["task"]["id"]
+                self.assertIn(job_id, manager.jobs)
+                self.assertTrue(manager.jobs[job_id].job_dir.is_dir())
+            finally:
+                resume_create.set()
+                manager.stop()
+
+    def test_live_job_limit_is_atomic_for_concurrent_creates(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as source:
+            Path(source, "ecology", "src").mkdir(parents=True)
+            Path(source, "ecology", "src", "A.java").write_text("x", encoding="utf-8")
+            manager = StandardJobManager(
+                profiles=[SourceProfile("default", "测试来源", standard_path=source)],
+                temp_root=root,
+                min_free_bytes=0,
+                max_live_jobs=1,
+                require_password_stdin=False,
+            )
+            manager._executor.submit = mock.Mock()
+
+            def create():
+                try:
+                    return manager.create_job(
+                        svn_url="https://svn.example.com/svn/customer/ecology",
+                        username="user",
+                        password="password",
+                        profile_id="default",
+                        file_list="src/A.java",
+                        commit_message="QC123456 标准文件",
+                    )["task"]["id"]
+                except StandardWebError as exc:
+                    return exc.code
+
+            try:
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    values = list(pool.map(lambda _index: create(), range(2)))
+                self.assertEqual(sum(value == "too_many_jobs" for value in values), 1)
+                self.assertEqual(len(manager.jobs), 1)
+            finally:
+                for job in manager.jobs.values():
+                    manager._delete_job_directory(job)
+                manager.stop()
+
+    def test_cleanup_retries_terminal_job_after_transient_delete_failure(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as source:
+            Path(source, "ecology", "src").mkdir(parents=True)
+            Path(source, "ecology", "src", "A.java").write_text("x", encoding="utf-8")
+            manager = self.make_manager(root, source)
+            manager._executor.submit = mock.Mock()
+            try:
+                created = manager.create_job(
+                    svn_url="https://svn.example.com/svn/customer/ecology",
+                    username="user",
+                    password="password",
+                    profile_id="default",
+                    file_list="src/A.java",
+                    commit_message="QC123456 标准文件",
+                )
+                job = manager.jobs[created["task"]["id"]]
+                job.state = "committed"
+                job.finished_at = time.time()
+                with mock.patch("web_standard_service.shutil.rmtree", side_effect=OSError("busy")):
+                    self.assertFalse(manager._delete_job_directory(job))
+                self.assertEqual(job.cleanup_status, "failed")
+                manager.cleanup_expired()
+                self.assertEqual(job.cleanup_status, "cleaned")
+                self.assertFalse(job.job_dir.exists())
+            finally:
+                manager.stop()
+
+    def test_preview_expires_without_browser_polling_near_ttl(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as source:
+            Path(source, "ecology").mkdir()
+            manager = StandardJobManager(
+                profiles=[SourceProfile("default", "测试来源", standard_path=source)],
+                temp_root=root,
+                preview_ttl=0.08,
+                cleanup_interval=0.02,
+                min_free_bytes=0,
+                require_password_stdin=False,
+            )
+            manager._executor.submit = mock.Mock()
+            try:
+                manager.start()
+                created = manager.create_job(
+                    svn_url="https://svn.example.com/svn/customer/ecology",
+                    username="user",
+                    password="password",
+                    profile_id="default",
+                    file_list="src/A.java",
+                    commit_message="QC123456 标准文件",
+                )
+                job = manager.jobs[created["task"]["id"]]
+                with job.lock:
+                    job.state = "preview_ready"
+                    job.can_commit = True
+                    job.expires_at = time.time() + 0.08
+                deadline = time.time() + 1
+                while time.time() < deadline:
+                    with job.lock:
+                        if job.state == "expired" and job.cleanup_status == "cleaned":
+                            break
+                    time.sleep(0.01)
+                with job.lock:
+                    self.assertEqual(job.state, "expired")
+                    self.assertIsNone(job.password)
+                    self.assertEqual(job.cleanup_status, "cleaned")
+                self.assertFalse(job.job_dir.exists())
+            finally:
+                manager.stop()
+
+    def test_commit_acceptance_renews_deadline_and_expiry_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as source:
+            Path(source, "ecology").mkdir()
+            manager = self.make_manager(root, source)
+            manager._executor.submit = mock.Mock()
+            try:
+                created = manager.create_job(
+                    svn_url="https://svn.example.com/svn/customer/ecology",
+                    username="user",
+                    password="password",
+                    profile_id="default",
+                    file_list="src/A.java",
+                    commit_message="QC123456 标准文件",
+                )
+                job_id = created["task"]["id"]
+                token = created["task"]["access_token"]
+                job = manager.jobs[job_id]
+                confirmation = "confirm-token"
+                from web_standard_service import _token_hash
+                with job.lock:
+                    job.state = "preview_ready"
+                    job.can_commit = True
+                    job.expires_at = time.time() + 0.1
+                    job.confirmation_token = confirmation
+                    job.confirmation_token_hash = _token_hash(confirmation)
+                manager.request_commit(
+                    job_id, token, confirmation, "deadline_commit_123456")
+                self.assertGreater(job.expires_at, time.time() + 60)
+                job.expires_at = time.time() - 1
+                manager._commit_job(job_id)
+                self.assertEqual(job.state, "expired")
+                self.assertEqual(job.cleanup_status, "cleaned")
+                self.assertIsNone(job.error)
+            finally:
+                manager.stop()
+
+    def test_capacity_checks_account_for_pristine_each_file_and_sources(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as source:
+            Path(source, "ecology").mkdir()
+            manager = StandardJobManager(
+                profiles=[SourceProfile("default", "测试来源", standard_path=source)],
+                temp_root=root,
+                min_free_bytes=0,
+                max_root_bytes=1024 * 1024,
+                max_job_bytes=100 * 1024,
+                require_password_stdin=False,
+            )
+            manager._executor.submit = mock.Mock()
+            try:
+                created = manager.create_job(
+                    svn_url="https://svn.example.com/svn/customer/ecology",
+                    username="user",
+                    password="password",
+                    profile_id="default",
+                    file_list="src/A.java",
+                    commit_message="QC123456 标准文件",
+                )
+                job = manager.jobs[created["task"]["id"]]
+                with self.assertRaisesRegex(RuntimeError, "仓库文件"):
+                    manager._prepare_safety_check(job, 1, "remote", 20 * 1024)
+
+                oversized = job.job_dir / "oversized.bin"
+                oversized.write_bytes(b"x" * (101 * 1024))
+                with self.assertRaisesRegex(RuntimeError, "单任务容量"):
+                    manager._prepare_safety_check(job, 1, "after", None)
+                oversized.unlink()
+
+                source_file = Path(source, "large.bin")
+                source_file.write_bytes(b"x" * (101 * 1024))
+                item = mock.Mock(source_file=str(source_file), rel_path="large.bin")
+                with self.assertRaisesRegex(RuntimeError, "标准来源文件"):
+                    manager._check_source_capacity(job, [item])
+            finally:
+                manager.stop()
+
+    def test_capacity_reservations_prevent_concurrent_root_overcommit(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as source:
+            Path(source, "ecology").mkdir()
+            manager = self.make_manager(root, source)
+            manager._executor.submit = mock.Mock()
+            try:
+                jobs = []
+                for name in ("A.java", "B.java"):
+                    created = manager.create_job(
+                        svn_url="https://svn.example.com/svn/customer/ecology",
+                        username="user",
+                        password="password",
+                        profile_id="default",
+                        file_list="src/" + name,
+                        commit_message="QC123456 标准文件",
+                    )
+                    jobs.append(manager.jobs[created["task"]["id"]])
+                manager.max_root_bytes = 100
+                barrier = threading.Barrier(2)
+
+                def reserve(job):
+                    barrier.wait()
+                    try:
+                        manager._reserve_estimated_capacity(job, 60, "测试文件")
+                        return "accepted"
+                    except RuntimeError:
+                        return "rejected"
+
+                with mock.patch("web_standard_service._directory_size", return_value=0), \
+                        mock.patch("web_standard_service.shutil.disk_usage",
+                                   return_value=mock.Mock(free=100)):
+                    with ThreadPoolExecutor(max_workers=2) as pool:
+                        results = list(pool.map(reserve, jobs))
+                self.assertEqual(results.count("accepted"), 1)
+                self.assertEqual(results.count("rejected"), 1)
+            finally:
+                for job in manager.jobs.values():
+                    manager._release_capacity_reservation(job)
+                manager.stop()
+
+    def test_blocked_preview_immediately_clears_credentials_and_directory(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as source:
+            Path(source, "ecology").mkdir()
+
+            class FakeEngine:
+                def __init__(self, _username, _password, _config):
+                    pass
+
+                def release_credentials(self):
+                    pass
+
+            def fake_sparse(_engine, _url, destination, _paths, safety_check=None):
+                Path(destination).mkdir(parents=True)
+                return SparseCheckoutResult(1, [], ["src/Missing.java"])
+
+            missing_item = mock.Mock(
+                rel_path="src/Missing.java",
+                source_label="",
+                status="未找到来源",
+                detail="来源目录中不存在",
+            )
+            manager = StandardJobManager(
+                profiles=[SourceProfile("default", "测试来源", standard_path=source)],
+                temp_root=root,
+                min_free_bytes=0,
+                require_password_stdin=False,
+                engine_factory=FakeEngine,
+            )
+            try:
+                with mock.patch("web_standard_service.prepare_sparse_working_copy", fake_sparse), \
+                        mock.patch.object(manager, "_repository_identity",
+                                          return_value=("uuid", "https://svn.example.com/svn")), \
+                        mock.patch("web_standard_service.StandardFileService.scan",
+                                   return_value=([missing_item], 1, [])):
+                    created = manager.create_job(
+                        svn_url="https://svn.example.com/svn/customer/ecology",
+                        username="user",
+                        password="password",
+                        profile_id="default",
+                        file_list="src/Missing.java",
+                        commit_message="QC123456 标准文件",
+                    )
+                    job_id = created["task"]["id"]
+                    task = wait_for_job(
+                        manager, job_id, created["task"]["access_token"],
+                        {"preview_ready", "failed"},
+                    )
+                job = manager.jobs[job_id]
+                self.assertEqual(task["status"], "preview_ready", task.get("error"))
+                self.assertFalse(task["can_commit"])
+                self.assertEqual(task["cleanup"]["status"], "cleaned")
+                self.assertIsNone(job.password)
+                self.assertFalse(job.job_dir.exists())
+            finally:
+                manager.stop()
+
+    def test_local_sync_checkout_then_update_on_existing_working_copy(self):
+        """本地未拉取时 checkout，已有 .svn 工作副本时改为 update。"""
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as source:
+            Path(source, "ecology").mkdir()
+            export_root = Path(root, "export")
+
+            class RecordingEngine:
+                def __init__(self, cfg):
+                    self.cfg = cfg
+                    self.svn_user = "u"
+                    self.svn_pass = "p"
+                    self.calls = []
+
+                def _run_svn_bytes(self, *args, **kwargs):
+                    self.calls.append(args)
+                    if args and args[0] == "checkout" and len(args) >= 4:
+                        Path(args[-1], ".svn").mkdir(parents=True, exist_ok=True)
+                    return 0, ""
+
+                def release_credentials(self):
+                    pass
+
+            engine = RecordingEngine(None)
+            manager = StandardJobManager(
+                profiles=[SourceProfile("default", "测试来源", standard_path=source)],
+                temp_root=root,
+                min_free_bytes=0,
+                require_password_stdin=False,
+                export_root=str(export_root),
+            )
+            try:
+                def make_job(url, relative):
+                    return StandardJob(
+                        job_id="job-test", access_token_hash="x", created_at=time.time(),
+                        expires_at=time.time() + 60, svn_url=url, username="u", password="p",
+                        profile_id="default", source_relative=relative,
+                        source_unc_prefix=source, selection_mode="listed",
+                        relative_paths=["src/Test.java"], commit_message="QC1",
+                        job_dir=Path(root, "job"), wc_dir=Path(root, "job", "wc"),
+                        config_dir=Path(root, "job", "cfg"))
+
+                first = make_job("https://svn.example.com/svn/J客户",
+                                 "J/J客户/QC123/ecology")
+                self.assertTrue(manager._sync_local_checkout(first, engine))
+                target = export_root / "J" / "J客户" / "ecology"
+                self.assertTrue((target / ".svn").exists())
+                self.assertEqual([c[0] for c in engine.calls], ["checkout"])
+                self.assertIn("--force", engine.calls[0])
+                self.assertEqual(os.path.normcase(os.path.realpath(engine.calls[0][-1])),
+                                 os.path.normcase(os.path.realpath(str(target))))
+
+                second = make_job("https://svn.example.com/svn/J客户",
+                                  "J/J客户/QC123/ecology")
+                self.assertTrue(manager._sync_local_checkout(second, engine))
+                self.assertEqual(engine.calls[-1][0], "update")
+                self.assertEqual(os.path.normcase(os.path.realpath(engine.calls[-1][-1])),
+                                 os.path.normcase(os.path.realpath(str(target))))
+
+                skipped = make_job("https://svn.example.com/svn/x", ".")
+                self.assertFalse(manager._sync_local_checkout(skipped, engine))
+                self.assertEqual(engine.calls[-1][0], "update")
+            finally:
+                manager.stop()
+
+    def test_prepare_job_syncs_local_checkout_even_when_no_changes(self):
+        """即使清单为空、无需提交，也要先把本地目录 checkout 下来。"""
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as source:
+            customer_dir = Path(source, "J", "J客户", "QC123", "ecology")
+            customer_dir.mkdir(parents=True)
+            customer_path = str(customer_dir)
+            export_root = Path(root, "export")
+            holder = {}
+
+            class FakeEngine:
+                def __init__(self, _username, _password, _config):
+                    self.calls = []
+                    holder["engine"] = self
+
+                def _run_svn_bytes(self, *args, **kwargs):
+                    self.calls.append(args)
+                    if args and args[0] == "checkout" and len(args) >= 4:
+                        Path(args[-1], ".svn").mkdir(parents=True, exist_ok=True)
+                    if args and args[0] == "list":
+                        return 0, '<lists><list path="."/></lists>'
+                    if args and args[0] == "info":
+                        return 0, ('<info><entry revision="1"><repository>'
+                                   '<root>x</root><uuid>u</uuid></repository>'
+                                   '</entry></info>')
+                    return 0, ""
+
+                def release_credentials(self):
+                    pass
+
+            manager = StandardJobManager(
+                profiles=[SourceProfile("default", "测试来源", standard_path=source)],
+                temp_root=root,
+                min_free_bytes=0,
+                require_password_stdin=False,
+                engine_factory=FakeEngine,
+                export_root=str(export_root),
+            )
+            try:
+                created = manager.create_job(
+                    svn_url="https://svn.example.com/svn/J客户",
+                    username="user",
+                    password="password",
+                    profile_id="default",
+                    file_list="",
+                    cover_all_confirmed=True,
+                    customer_standard_path=customer_path,
+                    commit_message="QC123456 无变更",
+                )
+                job_id = created["task"]["id"]
+                task = wait_for_job(
+                    manager, job_id, created["task"]["access_token"],
+                    {"no_changes", "failed"},
+                )
+                self.assertEqual(task["status"], "no_changes", task.get("error"))
+                engine = holder["engine"]
+                self.assertEqual([c[0] for c in engine.calls].count("checkout"), 1)
+                target = export_root / "J" / "J客户" / "ecology"
+                self.assertTrue((target / ".svn").exists())
+            finally:
+                manager.stop()
+
+    def test_commit_launch_failure_is_known_failure_not_unknown(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as source:
+            Path(source, "ecology").mkdir()
+
+            class LaunchFailEngine:
+                def __init__(self, _username, _password, _config):
+                    self.commit_process_started = False
+
+                def reset_commit_tracking(self):
+                    self.commit_process_started = False
+
+                def _run_svn(self, _log, *_args):
+                    raise OSError("cannot launch svn")
+
+                def release_credentials(self):
+                    pass
+
+            manager = StandardJobManager(
+                profiles=[SourceProfile("default", "测试来源", standard_path=source)],
+                temp_root=root,
+                min_free_bytes=0,
+                require_password_stdin=False,
+                engine_factory=LaunchFailEngine,
+            )
+            manager._executor.submit = mock.Mock()
+            try:
+                created = manager.create_job(
+                    svn_url="https://svn.example.com/svn/customer/ecology",
+                    username="user",
+                    password="password",
+                    profile_id="default",
+                    file_list="src/A.java",
+                    commit_message="QC123456 标准文件",
+                )
+                job = manager.jobs[created["task"]["id"]]
+                target = job.wc_dir / "src" / "A.java"
+                target.parent.mkdir(parents=True)
+                target.write_text("new", encoding="utf-8")
+                entries = [{
+                    "path": "src/A.java", "item": "added", "props": "none",
+                    "kind": "file", "properties": {},
+                }]
+                job.state = "commit_queued"
+                job.preview_items = [{"path": "src/A.java", "result": "已覆盖"}]
+                job.commit_targets = ["src/A.java"]
+                job.preview_fingerprint = manager._fingerprint(job, entries)
+                with mock.patch.object(manager, "_read_status_entries", return_value=entries):
+                    manager._commit_job(job.job_id)
+                self.assertEqual(job.state, "failed")
+                self.assertEqual(job.error["code"], "commit_failed")
+            finally:
+                manager.stop()
+
+    def test_cancel_during_sparse_checkout_cannot_write_preview_ready_back(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as source:
+            Path(source, "ecology", "src").mkdir(parents=True)
+            Path(source, "ecology", "src", "A.java").write_text("x", encoding="utf-8")
+            started = threading.Event()
+            resume = threading.Event()
+
+            class FakeEngine:
+                def __init__(self, _username, _password, _config):
+                    pass
+
+                def release_credentials(self):
+                    pass
+
+            def fake_sparse(_engine, _url, _destination, _paths, safety_check=None):
+                started.set()
+                resume.wait(5)
+                safety_check(1, "after", 1)
+                return SparseCheckoutResult(1, [], [])
+
+            manager = StandardJobManager(
+                profiles=[SourceProfile("default", "测试来源", standard_path=source)],
+                temp_root=root,
+                min_free_bytes=0,
+                require_password_stdin=False,
+                engine_factory=FakeEngine,
+            )
+            try:
+                with mock.patch("web_standard_service.prepare_sparse_working_copy", fake_sparse):
+                    created = manager.create_job(
+                        svn_url="https://svn.example.com/svn/customer/ecology",
+                        username="user",
+                        password="password",
+                        profile_id="default",
+                        file_list="src/A.java",
+                        commit_message="QC123456 标准文件",
+                    )
+                    self.assertTrue(started.wait(5))
+                    job_id = created["task"]["id"]
+                    token = created["task"]["access_token"]
+                    manager.cancel(job_id, token)
+                    resume.set()
+                    task = wait_for_job(manager, job_id, token, {"cancelled"})
+                    self.assertEqual(task["status"], "cancelled")
+                    self.assertEqual(task["cleanup"]["status"], "cleaned")
+                    self.assertFalse(manager.jobs[job_id].job_dir.exists())
+                    self.assertIsNone(manager.jobs[job_id].password)
+            finally:
+                resume.set()
+                manager.stop()
+
+    def test_executor_submit_failure_cleans_new_job_immediately(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as source:
+            Path(source, "ecology", "src").mkdir(parents=True)
+            Path(source, "ecology", "src", "A.java").write_text("x", encoding="utf-8")
+            manager = self.make_manager(root, source)
+            manager._executor.submit = mock.Mock(side_effect=RuntimeError("shutdown"))
+            try:
+                with self.assertRaisesRegex(StandardWebError, "队列当前不可用"):
+                    manager.create_job(
+                        svn_url="https://svn.example.com/svn/customer/ecology",
+                        username="user",
+                        password="password",
+                        profile_id="default",
+                        file_list="src/A.java",
+                        commit_message="QC123456 标准文件",
+                    )
+                self.assertFalse(manager.jobs)
+                self.assertFalse(any(path.is_dir() for path in Path(root).iterdir()))
+            finally:
+                manager.stop()
+
+
+
+    def make_export_manager(self, root, source, export_root, overwrite=True):
+        return StandardJobManager(
+            profiles=[SourceProfile("default", "测试来源", standard_path=source)],
+            temp_root=root,
+            min_free_bytes=0,
+            max_root_bytes=1024 * 1024 * 1024,
+            require_password_stdin=False,
+            export_root=export_root,
+            export_overwrite=overwrite,
+        )
+
+    def _make_export_job(self, manager, file_list, source_relative):
+        manager._executor.submit = mock.Mock()
+        created = manager.create_job(
+            svn_url="https://svn.example.com/svn/customer/ecology",
+            username="user",
+            password="password",
+            profile_id="default",
+            file_list=file_list,
+            commit_message="QC5081286 标准文件",
+        )
+        job = manager.jobs[created["task"]["id"]]
+        job.source_relative = source_relative
+        return job
+
+    def test_workspace_config_parses_export_root_and_overwrite(self):
+        with tempfile.TemporaryDirectory() as root:
+            export_root = Path(root, "导出根")
+            workspace = web_standard_service._parse_workspace_config(
+                {"workspace": {"export_root": str(export_root), "overwrite": False}})
+            self.assertEqual(workspace["export_root"], str(export_root))
+            self.assertFalse(workspace["overwrite"])
+            default = web_standard_service._parse_workspace_config({})
+            self.assertEqual(default["export_root"], "")
+            self.assertTrue(default["overwrite"])
+
+    def test_workspace_config_rejects_relative_export_root(self):
+        with self.assertRaisesRegex(ValueError, "绝对路径"):
+            web_standard_service._parse_workspace_config(
+                {"workspace": {"export_root": "relative/path"}})
+
+    def test_export_committed_files_mirrors_customer_dir_without_qc(self):
+        with tempfile.TemporaryDirectory() as root, \
+                tempfile.TemporaryDirectory() as source, \
+                tempfile.TemporaryDirectory() as export_root:
+            Path(source, "ecology").mkdir()
+            manager = self.make_export_manager(root, source, export_root)
+            try:
+                job = self._make_export_job(
+                    manager, "src/A.java",
+                    "J/J江苏美思德化学股份/QC5081286/ecology")
+                wc = Path(job.wc_dir)
+                Path(wc, "src").mkdir(parents=True)
+                Path(wc, "src", "A.java").write_text("payload", encoding="utf-8")
+                job.commit_targets = ["src/A.java", "../evil.txt"]
+                manager._export_committed_files(job)
+                # 客户来源目录 J/J江苏美思德化学股份/QC5081286/ecology
+                # 本地导出去掉 QC 编号段 -> <root>/J/J江苏美思德化学股份/ecology/…
+                exported = Path(export_root, "J", "J江苏美思德化学股份", "ecology", "src", "A.java")
+                self.assertEqual(exported.read_text(encoding="utf-8"), "payload")
+                self.assertFalse(Path(export_root, "evil.txt").exists())
+                self.assertFalse(Path(export_root).parent.joinpath("evil.txt").exists())
+            finally:
+                manager.stop()
+
+    def test_export_committed_files_skips_existing_when_overwrite_disabled(self):
+        with tempfile.TemporaryDirectory() as root, \
+                tempfile.TemporaryDirectory() as source, \
+                tempfile.TemporaryDirectory() as export_root:
+            Path(source, "ecology").mkdir()
+            existing = Path(export_root, "J", "J客户", "ecology", "src", "A.java")
+            existing.parent.mkdir(parents=True)
+            existing.write_text("old", encoding="utf-8")
+            manager = self.make_export_manager(root, source, export_root, overwrite=False)
+            try:
+                job = self._make_export_job(
+                    manager, "src/A.java", "J/J客户/QC5081286/ecology")
+                wc = Path(job.wc_dir)
+                Path(wc, "src").mkdir(parents=True)
+                Path(wc, "src", "A.java").write_text("new", encoding="utf-8")
+                job.commit_targets = ["src/A.java"]
+                manager._export_committed_files(job)
+                self.assertEqual(existing.read_text(encoding="utf-8"), "old")
+            finally:
+                manager.stop()
+
+    def test_export_disabled_when_export_root_empty(self):
+        with tempfile.TemporaryDirectory() as root, \
+                tempfile.TemporaryDirectory() as source:
+            Path(source, "ecology").mkdir()
+            manager = self.make_manager(root, source)
+            self.assertIsNone(manager.export_root)
+            try:
+                job = self._make_export_job(
+                    manager, "src/A.java", "J/J客户/QC5081286/ecology")
+                wc = Path(job.wc_dir)
+                Path(wc, "src").mkdir(parents=True)
+                Path(wc, "src", "A.java").write_text("payload", encoding="utf-8")
+                job.commit_targets = ["src/A.java"]
+                manager._export_committed_files(job)
+                self.assertFalse(list(Path(root).glob("QC*")))
+            finally:
+                manager.stop()
+
+
+
+@unittest.skipUnless(shutil.which("svn") and shutil.which("svnadmin"), "需要本机 SVN CLI")
+class StandardJobLocalRepositoryIntegrationTest(unittest.TestCase):
+    def test_sparse_allows_custom_and_inherited_properties(self):
+        """客户 SVN 目录总量有明确上限，容量交给运行时门禁负责；
+        不再因为检出根、文件或祖先目录带自定义/未知属性而提前拒绝
+        （svn:keywords、svn:special 仍然是硬性拒绝，见下面的用例）。"""
+        with tempfile.TemporaryDirectory() as root:
+            repo = Path(root, "repo")
+            seed = Path(root, "seed")
+            destination = Path(root, "sparse")
+            config = Path(root, "svn-config")
+            subprocess.run(["svnadmin", "create", str(repo)], check=True, capture_output=True)
+            repo_url = repo.as_uri()
+            subprocess.run(["svn", "mkdir", repo_url + "/trunk", "-m", "init"],
+                           check=True, capture_output=True)
+            subprocess.run(["svn", "checkout", repo_url + "/trunk", str(seed)],
+                           check=True, capture_output=True)
+            subprocess.run(["svn", "propset", "demo:root", "root-value", str(seed)],
+                           check=True, capture_output=True)
+            binary_file = seed / "WEB-INF" / "lib" / "gson.jar"
+            binary_file.parent.mkdir(parents=True)
+            binary_file.write_bytes(b"PK\x03\x04binary-jar-payload")
+            subprocess.run(["svn", "add", "--parents", str(binary_file)],
+                           check=True, capture_output=True)
+            subprocess.run(
+                ["svn", "propset", "svn:mime-type", "application/octet-stream",
+                 str(binary_file)],
+                check=True, capture_output=True,
+            )
+            subprocess.run(
+                ["svn", "propset", "demo:dir", "dir-value", str(binary_file.parent)],
+                check=True, capture_output=True,
+            )
+            subprocess.run(["svn", "commit", str(seed), "-m", "custom property seed"],
+                           check=True, capture_output=True)
+
+            engine = WebSvnEngine("local-test-user", "local-test-password", config)
+            safety_calls = []
+            try:
+                result = prepare_sparse_working_copy(
+                    engine,
+                    repo_url + "/trunk",
+                    str(destination),
+                    ["WEB-INF/lib/gson.jar"],
+                    safety_check=lambda index, phase, size: safety_calls.append(
+                        (index, phase, size)),
+                )
+                self.assertEqual(result.materialized_paths, ["WEB-INF/lib/gson.jar"])
+                self.assertEqual(
+                    (destination / "WEB-INF" / "lib" / "gson.jar").read_bytes(),
+                    b"PK\x03\x04binary-jar-payload")
+                self.assertIn((1, "remote", len(b"PK\x03\x04binary-jar-payload")), safety_calls)
+            finally:
+                engine.release_credentials()
+
+    def test_sparse_rejects_keyword_expansion_before_materializing_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            repo = Path(root, "repo")
+            seed = Path(root, "seed")
+            destination = Path(root, "sparse")
+            config = Path(root, "svn-config")
+            subprocess.run(["svnadmin", "create", str(repo)], check=True, capture_output=True)
+            repo_url = repo.as_uri()
+            subprocess.run(["svn", "mkdir", repo_url + "/trunk", "-m", "init"],
+                           check=True, capture_output=True)
+            subprocess.run(["svn", "checkout", repo_url + "/trunk", str(seed)],
+                           check=True, capture_output=True)
+            keyword_file = seed / "src" / "Keyword.txt"
+            keyword_file.parent.mkdir(parents=True)
+            keyword_file.write_text("$Id$\n" * 100, encoding="utf-8")
+            subprocess.run(["svn", "add", "--parents", str(keyword_file)],
+                           check=True, capture_output=True)
+            subprocess.run(["svn", "propset", "svn:keywords", "Id", str(keyword_file)],
+                           check=True, capture_output=True)
+            subprocess.run(["svn", "commit", str(seed), "-m", "keyword seed"],
+                           check=True, capture_output=True)
+
+            engine = WebSvnEngine("local-test-user", "local-test-password", config)
+            safety_calls = []
+            try:
+                with self.assertRaisesRegex(ValueError, "svn:keywords"):
+                    prepare_sparse_working_copy(
+                        engine,
+                        repo_url + "/trunk",
+                        str(destination),
+                        ["src/Keyword.txt"],
+                        safety_check=lambda index, phase, size: safety_calls.append(
+                            (index, phase, size)),
+                    )
+                self.assertEqual(safety_calls, [
+                    (0, "checkout_before", None),
+                    (0, "checkout_after", None),
+                    (1, "before", None),
+                ])
+                self.assertFalse((destination / "src" / "Keyword.txt").exists())
+            finally:
+                engine.release_credentials()
+
+    def test_sparse_preview_exact_commit_and_immediate_cleanup(self):
+        COMMIT_MESSAGE = "QC123456 Web 标准文件集成测试"
+        with tempfile.TemporaryDirectory() as root:
+            repo = Path(root, "repo")
+            seed = Path(root, "seed")
+            source = Path(root, "standard")
+            jobs = Path(root, "jobs")
+            subprocess.run(["svnadmin", "create", str(repo)], check=True, capture_output=True)
+            repo_url = repo.as_uri()
+            subprocess.run(["svn", "mkdir", repo_url + "/trunk", "-m", "init"],
+                           check=True, capture_output=True)
+            subprocess.run(["svn", "checkout", repo_url + "/trunk", str(seed)],
+                           check=True, capture_output=True)
+            existing = seed / "src" / "现有 File.txt"
+            percent_existing = seed / "src" / "%2e%2e" / "Percent.bin"
+            existing.parent.mkdir(parents=True)
+            percent_existing.parent.mkdir(parents=True)
+            existing.write_text("old", encoding="utf-8")
+            percent_existing.write_bytes(b"old-percent" * 128)
+            subprocess.run(["svn", "add", "--parents", str(existing), str(percent_existing)],
+                           check=True, capture_output=True)
+            subprocess.run(["svn", "commit", str(seed), "-m", "seed"],
+                           check=True, capture_output=True)
+
+            standard_existing = source / "ecology" / "src" / "现有 File.txt"
+            standard_percent = source / "ecology" / "src" / "%2e%2e" / "Percent.bin"
+            standard_new = source / "ecology" / "src" / "新目录" / "新增.java"
+            standard_existing.parent.mkdir(parents=True)
+            standard_percent.parent.mkdir(parents=True)
+            standard_new.parent.mkdir(parents=True)
+            standard_existing.write_text("new-standard", encoding="utf-8")
+            standard_percent.write_bytes(b"new-percent")
+            standard_new.write_text("class Demo {}", encoding="utf-8")
+            executable_source = source / "ecology" / "scripts" / "upgrade.sh"
+            include_executable = os.name != "nt"
+            if include_executable:
+                executable_source.parent.mkdir(parents=True)
+                executable_source.write_text("#!/bin/sh\necho upgrade\n", encoding="utf-8")
+                executable_source.chmod(0o755)
+
+            manager = StandardJobManager(
+                profiles=[SourceProfile("default", "本地测试来源", standard_path=str(source))],
+                temp_root=jobs,
+                min_free_bytes=0,
+                max_root_bytes=1024 * 1024 * 1024,
+                max_job_bytes=128 * 1024 * 1024,
+                require_password_stdin=True,
+                allow_file_urls=True,
+            )
+            remote_sizes = []
+            original_safety_check = manager._prepare_safety_check
+
+            def recording_safety_check(job, index, phase, remote_size=None):
+                if phase == "remote":
+                    remote_sizes.append((job.relative_paths[index - 1], remote_size))
+                return original_safety_check(job, index, phase, remote_size)
+
+            manager._prepare_safety_check = recording_safety_check
+            try:
+                created = manager.create_job(
+                    svn_url=repo_url + "/trunk",
+                    username="local-test-user",
+                    password="local-test-password",
+                    profile_id="default",
+                    file_list="src/现有 File.txt\nsrc/%2e%2e/Percent.bin",
+                    commit_message=COMMIT_MESSAGE,
+                )
+                job_id = created["task"]["id"]
+                token = created["task"]["access_token"]
+                preview = wait_for_job(manager, job_id, token, {"preview_ready", "failed"})
+                self.assertEqual(preview["status"], "preview_ready", preview.get("error"))
+                self.assertTrue(preview["can_commit"])
+                self.assertEqual(
+                    preview["preview"]["summary"]["changed"],
+                    2,
+                )
+                self.assertIn(
+                    ("src/%2e%2e/Percent.bin", len(b"old-percent" * 128)),
+                    remote_sizes,
+                )
+                manager.request_commit(
+                    job_id,
+                    token,
+                    preview["preview"]["confirmation_token"],
+                    "integration_commit_123456",
+                )
+                result = wait_for_job(
+                    manager, job_id, token,
+                    {"committed", "failed", "commit_unknown"}, timeout=30)
+                self.assertEqual(result["status"], "committed", result.get("error"))
+                self.assertIsNotNone(result["result"]["revision"])
+                self.assertEqual(result["cleanup"]["status"], "cleaned")
+                self.assertFalse(Path(jobs, job_id).exists())
+                log_result = subprocess.run(
+                    ["svn", "log", "--xml", "-r", str(result["result"]["revision"]), repo_url],
+                    check=True, capture_output=True, text=True,
+                )
+                # 落到 SVN 日志里的提交说明必须与输入逐字一致，不含任何附加标记
+                self.assertIn("<msg>%s</msg>" % COMMIT_MESSAGE, log_result.stdout)
+                self.assertNotIn("LZR-WEB", log_result.stdout)
+
+                verify = Path(root, "verify")
+                subprocess.run(["svn", "checkout", repo_url + "/trunk", str(verify)],
+                               check=True, capture_output=True)
+                self.assertEqual(
+                    (verify / "src" / "现有 File.txt").read_text(encoding="utf-8"),
+                    "new-standard",
+                )
+                self.assertFalse((verify / "src" / "新目录" / "新增.java").exists())
+                self.assertEqual(
+                    (verify / "src" / "%2e%2e" / "Percent.bin").read_bytes(),
+                    b"new-percent",
+                )
+                self.assertFalse((verify / "src" / "忽略.txt").exists())
+                if include_executable:
+                    self.assertFalse((verify / "scripts" / "upgrade.sh").exists())
+
+                standard_existing.write_text("intersection-latest", encoding="utf-8")
+                all_created = manager.create_job(
+                    svn_url=repo_url + "/trunk",
+                    username="local-test-user",
+                    password="local-test-password",
+                    profile_id="default",
+                    file_list="",
+                    cover_all_confirmed=True,
+                    commit_message="QC123456 Web 全部交集测试",
+                )
+                all_id = all_created["task"]["id"]
+                all_token = all_created["task"]["access_token"]
+                all_preview = wait_for_job(
+                    manager, all_id, all_token, {"preview_ready", "failed"}, timeout=30)
+                self.assertEqual(all_preview["status"], "preview_ready", all_preview.get("error"))
+                self.assertEqual(
+                    all_preview["checkout_revision"], result["result"]["revision"])
+                self.assertEqual(all_preview["selection_mode"], "intersection")
+                self.assertEqual(all_preview["preview"]["summary"]["requested"], 2)
+                self.assertEqual(all_preview["preview"]["summary"]["changed"], 1)
+                manager.request_commit(
+                    all_id,
+                    all_token,
+                    all_preview["preview"]["confirmation_token"],
+                    "intersection_commit_123456",
+                )
+                all_result = wait_for_job(
+                    manager, all_id, all_token,
+                    {"committed", "failed", "commit_unknown"}, timeout=30)
+                self.assertEqual(all_result["status"], "committed", all_result.get("error"))
+                verify_latest = Path(root, "verify-latest")
+                subprocess.run(["svn", "checkout", repo_url + "/trunk", str(verify_latest)],
+                               check=True, capture_output=True)
+                self.assertEqual(
+                    (verify_latest / "src" / "现有 File.txt").read_text(encoding="utf-8"),
+                    "intersection-latest",
+                )
+                self.assertFalse(
+                    (verify_latest / "src" / "新目录" / "新增.java").exists())
+            finally:
+                manager.stop()
+
+
+if __name__ == "__main__":
+    unittest.main()

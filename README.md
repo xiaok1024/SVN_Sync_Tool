@@ -1,0 +1,731 @@
+﻿# SVN 代码同步工具 / SVN Code Sync Tool
+
+一个跨平台（Windows / macOS）工具，用于从 SVN 拉取代码、用整理好的本地目录（或网络共享）覆盖交叉文件、并自动提交变更。三步流程一键完成，提交完成后可一键复制 SVN 提交记录。
+
+提供四个入口：
+
+- **现代图形界面**（`svn_sync_qt.py`）：Windows 主要使用方式，基于 PySide6 / Qt Widgets，打包为 exe 分发。
+- **旧版图形界面**（`svn_sync_tool.py`）：保留为迁移期功能对照和回归入口，不再作为 Windows 正式打包入口。
+- **终端版**（`svn_sync_cli.py`）：macOS 推荐使用方式，功能与 GUI 的 6 个页面一一对应，支持交互式菜单和命令行参数两种用法，详见下方「终端版」章节。也可直接使用 `outputs/SVN_Sync_Tool.app.zip` 中的图形界面。
+- **Web 工具中心**（`svn_sync_web.py`）：提供“版本号路径生成”、“SVN 标准文件提交”、“升级清单提取”和“标准文件提交与升级清单提取”四个相互隔离的工作区；SVN 任务使用隔离的临时工作副本/配置目录与用户自己的 SVN 凭据。默认仅监听 `127.0.0.1`，可通过显式参数开放可信局域网访问。
+
+A Windows Qt GUI and macOS CLI tool for checking out code from SVN, overwriting cross-referenced files from a local organized directory (or network share), and automatically committing changes.
+
+---
+
+## 功能 / Features
+
+| 功能 | 说明 |
+|------|------|
+| **SVN 拉取** | 输入 SVN 地址（支持中文路径），选择拉取目录，支持用户名/密码认证或缓存认证 |
+| **交叉覆盖** | 遍历 SVN 检出目录下的每个文件，到整理好的目录中查找同名同路径文件，有则覆盖，没有则跳过 |
+| **全自动流程** | 一键执行：SVN 拉取 → 交叉覆盖 → SVN 提交，实时日志输出，无需手动操作 |
+| **升级清单提取** | 从复制的带颜色升级清单（QC 分组 + 红/黑标记的完整 SVN URL 或 `$/...` 路径）提取文件清单，并生成人读升级 Markdown 与 AI 专用 Markdown |
+| **版本号路径生成** | 快速完成这件事而设计的——不用打开 SVN log 界面一行行翻，提供一个版本号，工具直接查询出所有变更文件，并自动按 `(Vxxx)` 格式拼接好完整 URL |
+| **标准文件获取** | 按源码清单从 KB/历史目录补全客户工作副本，提交前预览整个工作副本的 SVN 状态；支持提交后恢复本地二开版本 |
+| **标准文件合并工作台（Web）** | 新增“标准文件提交与升级清单提取”页面：保留标准文件安全预览与提交，但不再显示收尾阶段；在配置任务内粘贴升级清单即可生成 Markdown 到本地导出目录 |
+
+| Feature | Description |
+|---------|-------------|
+| **SVN Checkout** | Enter SVN URL (supports Chinese characters), select checkout directory, supports username/password auth or cached auth |
+| **Cross Overwrite** | Iterates every file in the SVN checkout directory, looks for matching files (same relative path) in the organized directory, overwrites if found, skips if not |
+| **Auto Pipeline** | One-click execution: SVN checkout → cross-file overwrite → SVN commit, with real-time log output |
+| **Upgrade List Extract** | Extract the file list from a copied colored upgrade list (QC groups + red/black-marked SVN URLs), and generate a human-readable upgrade Markdown and an AI-oriented Markdown |
+| **Revision Path Generator** | Query changed files by SVN revision and generate complete URLs with `(Vxxx)` suffixes |
+| **Standard File Acquisition** | Restore missing source files from KB/history directories and preview SVN status before commit |
+
+---
+
+## 截图 / Screenshot
+
+![SVN Sync Tool](./README.assets/1782545885107.png)
+
+> 此图为旧版界面，仅供历史参考；当前 Windows GUI 已改为左侧导航、卡片式配置和分栏结果区。
+
+---
+
+## 下载 / Download
+
+直接从 outputs/ 目录获取对应平台的预编译产物：
+
+Grab the pre-built artifact for your platform from the outputs/ directory:
+
+| 平台 | 产物 |
+|------|------|
+| **Windows** | `outputs/SVN_Sync_Tool.exe` |
+| **macOS** | `outputs/SVN_Sync_Tool.app.zip`（解压得到 `SVN_Sync_Tool.app`）；也可直接运行终端版源码 `python3 svn_sync_cli.py` |
+
+Windows exe 双击运行，无需安装 Python 或任何依赖（但系统需已安装 SVN 命令行工具）。macOS 终端版只依赖系统 Python 3 和 SVN 命令行工具，无需安装第三方包。
+
+The Windows exe runs by double-click with no Python required. On macOS, run the terminal version (`python3 svn_sync_cli.py`) — it only needs Python 3 and the SVN CLI, no third-party packages.
+
+---
+
+## 终端版 / CLI（macOS 推荐）
+
+`svn_sync_cli.py` 与 GUI 共用同一套业务逻辑，功能与 6 个页面一一对应，两种用法：
+
+### 交互模式
+
+```bash
+python3 svn_sync_cli.py
+```
+
+进入主菜单选择功能（1-6 对应 GUI 的 6 个页面），随后按提示逐项输入参数：
+
+- 常用值（SVN 地址、目录、用户名等，**不含密码**）会记住在 `~/.config/svn_sync_tool/cli.json`，下次回车即可复用；
+- 密码输入不回显；来源为 `smb://` 共享时才会询问 SMB 账号；
+- 交叉覆盖会先列出文件清单，回车全部覆盖，或输入序号（如 `1,3-5`）只覆盖部分，确认后才执行；
+- 全自动流程执行前会显示参数摘要并要求确认；`checkout` 模式删除已有目录前会单独确认；
+- 全自动流程中任一文件覆盖失败都会立即终止，不会继续执行 `svn add` 或 `svn commit`；
+- 生成的提交路径 / 升级 Markdown / 版本号路径可直接复制到剪贴板或保存为文件。
+
+### 参数模式（可脚本化）
+
+```bash
+# 1. SVN 拉取
+python3 svn_sync_cli.py checkout --url https://svn.example.com/svn/cust/ecology --dir ~/work/ecology
+
+# 2. 交叉覆盖（--dry-run 仅预览；非交互执行覆盖必须 --yes）
+python3 svn_sync_cli.py overwrite --target ~/work/ecology --source 'smb://192.168.7.215/share/ecology' --dry-run
+python3 svn_sync_cli.py overwrite --target ~/work/ecology --source ~/organized --yes
+
+# 3. 全自动流程：拉取 → 覆盖 → 提交（非交互必须 --yes；--copy 完成后复制提交路径）
+python3 svn_sync_cli.py auto --url ... --dir ~/work/ecology --source ~/organized -m "自动同步代码" --mode update --yes --copy
+
+# 4. 升级清单提取（默认读剪贴板富文本；也可 --input 页面.html 或 --list 清单.txt）
+python3 svn_sync_cli.py extract --format md -o upgrade-file-list.md
+python3 svn_sync_cli.py extract --format ai-md -o upgrade-file-list-ai.md
+
+# 5. 版本号路径生成
+python3 svn_sync_cli.py paths --url https://svn.example.com/svn/cust/ecology -r "123,456-789 1000" --sort rev --copy
+
+# 6. 标准文件获取（先预览；确认覆盖后显示整个目标目录的待提交状态）
+python3 svn_sync_cli.py standard --url https://svn.example.com/svn/cust/ecology \
+  --target ~/work/ecology --mode upgrade --title QC123 \
+  --standard /path/to/kb --historical /path/to/history --list files.txt --dry-run
+python3 svn_sync_cli.py standard --url https://svn.example.com/svn/cust/ecology \
+  --target ~/work/ecology --mode upgrade --title QC123 \
+  --standard /path/to/kb --historical /path/to/history --list files.txt --yes --commit --copy
+```
+
+在终端里漏填的必填参数会自动转为交互提问补全；非终端环境（如 CI）漏填则直接报错退出。各子命令详细参数见 `python3 svn_sync_cli.py <子命令> --help`。
+
+---
+
+## 本地 Web 预览
+
+Web 版提供四个相互隔离的工作区。桌面端使用左侧工具导航和输入 / 结果分栏，窄屏自动切换为顶部导航与纵向工作区。
+「我的 SVN 账号」位于导航区，查询与提交表单也提供账号管理入口；弹窗支持键盘操作与 Escape 关闭。
+版本号输入框支持 `Cmd / Ctrl + Enter` 查询，结果区可直接粘贴已有路径并仅做本地排序。
+
+各工具按页面导航顺序如下：
+
+- **版本号路径生成**（01）：只读功能，直接复用 `svn_path_generator.py`，与 GUI Tab 5、CLI `paths` 子命令共用同一套版本号解析、`svn log` 查询、`(V版本)` URL 拼接和三种排序逻辑。只执行 `svn log`，不创建工作副本、不写入仓库；也可只对已有 `(V版本)` 路径做本地排序，此时完全不访问 SVN。打开页面时默认进入这个工作区。
+- **SVN 标准文件提交**（02）：保留原有完整流程。每个任务先读取客户 SVN 检出根的最新 HEAD，创建独立稀疏工作副本、匹配标准目录、覆盖并生成 `svn status` 预览，用户二次确认后才精确提交本次路径。页面展示“配置任务 → 读取文件 → 覆盖预览 → 确认提交 → 收尾”五个阶段；失败、取消或超时任务仍由服务端自动清理。
+- **升级清单提取**（03）：保留原有独立页面。粘贴带红黑颜色的网页升级清单后，服务端复用 `upgrade_list_core.py` 识别颜色与 QC 分组，生成人读或 AI Markdown，供复制、下载；这一页不写入 SVN，也不写入标准文件目录。
+- **标准文件提交与升级清单提取**（04）：新增的合并页面。标准文件提交沿用原有安全预览与二次确认，但页面只展示 4 个阶段，不再显示收尾；服务端仍按既有安全策略自动清理临时目录。升级清单入口合并到“配置任务”中：粘贴升级清单后点击“生成 Markdown到本地目录”，服务端从“提交说明”提取 QC 号（例如 `no.5081286` 或 `QC5081286`），按客户来源目录推导本地路径，生成 `upgrade-file-list-ai-<QC号>.md` 到 `<export_root>\分组\客户`，不要求提交 SVN。
+
+独立的升级清单提取页面只处理剪贴板 / HTML 到 Markdown 的转换；合并页面才提供“生成 Markdown到本地目录”。两个页面都不会长期保存粘贴内容。
+
+标准文件工作区按**角色**分两个来源，每个角色有各自的共享白名单。客户目录必须位于对应来源根下，并接受四段、以 `ecology` 结尾的路径校验。Windows 部署可直接使用盘符或 UNC 来源根；Linux/macOS 常驻部署继续使用挂载根：
+
+| 角色 | 共享根 | 目录格式 | 清单可否留空 |
+|------|--------|----------|--------------|
+| **标准文件** | `\\192.168.7.215\ECOLOGY_customer` | `分组\客户\QC编号\ecology` | 可以，勾选确认后覆盖 SVN 与来源的全部交集 |
+| **历史文件**（两台主机共三个共享） | `\\192.168.7.108\ECOLOGY_customer`<br>`\\192.168.7.173\ecology-customer`、`ecology-customer2` | `分组\客户\历史文件\ecology` | **必须提供文件清单** |
+
+关于这两个来源的几点约定：
+
+- **服务端不内置客户到主机的映射**。某个客户落在哪台历史主机、哪个共享，无法按首字母或任何规律推断，必须由使用者填写完整路径（来源是各任务的 `customer-env-info.md`）。服务只校验「主机+共享在白名单内、路径形状合法」。
+- **只有标准文件共享允许「清单留空 = 覆盖全部交集」**。它是源 KB 到目标 KB 的差异包，内容经过标准化管控；历史文件共享不受此约束，留空可能把大量非预期文件覆盖进客户仓库。该策略由共享根前缀推导，不能通过配置绕过。
+- **凭据按角色分两组**（`[standard]` / `[history]`），三台历史主机共用同一套 history 账号。SMB 账号由服务端统一管理，浏览器不会接收或返回 SMB 凭据。
+- 标准文件共享是**差异包而非完整产品树**：某个类没变化就不在包里，不能据此判断"标准产品没有这个文件"。
+
+配置项（TOML 文件）：
+
+来源配置现在从配置文件读取，服务启动时只读取一次并缓存在进程内；修改后**必须重启 Web 服务**才生效。默认配置放在**当前项目的 `conf` 目录**：
+
+- 默认位置（推荐）：`<项目根>/conf/web-sources.toml`，仓库已附带一份默认配置，直接编辑即可；
+- Linux 常驻部署：`conf/web-sources.toml` 由部署机自己维护，`deploy-linux.sh` / `svn-sync-deploy` 都不会覆盖它。
+
+也可以在启动前用 `SVN_SYNC_WEB_SOURCE_CONFIG` 指定其他路径：
+
+```bash
+export SVN_SYNC_WEB_SOURCE_CONFIG='/etc/svn-sync-tool/web-sources.toml'
+```
+
+完整示例见 `deploy/web-sources.example.toml`。Windows 盘符/UNC 示例：
+
+```toml
+[server]
+allowed_svn_prefixes = ["https://svn.example.com/svn/"]
+
+[[profiles]]
+id = "e9-default"
+label = "E9 标准文件共享"
+role = "standard"
+# TOML 单引号字符串保留反斜杠，不要写成双反斜杠
+standard_path = 'D:\E9标准文件'
+unc_prefix = '\\192.168.7.215\ECOLOGY_customer'
+```
+
+Windows 下配置 `standard_path` 后，标准文件任务与合并工作台默认以该路径作为来源根；可直接使用盘符目录或 UNC，不需要额外挂载共享。升级清单 Markdown 会写入该来源根下对应客户目录（`<export_root>\分组\客户`），不放入 `ecology` 子目录。
+
+Linux 常驻部署示例：
+
+```toml
+[server]
+mount_root = "/mnt/ecology"
+smb_credentials_file = "/root/.config/svn_sync_tool/smb-credentials.toml"
+allowed_svn_prefixes = ["https://svn.example.com/svn/"]
+
+[[profiles]]
+id = "e9-default"
+label = "E9 标准文件共享"
+role = "standard"
+unc_prefix = '\\192.168.7.215\ECOLOGY_customer'
+
+# 需要历史文件来源时再启用；三台历史共享会自动加入白名单
+[[profiles]]
+id = "historical"
+label = "E9 历史文件共享"
+role = "historical"
+unc_prefix = '\\192.168.7.108\ECOLOGY_customer'
+```
+
+仓库自带的 `conf/web-sources.toml` 是默认配置，只保存来源和凭据文件路径，不保存用户名/密码；SMB 凭据仍放在独立的 `smb-credentials.toml`，不得加入 Git。旧版 `SVN_SYNC_WEB_STANDARD_PATH` 等环境变量仅在未提供来源配置文件时作为兼容路径读取。
+
+### 安装独立 Web 环境
+
+```bash
+python3 -m venv .venv-web
+.venv-web/bin/python -m pip install -r requirements-web.txt
+```
+
+### 启动
+
+先编辑项目内默认配置 `conf/web-sources.toml`，或用 `SVN_SYNC_WEB_SOURCE_CONFIG` 指定其他文件，然后启动：
+
+```bash
+.venv-web/bin/python svn_sync_web.py
+```
+
+随后访问：`http://127.0.0.1:8765/`
+
+### 部署到 Windows / 一键启动与关闭
+
+首次部署（每台 Windows 服务器执行一次）：
+
+```powershell
+git clone -b windows https://github.com/xiaok1024/SVN_Sync_Tool.git D:\svn-sync-tool
+cd D:\svn-sync-tool
+python -m venv .venv-web
+.\.venv-web\Scripts\python.exe -m pip install -r requirements-web.txt
+```
+
+后续更新代码后在项目根目录执行 `git pull origin windows`，再重启服务。
+
+编辑 `conf\web-sources.toml`，至少确认 `[workspace] export_root` 和各 `[[profiles]]` 的
+`standard_path` / `unc_prefix` 指向这台服务器实际可访问的盘符或 UNC 路径。服务只在启动时读取
+该配置，修改后必须重启。
+
+一键启停（在项目根目录双击 `.bat`，或在命令行执行）：
+
+```bat
+start-web.bat
+stop-web.bat
+```
+
+默认只监听 `127.0.0.1:8765`。如果其他 Windows 服务器或电脑需要访问，在配置 HTTPS 后执行：
+
+```bat
+start-web.bat -Lan
+```
+
+也可以覆盖端口或指定配置文件：
+
+```bat
+start-web.bat -Port 9000
+start-web.bat -Config D:\svn-sync\web-sources.toml
+```
+
+`start-web.bat` 会把服务及其真实监听进程 PID 写入 `run\web-process.json`，标准输出和错误分别写入
+`run\web-*.out.log` / `run\web-*.err.log`；`stop-web.bat` 会按 PID 同时清理外层 Python 和实际
+uvicorn 进程，不会只留下子进程。
+
+### 部署到 Linux 常驻运行（推荐）
+
+Web 服务日常跑在 Linux 主机上：常年开机、静态 IP、不依赖某台 Mac 是否开着。
+
+```bash
+# 服务器一次性准备（Ubuntu 22.04）
+apt-get install -y subversion cifs-utils python3.10-venv
+mkdir -p /opt/svn-sync-tool
+cd /opt/svn-sync-tool && python3 -m venv .venv-web
+.venv-web/bin/python -m pip install -r requirements-web.txt
+
+# 之后每次从开发机同步（只推源码，约 200 KB）
+./deploy-linux.sh            # 同步并重启服务
+./deploy-linux.sh --test     # 同步后在服务器上跑测试，不重启
+./deploy-linux.sh --deps     # requirements-web.txt 变了时，顺带重装依赖
+```
+
+systemd 单元 `/etc/systemd/system/svn-sync-web.service` 以 root 运行，`Restart=always`
+并已 `enable` 开机自启；日志走 journald（`journalctl -u svn-sync-web -f`）。
+`deploy-linux.sh`（不带参数）用 `rsync --delete` 把**本地工作区**同步过去，只用于开发中快速验证；
+正式发布走下面的 `--from-git`。
+
+Linux 上的来源配置放在 `/opt/svn-sync-tool/conf/web-sources.toml`。该文件由部署机自己维护，
+`deploy-linux.sh` 与正式发布都**不会覆盖它**；首次启用时从 `deploy/web-sources.example.toml`
+复制一份再改（至少填 `[server] mount_root` 与各 `[[profiles]]` 的 `unc_prefix`），改完执行
+`systemctl restart svn-sync-web` 才生效。没有这个文件时，服务退回读取 systemd 单元里声明的旧环境变量。
+
+### 正式发布：服务器只从 GitHub main 取代码
+
+线上必须等于 `main` 上的某个提交，而不是某人工作区里的状态。服务器上的
+`/usr/local/sbin/svn-sync-deploy`（源码在 `deploy/linux/svn-sync-deploy.sh`）负责：
+fetch main → 检出到 `/var/lib/svn-sync-deploy/releases/<commit>` → **在那里跑完整测试** →
+同步到 `/opt/svn-sync-tool` → 重启 → 健康检查；检查失败**自动回滚**到上一版。
+`requirements-web.txt` 变了才会装依赖。线上跑的是哪个提交，看页脚或 `/api/health` 的 `deployed`。
+
+```bash
+./deploy-linux.sh --from-git        # 推送 main 之后，一条命令发布（维护者）
+ssh ubuntu-root svn-sync-deploy --rollback   # 回到上一个成功发布的版本
+```
+
+**同事如何发布**（不需要登录主机）：
+
+1. 同事把自己的 SSH **公钥**（`~/.ssh/id_ed25519.pub` 一整行）发给维护者；
+2. 维护者在服务器上执行 `svn-sync-deploy-grant.sh <名字> '<公钥整行>'`（源码在
+   `deploy/linux/`）。它会创建专用账号 `svn-deploy`（锁定密码、`restrict` + 强制命令），
+   sudoers 只放行发布脚本一条命令——持钥匙的人连上来只能触发一次"发布 main"，
+   看不到主机文件、开不了 shell；`--revoke <名字>` 撤销，`--list` 查看；
+3. 同事推送 `main` 后，在自己电脑上：
+
+   ```bash
+   SVN_SYNC_DEPLOY_HOST=svn-deploy@192.168.30.178 ./deploy-linux.sh --from-git
+   # 或直接：ssh svn-deploy@192.168.30.178
+   ```
+
+   能看到测试、发布、健康检查的完整输出；测试不过线上不动。
+
+信任边界：谁能推 `main` 谁就能上线（服务以 root 运行），这与仓库本身的协作者范围一致；
+发布钥匙泄露也只能触发一次对 `main` 的发布。
+
+账号与会话（服务重启不会让大家掉线）：
+
+- 账号库 `/root/.config/svn_sync_tool/web_users.json`（0600），同目录的 `session-secret` 是会话
+  签名密钥，首次启动自动生成；两者都不进 Git。删掉 `session-secret` 等于让所有人重新登录。
+- 会话是签名令牌，服务端不保存会话表，重启、重新部署都不影响已登录的浏览器；持续使用会自动
+  续期，12 小时不用才过期。
+- 忘记登录密码：`.venv-web/bin/python manage_web_users.py reset-password <账号>`（隐藏输入）。
+  重置后该账号在所有浏览器上的登录立即失效，运行中的服务不需要重启；已保存的 SVN 凭据不受影响。
+  `list` 列账号、`delete <账号>` 删账号。
+
+### 服务端诊断日志
+
+Web 服务会将诊断事件持久化为 JSON Lines。Linux root 服务默认写入
+`/var/log/svn-sync-tool/web.jsonl`；普通用户运行时使用
+`~/.local/state/svn-sync-tool/log/web.jsonl`。可用 `SVN_SYNC_WEB_LOG_DIR` 指定目录，
+但必须位于项目/部署目录之外，避免发布时被覆盖或随代码入库。日志文件权限为 `0600`，
+首次创建的日志目录权限为 `0700`，读取仅限服务账号/管理员。
+
+- 每条日志有 UTC 时间、级别、事件名称、进程号和部署提交号。
+- 标准文件任务记录任务编号、操作账号、请求编号、各阶段及耗时、文件数量、检出/提交版本，
+  以及清理开始、完成、失败原因和重试次数；页面显示任务编号，反馈问题时可直接复制。
+- API 记录写请求和失败请求的路由模板、状态码、耗时及请求编号；响应头
+  `X-Request-ID` 可用于关联查询。成功的状态轮询、静态资源和健康检查不逐条记录。
+- 不保存密码、Cookie、Token、请求正文、查询参数、提交说明、文件正文或 SVN 原始输出。
+  异常记录类型、系统错误号、代码文件/行号，省略可能含凭据的异常原文与局部变量。
+- 单文件达到 **50 MiB** 轮转，最多保留 **30 份归档**（含当前文件约 1.52 GiB）；
+  启动及轮转时清理超过 **30 天**的归档。服务重启继续追加，任务目录清理不影响日志。
+- 日志写入失败时向 systemd 日志输出固定提示，不因此打断任务；应检查磁盘与目录权限。
+  日志目录无法初始化则启动失败，避免误以为诊断日志正在正常记录。
+
+维护者可执行（将任务编号替换为页面显示的值）：
+
+```bash
+ssh ubuntu-root 'tail -n 50 /var/log/svn-sync-tool/web.jsonl'
+ssh ubuntu-root 'grep -hF "任务编号" /var/log/svn-sync-tool/web.jsonl*'
+ssh ubuntu-root 'journalctl -u svn-sync-web -n 50 --no-pager'
+```
+
+这些日志用于问题追踪，不作为 SVN 提交成功的唯一依据；提交结果不确定时仍需核对 SVN 日志。
+
+### HTTPS
+
+服务通过 IP 在局域网内访问，走 **私有 CA + 按 IP 签发的服务器证书**：同事把 CA 证书装进
+系统信任一次，之后所有浏览器都不再警告；服务器证书可独立续期，续期后同事无需重装。
+
+```bash
+# 服务器一次性生成（CA 10 年；服务器证书 825 天——Apple/Chrome 对 TLS 证书的上限）
+cp deploy/linux/svn-sync-tls-setup.sh /usr/local/sbin/ && chmod 700 /usr/local/sbin/svn-sync-tls-setup.sh
+svn-sync-tls-setup.sh                 # 生成到 /etc/svn-sync-tool/tls/
+svn-sync-tls-setup.sh --renew         # 到期前仅重签服务器证书，CA 不变
+
+# 单元文件已按 HTTPS 配置：见 deploy/linux/svn-sync-web.service
+```
+
+监听布局：
+
+| 端口 | 协议 | 用途 |
+|------|------|------|
+| **8443** | HTTPS | 正式入口：`https://192.168.30.178:8443/` |
+| 8081 | HTTP | 只做 301 跳转到 8443，旧书签不会断；另在 `/ca.crt` 提供 CA 证书下载 |
+
+同事首次使用需安装 CA（只做一次）：
+
+1. 浏览器打开 `http://192.168.30.178:8081/ca.crt` 下载 `lzr-svn-sync-ca.crt`；
+2. **macOS**：双击导入「钥匙串访问」→ 登录钥匙串 → 找到「LZR SVN Sync Local CA」→ 显示简介 →
+   信任 → 「使用此证书时」选「始终信任」。Chrome / Safari 随即生效；**Firefox** 使用自己的证书库，
+   需在 设置 → 隐私与安全 → 证书 → 查看证书 → 证书颁发机构 → 导入，并勾选「信任由此 CA 标识的网站」；
+3. **Windows**：双击 `.crt` → 安装证书 → 当前用户 → 「将所有的证书都放入下列存储」→
+   浏览 → **受信任的根证书颁发机构**。Edge / Chrome 随即生效；Firefox 同样需单独导入。
+
+安装前可与服务器输出的 CA 指纹核对（`svn-sync-tls-setup.sh` 会打印 SHA-256），避免在首次
+明文下载环节被替换——这是私有 CA 的固有信任起点，内网环境可接受，但请通过聊天工具再发一份指纹。
+
+启用 HTTPS 后浏览器进入安全上下文，`navigator.clipboard` 可用，复制不再依赖降级路径；
+会话 Cookie 带 `Secure`，不会随明文 HTTP 发送。HSTS 未设置：RFC 6797 明确排除 IP 字面量，
+对 IP 访问不生效；8081 的强制跳转已保证所有人落到 HTTPS。
+
+共享挂载（Linux/macOS 常驻部署的标准文件提交需要；Windows 直接使用盘符/UNC，无需此步骤）：
+
+```bash
+# 凭据：按 deploy/linux/smb-credentials.example.toml 填好真实密码后放到
+#   /root/.config/svn_sync_tool/smb-credentials.toml（0600）
+# 三台历史文件主机共用同一套 [history] 账号，无需按主机拆
+
+cp deploy/linux/svn-sync-mount-shares.sh /usr/local/sbin/ && chmod 700 /usr/local/sbin/svn-sync-mount-shares.sh
+cp deploy/linux/svn-sync-mounts.service deploy/linux/svn-sync-mounts-heal.service \
+   deploy/linux/svn-sync-mounts.timer /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now svn-sync-mounts.service svn-sync-mounts.timer
+
+svn-sync-mount-shares.sh --status    # 查看十个共享的挂载状态
+```
+
+挂载点规则是 `<web-sources.toml 中 server.mount_root>/<主机>/<共享>`，与 `SourceProfile.local_root_for`
+保持一致——改其中一处必须同步改另一处，否则服务找不到已挂载的共享。
+
+`svn-sync-mounts.timer` 每 10 分钟触发一次 **`svn-sync-mounts-heal.service`** 重跑挂载脚本：
+脚本对已挂载的共享会跳过，所以重复执行安全，共享掉线后能自动补回。之所以是独立单元：
+`svn-sync-mounts.service` 为了在关机时卸载而 `RemainAfterExit=yes`、常驻 active，timer 对
+active 单元的 start 是空操作，直接触发它等于什么都不做。Web 服务用 `Wants=` 而非 `Requires=`
+依赖挂载单元，共享挂不上时版本号路径生成与升级清单提取仍可正常使用。
+
+共享掉线时，标准文件提交会在创建任务时直接返回「服务端共享 … 当前未挂载或已断开」（503），
+而不是等后台检出后再报"客户目录不存在"；其他仍在线的共享不受影响。
+
+几点 Linux 特有的注意：
+
+- **Python 3.10 需要 `tomli`**：`tomllib` 是 3.11+ 的标准库，`requirements-web.txt` 里带了
+  条件依赖 `tomli ; python_version < "3.11"`，代码按需回退，无需手工处理。
+- **可信 Host 显式写静态 IP**：`--lan` 会从主机名反查 IP，但那依赖 `/etc/hosts`
+  的写法（Ubuntu 默认可能把主机名指向 `127.0.1.1`，那样局域网访问会被判为
+  非法 Host）。systemd 单元里用 `SVN_SYNC_WEB_ALLOWED_HOSTS` 直接钉死静态 IP，
+  `--lan` 的自动探测结果会与之合并。
+- **SMB 共享要预先挂好**：`svn_sync_core` 的自动挂载只实现了 macOS（`mount_smbfs`）
+  和 Windows（UNC 直连）。Linux 上需用 `mount.cifs` 事先挂载，再把
+  `[server] mount_root` 指向挂载根——服务命中本地路径分支后完全不会走
+  那段平台代码。
+- **SMB 协议版本要能降级**：当前启用的 `.215` / `.108` / `.173` 用 `vers=3.0` 正常，
+  但实测 `192.168.7.106`（暂未启用）必须降到 `2.1` 才挂得上。挂载脚本按 3.0 → 2.1
+  依次尝试，不要写死单一版本，也不要降到 1.0。
+- **目录名含中文，必须带 `iocharset=utf8`**：客户目录大量使用中文，漏掉会乱码。
+  若日后启用 `.106`，其共享名本身也含中文（形如 `客户升级记录s上海`）。
+
+需要让可信局域网内的用户访问时，使用显式局域网模式：
+
+```bash
+.venv-web/bin/python svn_sync_web.py --lan
+```
+
+随后可访问：`http://lzr-mac-mini.local:8765/`。服务会自动把当前主机名、`.local` 名称和解析到的 IPv4 地址加入可信 Host；若还需允许其他固定域名或 IP，可在启动前配置逗号分隔的 `SVN_SYNC_WEB_ALLOWED_HOSTS`。
+
+页面支持：
+
+- 从浏览器粘贴带颜色富文本，或读取本地 HTML 文件；
+- 提取按 QC 分组的 `[red]` / `[black]` 清单；
+- 在生成前手工校对清单；
+- 生成人读 Markdown 与 AI Markdown；
+- 在浏览器复制结果或下载 `.md` 文件；
+- 下载文件自动使用客户名作为前缀，并清理 Windows / macOS 不支持的文件名字符；
+- 加载内置示例快速体验升级清单流程；
+- 标准文件清单只接受 `ecology` 下的相对文件路径，不解析 URL、`$/...` 或颜色标记；
+- 客户来源目录可直接粘贴任务描述原文（「标准文件请到 \\…\QC…\ecology 下面提取」），首尾说明词与空行、空格会自动去掉，前后端各做一次；
+- 清单非空时只覆盖列出的、且 SVN 与客户标准目录同时存在的文件；任一项只存在一端会阻止整个任务；
+- 清单留空时必须额外勾选确认，服务会在该 SVN 最新 revision 与客户标准目录之间求文件交集，只覆盖交集，不会 `svn add` 标准目录独有文件；
+- 每个 SVN 任务强制使用 `--config-dir`、`--no-auth-cache` 和 `--password-from-stdin`，不会读取或写入主机 SVN 认证缓存；
+- 提交预览使用一次性确认令牌和幂等键，重复点击不会再次执行同一任务的 `svn commit`；
+- 提交说明严格按输入原样写入 SVN，不追加任何内部标记；
+- 检出根目录、目标文件和其祖先目录可以带任意自定义/未知 SVN 属性（客户 SVN 目录总量有明确上限，远小于下面的临时目录容量门禁，因此不再逐一按属性名预检）；仍然硬性拒绝的只有 `svn:keywords`（关键字替换会改变落盘内容）和 SVN 特殊文件（`svn:special`，如符号链接，需要与普通文件不同的处理方式），这两项与磁盘容量无关；`svn:eol-style` 会按约 2 倍估算容量，其余属性不影响容量估算；
+- 默认最多同时执行 2 个任务、保留 10 个活跃任务，单任务临时目录上限 1 GiB；成功后立即清理。
+
+版本号路径生成额外的 Web 侧约束（桌面版没有这些上限，因为它不对外提供服务）：
+
+- 版本号只接受数字、逗号、空格和连字符；`0`、负数和无法解析的写法直接报错，不会静默忽略；
+- 单次最多查询 200 个版本（每个版本都是一次 `svn log`），单次结果最多 20000 个文件；
+- 单版本查询超时 60 秒，整次查询时间上限 240 秒；触发上限会返回已查到的结果，并明确说明有多少个版本没有查询；
+- 同时最多执行 2 次查询，超出返回 429；
+- 一律使用登录人在「我的 SVN 账号」里保存的凭据：独立 `--config-dir` 且 `--no-auth-cache`，密码经 stdin 传入，查询结束立即删除临时配置目录。未保存凭据时返回 428 并引导去设置，不存在回退到主机缓存的路径；
+- 单个版本查询失败（例如版本不存在、无变更文件）只作为该版本的提示返回，不影响其余版本，错误文本经过凭据脱敏；
+- **地址必须填仓库根**：`svn log` 返回的是仓库绝对路径，生成的 URL 由填入地址直接拼接该路径，填子目录会出现重复路径段。这与 GUI Tab 5、CLI `paths` 的行为一致。
+
+> `--lan` 只适合受信任的内网使用。服务会校验 Host 并拒绝浏览器跨站写请求；正式对同事开放时
+> 请按「部署到 Linux 常驻运行 → HTTPS」配置证书，否则登录密码与 SVN 密码会在局域网内明文传输。
+> 任何情况下都不得暴露到公网。
+
+Web 专项测试：
+
+```bash
+.venv-web/bin/python -m unittest \
+  tests.test_web_upgrade_service tests.test_web_standard_service \
+  tests.test_web_path_service tests.test_web_app -v
+```
+
+---
+
+## 使用说明 / Usage
+
+### 页面 1: SVN 拉取 / Page 1: SVN Checkout
+
+1. 输入 **SVN 仓库地址**
+2. （可选）填写 **用户名** 和 **密码**，留空则使用本地 SVN 缓存认证
+3. 选择 **拉取到目录**
+4. 点击 **拉取代码**
+5. 日志区域实时显示 svn checkout 输出
+
+---
+
+### 页面 2: 交叉覆盖 / Page 2: Cross Overwrite
+
+1. 选择 **SVN 拉取目录**（目标，被覆盖的目录）
+2. 选择 **整理好的目录**（来源，取文件的目录）——也可直接填**网络共享地址**（见下方「共享目录地址」）
+3. 点击 **扫描预览** 查看哪些文件会被覆盖
+4. 点击列表中的文件可切换勾选/取消
+5. 点击 **覆盖选中** 执行覆盖
+
+也可直接点击 **一键覆盖**：工具先扫描并展示全部匹配文件，确认后再统一覆盖。
+
+---
+
+### 页面 3: 全自动流程 / Page 3: Auto Pipeline
+
+1. 填写 **用户名/密码**（可选）
+2. 输入 **SVN 仓库地址**
+3. 选择 **SVN 拉取目录**
+4. 选择 **整理好的目录（来源）**——也可直接填**网络共享地址**（见下方「共享目录地址」）
+5. 选择拉取模式：checkout（首次）或 update（已有）
+6. 输入 **SVN 提交信息**
+7. 点击 **▶ 一键执行**，工具将自动完成：
+   ```
+   SVN 拉取 → 交叉文件覆盖 → SVN 提交
+   ```
+8. 日志区域实时显示每一步的输出和结果
+
+---
+
+### 页面 4: 升级清单提取 / Page 4: Upgrade List Extract
+
+从网页（如 QC 任务系统）复制的**带颜色升级清单**中，提取需要升级的文件并生成文档。清单中通常按 QC 分组，完整 SVN URL 或 `$/仓库/路径(V版本)` 用**红色**标记需打包、**黑色**标记仅作上下文参考。
+
+1. 在网页中复制带样式的升级清单（必须是富文本，不能是纯文本，否则丢失颜色）
+2. 点击 **从剪贴板提取** —— 工具读取剪贴板 HTML，解析出按 QC 分组的清单（每行 `[red]/[black] + 完整 SVN URL 或 $/... 路径`），显示在可编辑文本框中
+3. 如需可手工微调清单内容（改动会带入后续生成）
+4. 点击 **生成升级 Markdown** —— 生成人读的升级清单（按 QC 列出标题/模块/文件+版本+颜色标识）
+5. 点击 **生成 AI Markdown** —— 生成 AI 执行用清单（按文件类型分类：源码迁移、二进制/SQL/生成物跳过，含统计与去重信息）
+6. 用 **复制结果** / **另存为...** 导出生成的 Markdown
+
+> 颜色语义：**红色 = 需迁移升级**（AI Markdown 中 `action: migrate`）；**黑色 = 上下文，跳过**（`action: skip` / `upgrade_scope: context-only`）。
+>
+> 剪贴板颜色读取分平台：macOS 用 `pbpaste -Prefer html` / NSPasteboard；Windows 读 `CF_HTML` 剪贴板格式。若剪贴板只有纯文本，会因缺少颜色而无法区分红/黑。
+
+---
+
+### 页面 5: 版本号路径生成 / Page 5: Revision Path Generator
+
+用于按一个或多个 SVN 版本号查询变更文件，并生成带 `(V版本号)` 后缀的完整路径。
+
+1. 填写 SVN 仓库地址及可选的用户名/密码
+2. 输入单版本、多个版本或版本区间，如 `123`、`123,456`、`123 456`、`123-456`
+3. 选择按版本、路径或文件名排序
+4. 点击生成后复制结果；也可粘贴已有 `(Vxxx)` 路径执行本地排序
+
+---
+
+
+### 页面 6: 标准文件获取 / Page 6: Standard File Acquisition
+
+用于在版本升级或二开任务中，补全客户 SVN 中缺失的源码文件：按文件清单从 KB / 历史文件目录中定位文件，扫描预览后覆盖到已检出的客户 SVN 工作副本，确认后提交，并把提交文件 URL 一键复制到剪贴板。
+
+1. 填写**任务标题**，选择任务类型：**升级任务**（upgrade）或 **二开任务**（secondev）
+   - 升级任务：KB 文件路径（标准文件）→ 历史文件路径，按优先级查找来源
+   - 二开任务：仅查历史文件路径，KB 文件路径行自动隐藏
+2. 填写**客户 SVN 地址**、**目标 SVN 目录**（必须是已检出的客户 SVN 工作副本）；SVN 用户/密码留空时使用本机缓存认证
+3. 填写 **KB 文件路径**（升级任务必填）和**历史文件路径**，支持本地路径、`\\` UNC 与 `smb://` 共享地址（来源填 `smb://` 时需填写 SMB 账号/密码）
+4. 在**文件清单**中粘贴源码路径列表（每行一个），也可点击 **从剪贴板粘贴**：
+   - 相对路径：`src/com/api/.../DocAccService.java`
+   - SVN URL：`https://svn.example.com/svn/cust/ecology/src/...`（自动裁切为相对路径）
+   - 本地全路径：`D:\...\ecology\src\...`（自动裁切为相对 ecology 路径，并作为「提交后覆盖本地」的本地源）
+   - 自动剥除 `[red]` / `[black]` 颜色标记（含单独占一行的写法）与 `(Vxxx)` 版本号后缀；`#` / `//` 注释行、`QC` 开头的标题行和 `[black]` 上下文行自动跳过，可直接粘贴升级清单
+5. 按需勾选：**允许覆盖已存在的文件**（默认勾选，取消后目标已存在的文件跳过）、**覆盖成功后自动进入提交准备**（默认勾选）
+6. 点击 **扫描预览**，工具按优先级到各来源目录的 `ecology/` 子目录（及目录本身）查找，并显示四种命中状态：**待覆盖** / **内容相同**（来源与目标逐字节一致，无需覆盖）/ **跳过(目标已存在)**（未勾选允许覆盖）/ **未找到来源**
+7. 点击 **确认覆盖** 将文件复制到目标 SVN 目录（执行前确认覆盖数量）
+8. 点击 **提交 SVN 标准文件** 提交变更；提交信息自动生成为「任务标题 + 来源类型」（`标准文件` / `历史文件` / `标准文件/历史文件`）。提交成功后自动导出变更文件 URL（`{SVN地址}/{路径}(V{版本})`）到日志，并可通过 **复制提交文件路径** 一键复制
+9. 提交完成后，如果文件清单里贴的是本地全路径，可点击 **提交后覆盖本地**，用这些本地文件覆盖目标 SVN 工作副本中对应的已提交文件；该操作只覆盖、不会再次提交 SVN
+
+> 来源查找优先级（升级任务）：`{KB路径}/ecology/{rel_path}` → `{KB路径}/{rel_path}` → `{历史路径}/ecology/{rel_path}` → `{历史路径}/{rel_path}`；二开任务只查后两条。目录条目（非文件）自动过滤。
+>
+> SVN 提交采用 Windows 兼容模式：只对本次覆盖文件执行 `svn add --parents`，随后展示整个目标 SVN 工作副本的 `svn status` 并二次确认。未版本控制（`?`）文件不会自动加入，但目录中其他已修改、已登记新增或删除的文件会一并提交。
+>
+> 终端版对应 `standard` 子命令（主菜单项 6）：`--dry-run` 仅扫描预览、`--skip-existing` 跳过目标已存在文件、`--yes` 非交互确认覆盖、`--commit` 覆盖后提交、`--copy` 复制提交文件 URL。
+
+---
+## 共享目录地址 / Network Share
+
+「整理好的目录（来源）」除了本地路径，也可以直接填**网络共享地址**。工具会按操作系统自动处理，**两个平台都无需手动改写路径**：
+
+The "organized directory (source)" accepts a **network share address** in addition to a local path. The tool resolves it automatically per platform:
+
+| 平台 | 支持的写法 | 处理方式 |
+|------|-----------|---------|
+| **Windows** | `\\server\share\path` 或 `smb://server/share/path` | 转成 UNC 路径**直接访问，无需挂载、无需填 SMB 账号**（系统按需建立连接） |
+| **macOS** | `smb://server/share/path` 或 `\\server\share\path` | 自动挂载共享后访问；优先复用访达已连接的挂载（含深层挂载），临时挂载在退出时自动卸载 |
+
+- **直接粘贴原文**：来源框可直接粘贴带提示语的整段文本，例如 `标准文件请到\\192.168.7.215\...\ecology下面提取`，工具会自动剥除「标准文件请到」「下面提取」等前后缀。
+- **为什么有平台差异**：Windows 原生支持把 UNC 路径当本地路径访问；macOS 必须先把 SMB 共享挂载到文件系统才能用，`smb://` 本身只是 URL，不能当路径直接打开。
+- **macOS 认证（两种方式）**：
+  1. 在界面的 **SMB 账号 / 密码** 框填写凭据，工具用它挂载（凭据只存内存、不写入源码或安装包、日志不打印密码）；
+  2. 或先在访达按 `Cmd+K` 输入 `smb://...` 连接一次（勾选「记住密码」存入钥匙串），工具自动复用该挂载，SMB 账号框留空即可。
+- **深层挂载复用**：访达可把共享的深层子目录直接挂载（如挂到 `/Volumes/ecology`）；工具会比对挂载源的完整路径正确复用，并对中文路径做 Unicode/百分号编码归一化。
+- **Windows 无需填 SMB 账号**：UNC 直接访问，SMB 账号/密码框留空即可。
+- 本地路径（如 `/Users/...`、`C:\work\...`）按原有方式处理，行为不变。
+
+---
+
+## 构建 / Build from Source
+
+### 前置条件 / Prerequisites
+
+- **Python 3.10+**
+- **requirements.txt 中的打包依赖**（PyInstaller、PySide6-Essentials；`ttkbootstrap` 仅供旧版 GUI 回归）
+- **SVN CLI**（`svn` / `svn.exe` 需在 PATH 中；macOS 可用 Homebrew 安装：`brew install subversion`）
+
+### 打包命令 / Build Command
+
+**Windows**（单文件 exe）：
+
+```bat
+py -m pip install -r requirements.txt
+
+REM 可选：直接从源码启动现代界面
+py svn_sync_qt.py
+
+REM 使用 Qt 专用 spec 打包为单文件 exe（无控制台窗口）
+py -m PyInstaller --clean --noconfirm SVN_Sync_Tool.spec
+
+REM 产物在 dist\ 下，复制到 outputs\
+copy /Y dist\SVN_Sync_Tool.exe outputs\SVN_Sync_Tool.exe
+```
+
+**macOS**（应用包）：
+
+```bash
+python3 -m venv .venv-macos
+.venv-macos/bin/python -m pip install -r requirements.txt
+
+# 用 macOS 专用 spec 打包为 .app
+.venv-macos/bin/python -m PyInstaller --clean --noconfirm SVN_Sync_Tool_macos.spec
+
+# 压成 zip 后放入 outputs/（ditto 可保留可执行位与符号链接）
+rm -rf outputs/SVN_Sync_Tool.app && cp -R dist/SVN_Sync_Tool.app outputs/
+ditto -c -k --sequesterRsrc --keepParent outputs/SVN_Sync_Tool.app outputs/SVN_Sync_Tool.app.zip
+```
+
+也可以不打包，直接运行终端版或从源码启动图形界面：
+
+```bash
+python3 svn_sync_cli.py                    # 终端版
+.venv-macos/bin/python svn_sync_qt.py      # 图形界面
+```
+
+> 两份 spec 不可混用：`SVN_Sync_Tool.spec` 是 Windows 单文件 exe（binaries/datas 内联进 EXE、开启 UPX）；`SVN_Sync_Tool_macos.spec` 是 macOS 应用包（`COLLECT` + `BUNDLE`、关闭 UPX，因为 UPX 会破坏 Mach-O 结构）。新增运行时资源时两份都要加进 `datas`。
+
+> `build/`、`dist/` 均已在 `.gitignore` 中忽略；`outputs/*.app/` 也不入库，仓库只保留 `outputs/` 下的 `.exe` 与 `.app.zip` 成品。
+
+### 参数说明 / Arguments Explained
+
+| 参数 | 说明 |
+|------|------|
+| `--onefile` | 打包为单个文件（Windows exe 常用） |
+| `--windowed` | 不显示控制台窗口（GUI 程序专用） |
+| `--name "SVN_Sync_Tool"` | 指定输出文件名 |
+| `svn_sync_qt.py` | 现代 GUI 入口脚本 |
+
+---
+
+## 技术栈 / Tech Stack
+
+- **语言**: Python 3.10+
+- **Windows GUI**: PySide6-Essentials / Qt Widgets（Qt 6）
+- **旧 GUI 回归**: tkinter / ttkbootstrap
+- **本地 Web**: FastAPI / Uvicorn / Jinja2（独立 `requirements-web.txt`）
+- **SVN**: 通过 subprocess 调用系统 svn CLI
+- **共享核心**: `svn_sync_core.py`、`svn_sync_workflow.py`、`svn_standard_file_core.py`、`upgrade_list_core.py`
+- **打包**: PyInstaller（仅 Windows 持续更新 exe；macOS 直接运行 CLI）
+
+> Windows exe 会内嵌 Python 与 Qt GUI 依赖，普通用户无需安装 Python、PyInstaller 或 pip 依赖；运行 SVN 功能仍需系统已安装 SVN 命令行工具。macOS 推荐直接使用系统 Python 运行 CLI。
+
+---
+
+## 项目结构 / Project Structure
+
+```
+.
+├── .gitignore                          # Git 排除规则
+├── AGENTS.md                           # 项目 AI 协作与维护规则
+├── requirements.txt                    # 打包依赖
+├── requirements-web.txt                # 本地 Web 与接口测试依赖
+├── svn_sync_qt.py                      # 现代 Windows GUI 入口
+├── qt_app.py / qt_pages.py             # Qt 主窗口、六个功能页面
+├── qt_components.py / qt_theme.py      # Qt 通用组件与视觉主题
+├── svn_sync_tool.py                    # 旧 Tk GUI 兼容入口
+├── svn_sync_cli.py                     # macOS 终端入口（交互菜单 + 6 个子命令）
+├── svn_sync_core.py                    # GUI/CLI 共享的 SVN、SMB/UNC 与扫描核心
+├── svn_sync_workflow.py                # 拉取/覆盖/提交的无界面工作流编排
+├── svn_path_generator.py               # 版本号路径生成（Tab 5 / paths 子命令）
+├── svn_standard_file_core.py           # 标准文件扫描、覆盖与 SVN 提交业务层
+├── upgrade_list_core.py                # 富文本升级清单解析与 Markdown 生成
+├── clipboard_core.py                   # Windows/macOS HTML 剪贴板适配
+├── svn_sync_web.py                     # Web 启动入口（默认本机，可显式开放局域网）
+├── start-web.bat / stop-web.bat        # Windows 一键启动、关闭入口
+├── deploy/windows/                     # Windows 启停 PowerShell 实现与运行状态管理
+├── web_app.py / web_upgrade_service.py # Web API 与升级清单适配层
+├── web_svn_common.py                   # Web 端共用的 SVN 地址校验、凭据校验与隔离引擎
+├── web_standard_service.py             # Web 标准文件临时任务、凭据隔离与清理
+├── web_path_service.py                 # Web 版本号路径生成（只读查询与本地排序）
+├── web/                                # HTML 模板及本地 CSS/JavaScript
+├── SVN_Sync_Tool.spec                  # Windows 单文件 exe 的 PyInstaller 配置
+├── SVN_Sync_Tool_macos.spec            # macOS .app 应用包的 PyInstaller 配置
+├── qt_assets/                          # Qt 样式表引用的图标资源（下拉箭头等）
+├── tests/                              # 核心、安全门与职责边界回归测试
+├── outputs/                            # 预编译成品（纳入版本库）
+│   ├── SVN_Sync_Tool.exe               #   Windows 可执行文件
+│   └── SVN_Sync_Tool.app.zip           #   macOS 应用包（解压即用）
+├── README.assets/                      # README 截图
+└── README.md                           # 本文档
+```
+
+---
+
+## 注意事项 / Notes
+
+- 首次使用 SVN 功能时，如果未填写用户名/密码，会使用系统 SVN 缓存的认证信息
+- 覆盖操作不可撤销，建议先在页面 2 使用“扫描预览”查看变更
+- 如果 SVN 服务器使用自签名证书，工具已默认添加 --trust-server-cert-failures 参数信任常见证书问题
+- 来源目录支持直接填共享地址：Windows 用 `\\server\share`，macOS 用 `smb://server/share`，详见「共享目录地址」
+- macOS 上由工具临时挂载的共享会在关闭窗口时自动卸载；访达手动连接的挂载不会被卸载
+- 全自动流程提交成功后会列出本次提交文件的可访问 URL，可一键复制；提交解析使用 `svn info/log --xml`，不受中文（GBK/本地化）输出影响
+- 若本次运行无变更（不产生新提交），会回退导出工作副本当前版本的文件路径，方便随时复制
+- 源码打包环境要求 Python 3.10+；普通用户运行预编译产物无需安装 Python

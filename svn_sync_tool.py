@@ -1,0 +1,859 @@
+﻿# -*- coding: utf-8 -*-
+"""SVN 代码拉取 + 交叉文件覆盖 + 全自动提交 + 文件路径导出"""
+
+import os, sys, subprocess, threading, shutil, atexit
+import re
+from clipboard_core import read_clipboard_html_macos, read_clipboard_html_windows
+from upgrade_list_core import *  # 保留既有 rt_* 公共 API
+# GUI 依赖允许缺失：终端版（svn_sync_cli.py）只复用本模块的业务逻辑，不需要 tkinter/ttkbootstrap
+try:
+    import tkinter as tk
+    from tkinter import filedialog, scrolledtext, messagebox, font as tkfont
+    from ttkbootstrap import Style
+    from tkinter import ttk
+    GUI_AVAILABLE = True
+except ImportError:
+    tk = None
+    GUI_AVAILABLE = False
+import svn_path_generator
+from svn_sync_core import IS_MACOS, IS_WINDOWS, SyncEngine
+if GUI_AVAILABLE:
+    import svn_standard_file_tab
+try: import queue
+except: import Queue as queue
+
+# 升级清单纯逻辑已迁移到 upgrade_list_core.py；本模块继续导出原有 rt_* 名称。
+
+
+class SvnSyncTool(SyncEngine):
+    def __init__(self, root):
+        super().__init__()
+        self.root = root
+        self.root.title("SVN 代码同步工具")
+        self.root.geometry("920x820")
+        self.root.minsize(760, 660)
+        self._setup_styles()
+        self.svn_url = tk.StringVar()
+        self.svn_user = tk.StringVar()
+        self.svn_pass = tk.StringVar()
+        self.smb_user = tk.StringVar()  # 共享地址（SMB）账号，仅 macOS 挂载用，与 SVN 账号分开
+        self.smb_pass = tk.StringVar()
+        self.checkout_dir = tk.StringVar()
+        self.source_dir = tk.StringVar()
+        self.target_dir = tk.StringVar()
+        self.mode_var = tk.StringVar(value="checkout")
+        self.log_queue = queue.Queue()
+        self._commit_urls = []
+        self._temp_mounts = []  # 本工具在 macOS 上临时挂载的 SMB 挂载点，退出时清理
+        self._build_ui()
+        self._poll_log_queue()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        atexit.register(self._cleanup_temp_mounts)
+
+    def _setup_styles(self):
+        self.colors = {
+            "bg": "#f6f7f9",
+            "panel": "#ffffff",
+            "border": "#d7dce2",
+            "primary": "#2563eb",
+            "primary_hover": "#1d4ed8",
+            "primary_pressed": "#1e40af",
+            "text": "#1f2937",
+            "muted": "#6b7280",
+            "tab_bg": "#e9edf3",
+            "tab_selected": "#eff6ff",
+            "tab_hover": "#f1f5ff",
+            "log_bg": "#f8fafc",
+            "log_fg": "#334155",
+            "path_fg": "#166534",
+            "field": "#ffffff",
+            "field_disabled": "#f3f4f6",
+            "selection": "#dbeafe",
+        }
+
+        family = self._choose_font_family()
+        self.fonts = {
+            "body": (family, 10),
+            "small": (family, 9),
+            "hint": (family, 8),
+            "button": (family, 10, "bold"),
+            "tab": (family, 10, "bold"),
+            "mono": ("Menlo" if IS_MACOS else "Consolas", 10),
+            "mono_small": ("Menlo" if IS_MACOS else "Consolas", 9),
+        }
+
+        self.root.configure(bg=self.colors["bg"])
+        self.root.option_add("*Font", self.fonts["body"])
+
+        self.style = Style()
+        self.style.theme_use("flatly")
+
+        self.style.configure("TFrame", background=self.colors["panel"])
+        self.style.configure("App.TFrame", background=self.colors["bg"])
+        self.style.configure("Panel.TFrame", background=self.colors["panel"])
+        self.style.configure("TLabel", background=self.colors["panel"], foreground=self.colors["text"], font=self.fonts["body"])
+        self.style.configure("Muted.TLabel", background=self.colors["panel"], foreground=self.colors["muted"], font=self.fonts["small"])
+        self.style.configure("Hint.TLabel", background=self.colors["panel"], foreground=self.colors["muted"], font=self.fonts["hint"])
+        self.style.configure("Treeview", font=self.fonts["small"], rowheight=28, background=self.colors["panel"], fieldbackground=self.colors["panel"], foreground=self.colors["text"], bordercolor=self.colors["border"])
+        self.style.configure("Treeview.Heading", font=self.fonts["button"])
+        self.style.configure("Panel.TLabelframe", background=self.colors["panel"], borderwidth=1)
+        self.style.configure("Panel.TLabelframe.Label", background=self.colors["panel"], foreground=self.colors["text"], font=self.fonts["small"])
+        self.style.configure("TRadiobutton", background=self.colors["panel"], foreground=self.colors["text"], font=self.fonts["small"])
+
+    def _choose_font_family(self):
+        preferred = ["PingFang SC", "Microsoft YaHei", "Arial"]
+        try:
+            available = set(tkfont.families(self.root))
+        except Exception:
+            available = set()
+        for family in preferred:
+            if not available or family in available:
+                return family
+        return "Arial"
+
+    def _style_text(self, widget, kind="log"):
+        fg = self.colors["path_fg"] if kind == "path" else self.colors["log_fg"]
+        widget.configure(
+            font=self.fonts["mono_small"],
+            bg=self.colors["log_bg"],
+            fg=fg,
+            insertbackground=self.colors["text"],
+            selectbackground="#dbeafe",
+            selectforeground=self.colors["text"],
+            relief=tk.FLAT,
+            borderwidth=0,
+            highlightthickness=1,
+            highlightbackground=self.colors["border"],
+            highlightcolor=self.colors["border"],
+            padx=10,
+            pady=8,
+        )
+
+    def _build_ui(self):
+        shell = ttk.Frame(self.root, style="App.TFrame", padding=(12, 12, 12, 10))
+        shell.pack(fill=tk.BOTH, expand=True)
+        nb = ttk.Notebook(shell, takefocus=False)
+        nb.pack(fill=tk.BOTH, expand=True)
+        t1 = ttk.Frame(nb, padding=18, style="Panel.TFrame")
+        nb.add(t1, text="  1. SVN 拉取  ")
+        self._build_tab1(t1)
+        t2 = ttk.Frame(nb, padding=18, style="Panel.TFrame")
+        nb.add(t2, text="  2. 交叉覆盖  ")
+        self._build_tab2(t2)
+        t3 = ttk.Frame(nb, padding=18, style="Panel.TFrame")
+        nb.add(t3, text="  3. 全自动流程  ")
+        self._build_tab3(t3)
+        t4 = ttk.Frame(nb, padding=18, style="Panel.TFrame")
+        nb.add(t4, text="  4. 升级清单提取  ")
+        self._build_tab4(t4)
+
+        t5 = ttk.Frame(nb, padding=18, style="Panel.TFrame")
+        nb.add(t5, text="  5. 版本号路径生成  ")
+        self._build_tab5(t5)
+        t6 = ttk.Frame(nb, padding=18, style="Panel.TFrame")
+        nb.add(t6, text="  6. 标准文件获取  ")
+        self._build_tab6(t6)
+    def _build_tab1(self, t1):
+        row = 0
+        ttk.Label(t1, text="SVN 仓库地址：").grid(row=row, column=0, sticky=tk.W, pady=(0, 6)); row+=1
+        ttk.Entry(t1, textvariable=self.svn_url).grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(0, 10)); row+=1
+        af = ttk.Frame(t1)
+        af.grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(0, 10))
+        ttk.Label(af, text="用户名：", style="Muted.TLabel").pack(side=tk.LEFT)
+        ttk.Entry(af, textvariable=self.svn_user, width=18).pack(side=tk.LEFT, padx=(0, 14))
+        ttk.Label(af, text="密码：", style="Muted.TLabel").pack(side=tk.LEFT)
+        ttk.Entry(af, textvariable=self.svn_pass, width=18, show="*").pack(side=tk.LEFT, padx=(0, 0))
+        ttk.Label(af, text="（留空使用缓存）", style="Hint.TLabel").pack(side=tk.LEFT, padx=(8, 0))
+        row += 1
+        ttk.Label(t1, text="拉取到目录：").grid(row=row, column=0, sticky=tk.W, pady=(0, 6)); row+=1
+        frm = ttk.Frame(t1)
+        frm.grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(0, 14))
+        ttk.Entry(frm, textvariable=self.checkout_dir).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(frm, text="浏览...", command=self._browse_checkout).pack(side=tk.RIGHT, padx=(6, 0))
+        row+=1
+        self.btn_co = ttk.Button(t1, text="拉取代码", command=self._start_checkout)
+        self.btn_co.grid(row=row, column=0, columnspan=3, pady=(0, 14)); row+=1
+        ttk.Label(t1, text="执行日志：", style="Muted.TLabel").grid(row=row, column=0, sticky=tk.W, pady=(0, 6)); row+=1
+        self.log_co = scrolledtext.ScrolledText(t1, height=14)
+        self._style_text(self.log_co)
+        self.log_co.grid(row=row, column=0, columnspan=3, sticky=tk.NSEW); row+=1
+        t1.columnconfigure(1, weight=1)
+        t1.rowconfigure(row, weight=1)
+
+    def _build_tab2(self, t2):
+        row = 0
+        ttk.Label(t2, text="SVN 拉取目录（目标，被覆盖）：").grid(row=row, column=0, sticky=tk.W, pady=(0, 6)); row+=1
+        f2 = ttk.Frame(t2)
+        f2.grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(0, 10))
+        ttk.Entry(f2, textvariable=self.target_dir).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(f2, text="浏览...", command=self._browse_target).pack(side=tk.RIGHT, padx=(6, 0))
+        row+=1
+        ttk.Label(t2, text="整理好的目录（来源，取文件）：").grid(row=row, column=0, sticky=tk.W, pady=(0, 6)); row+=1
+        f1 = ttk.Frame(t2)
+        f1.grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(0, 10))
+        ttk.Entry(f1, textvariable=self.source_dir).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(f1, text="浏览...", command=self._browse_source).pack(side=tk.RIGHT, padx=(6, 0))
+        row+=1
+        sf2 = ttk.Frame(t2)
+        sf2.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 12))
+        ttk.Label(sf2, text="SMB 账号：", style="Muted.TLabel").pack(side=tk.LEFT)
+        ttk.Entry(sf2, textvariable=self.smb_user, width=16).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(sf2, text="密码：", style="Muted.TLabel").pack(side=tk.LEFT)
+        ttk.Entry(sf2, textvariable=self.smb_pass, width=16, show="*").pack(side=tk.LEFT)
+        ttk.Label(sf2, text="（仅来源填 smb:// 共享时需要；本地目录/Windows 可留空）", style="Hint.TLabel").pack(side=tk.LEFT, padx=(8, 0))
+        row+=1
+        bf = ttk.Frame(t2)
+        bf.grid(row=row, column=0, columnspan=3, pady=(0, 14))
+        self.btn_scan = ttk.Button(bf, text="扫描预览", command=self._start_scan)
+        self.btn_scan.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_quick = ttk.Button(bf, text="一键覆盖（推荐）", command=self._start_quick_overwrite)
+        self.btn_quick.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_ow = ttk.Button(bf, text="覆盖选中", command=self._start_overwrite, state=tk.DISABLED)
+        self.btn_ow.pack(side=tk.LEFT)
+        ttk.Button(bf, text="清空结果", command=self._clear_results).pack(side=tk.LEFT, padx=(8, 0))
+        row+=1
+        ttk.Label(t2, text="文件列表（点击切换勾选）：", style="Muted.TLabel").grid(row=row, column=0, sticky=tk.W, pady=(0, 6)); row+=1
+        lf = ttk.Frame(t2)
+        lf.grid(row=row, column=0, columnspan=3, sticky=tk.NSEW); row+=1
+        self.tree = ttk.Treeview(lf, columns=("src", "tgt"), show="tree headings", height=8)
+        self.tree.heading("#0", text="文件名")
+        self.tree.heading("src", text="来源路径")
+        self.tree.heading("tgt", text="目标路径")
+        self.tree.column("#0", width=260, minwidth=180)
+        self.tree.column("src", width=240, minwidth=160)
+        self.tree.column("tgt", width=240, minwidth=160)
+        vsb = ttk.Scrollbar(lf, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.lbl_st = ttk.Label(t2, text="就绪", style="Muted.TLabel")
+        self.lbl_st.grid(row=row, column=0, sticky=tk.W, pady=(8, 0))
+        self.lbl_cnt = ttk.Label(t2, text="共 0 个文件", style="Muted.TLabel")
+        self.lbl_cnt.grid(row=row, column=2, sticky=tk.E, pady=(8, 0))
+        t2.columnconfigure(1, weight=1)
+        t2.rowconfigure(row, weight=1)
+        self.tree.bind("<<TreeviewSelect>>", self._on_click)
+        self._xf = []
+        self._ck = set()
+
+    def _build_tab3(self, t3):
+        row = 0
+        af = ttk.Frame(t3)
+        af.grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(0, 12))
+        ttk.Label(af, text="用户名：", style="Muted.TLabel").pack(side=tk.LEFT)
+        ttk.Entry(af, textvariable=self.svn_user, width=16).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(af, text="密码：", style="Muted.TLabel").pack(side=tk.LEFT)
+        ttk.Entry(af, textvariable=self.svn_pass, width=16, show="*").pack(side=tk.LEFT, padx=(0, 0))
+        ttk.Label(af, text="（留空使用缓存）", style="Hint.TLabel").pack(side=tk.LEFT, padx=(8, 0))
+        row += 1
+        ttk.Label(t3, text="SVN 仓库地址：").grid(row=row, column=0, sticky=tk.W, pady=(0, 6)); row+=1
+        ttk.Entry(t3, textvariable=self.svn_url).grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(0, 10)); row+=1
+        ttk.Label(t3, text="SVN 拉取目录：").grid(row=row, column=0, sticky=tk.W, pady=(0, 6)); row+=1
+        f_a = ttk.Frame(t3)
+        f_a.grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(0, 10))
+        ttk.Entry(f_a, textvariable=self.checkout_dir).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(f_a, text="浏览...", command=self._browse_checkout).pack(side=tk.RIGHT, padx=(6, 0))
+        row+=1
+        ttk.Label(t3, text="整理好的目录（来源取文件）：").grid(row=row, column=0, sticky=tk.W, pady=(0, 6)); row+=1
+        f_b = ttk.Frame(t3)
+        f_b.grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(0, 12))
+        ttk.Entry(f_b, textvariable=self.source_dir).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(f_b, text="浏览...", command=self._browse_source).pack(side=tk.RIGHT, padx=(6, 0))
+        row+=1
+        sf3 = ttk.Frame(t3)
+        sf3.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 10))
+        ttk.Label(sf3, text="SMB 账号：", style="Muted.TLabel").pack(side=tk.LEFT)
+        ttk.Entry(sf3, textvariable=self.smb_user, width=16).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(sf3, text="密码：", style="Muted.TLabel").pack(side=tk.LEFT)
+        ttk.Entry(sf3, textvariable=self.smb_pass, width=16, show="*").pack(side=tk.LEFT)
+        ttk.Label(sf3, text="（仅来源填 smb:// 共享时需要；本地目录/Windows 可留空）", style="Hint.TLabel").pack(side=tk.LEFT, padx=(8, 0))
+        row+=1
+        mode_f = ttk.Frame(t3)
+        mode_f.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 10))
+        ttk.Label(mode_f, text="拉取模式：", style="Muted.TLabel").pack(side=tk.LEFT)
+        ttk.Radiobutton(mode_f, text="checkout（首次拉取）", variable=self.mode_var, value="checkout").pack(side=tk.LEFT, padx=(6, 12))
+        ttk.Radiobutton(mode_f, text="update（已有则更新）", variable=self.mode_var, value="update").pack(side=tk.LEFT, padx=(0, 6))
+        row += 1
+        ttk.Label(t3, text="SVN 提交信息：").grid(row=row, column=0, sticky=tk.W, pady=(0, 6)); row+=1
+        self.auto_msg = scrolledtext.ScrolledText(t3, height=3, wrap=tk.WORD)
+        self.auto_msg.configure(font=self.fonts["body"], bg=self.colors["field"], fg=self.colors["text"], insertbackground=self.colors["text"], relief=tk.FLAT, borderwidth=0, highlightthickness=1, highlightbackground=self.colors["border"], highlightcolor=self.colors["primary"], padx=8, pady=6)
+        self.auto_msg.grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(0, 12))
+        self.auto_msg.insert(tk.END, "自动同步代码")
+        row += 1
+        self.btn_auto = ttk.Button(t3, text="一键执行：拉取 -> 覆盖 -> 提交", command=self._start_auto_pipeline)
+        self.btn_auto.grid(row=row, column=0, columnspan=3, pady=(0, 14), ipady=4)
+        row += 1
+        ttk.Label(t3, text="执行日志：", style="Muted.TLabel").grid(row=row, column=0, sticky=tk.W, pady=(0, 6)); row+=1
+        self.log_auto = scrolledtext.ScrolledText(t3, height=10)
+        self._style_text(self.log_auto)
+        self.log_auto.grid(row=row, column=0, columnspan=3, sticky=tk.NSEW); row+=1
+        row += 1
+
+        # 文件路径导出区域
+        self.path_frame = ttk.Labelframe(t3, text=" 提交文件路径 ", style="Panel.TLabelframe")
+        self.path_frame.grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(10, 2))
+        pf_row = 0
+        btn_copy_frame = ttk.Frame(self.path_frame)
+        btn_copy_frame.grid(row=pf_row, column=0, sticky=tk.W, pady=(2, 6))
+        self.btn_copy_paths = ttk.Button(btn_copy_frame, text="复制文件路径", command=self._copy_commit_paths, state=tk.DISABLED)
+        self.btn_copy_paths.pack(side=tk.LEFT, padx=(0, 10))
+        self.lbl_paths_count = ttk.Label(btn_copy_frame, text="（暂无）", style="Muted.TLabel")
+        self.lbl_paths_count.pack(side=tk.LEFT)
+        pf_row += 1
+        self.txt_paths = scrolledtext.ScrolledText(self.path_frame, height=4, state=tk.DISABLED)
+        self._style_text(self.txt_paths, kind="path")
+        self.txt_paths.grid(row=pf_row, column=0, sticky=tk.EW, pady=(2, 2))
+        self.path_frame.columnconfigure(0, weight=1)
+        row += 1
+
+        t3.columnconfigure(1, weight=1)
+        t3.rowconfigure(row - 2, weight=1)
+
+    def _build_tab4(self, t4):
+        row = 0
+        ttk.Label(t4, text="从复制的带颜色升级清单提取，生成清单与升级 Markdown", style="Muted.TLabel").grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 10)); row += 1
+        bf = ttk.Frame(t4)
+        bf.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 10))
+        ttk.Button(bf, text="从剪贴板提取", command=self._rt_extract).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(bf, text="清空", command=self._rt_clear).pack(side=tk.LEFT)
+        row += 1
+        ttk.Label(t4, text="提取清单（可编辑，按 QC 分组，[red]/[black] + SVN URL）：", style="Muted.TLabel").grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 6)); row += 1
+        self.rt_list = scrolledtext.ScrolledText(t4, height=12, wrap=tk.NONE)
+        self._style_text(self.rt_list)
+        self.rt_list.grid(row=row, column=0, columnspan=3, sticky=tk.NSEW); row += 1
+        gen_f = ttk.Frame(t4)
+        gen_f.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(10, 10))
+        ttk.Button(gen_f, text="复制清单", command=self._rt_copy_list).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(gen_f, text="生成升级 Markdown", command=self._rt_gen_human).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(gen_f, text="生成 AI Markdown", command=self._rt_gen_ai).pack(side=tk.LEFT)
+        row += 1
+        res_f = ttk.Frame(t4)
+        res_f.grid(row=row, column=0, columnspan=3, sticky=tk.EW)
+        ttk.Label(res_f, text="生成结果：", style="Muted.TLabel").pack(side=tk.LEFT)
+        ttk.Button(res_f, text="另存为...", command=self._rt_save_result).pack(side=tk.RIGHT)
+        ttk.Button(res_f, text="复制结果", command=self._rt_copy_result).pack(side=tk.RIGHT, padx=(0, 8))
+        row += 1
+        self.rt_result = scrolledtext.ScrolledText(t4, height=10, wrap=tk.NONE)
+        self._style_text(self.rt_result, kind="path")
+        self.rt_result.grid(row=row, column=0, columnspan=3, sticky=tk.NSEW); row += 1
+        self.rt_status = ttk.Label(t4, text="就绪", style="Muted.TLabel")
+        self.rt_status.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(8, 0)); row += 1
+        self._rt_result_default_name = "upgrade-file-list.md"
+        t4.columnconfigure(1, weight=1)
+        t4.rowconfigure(3, weight=3)
+        t4.rowconfigure(7, weight=2)
+
+    # ---- tab4 剪贴板读取（分平台）----
+    def _read_clipboard_content(self):
+        """读取剪贴板内容，返回 (text, kind)。kind 为 'html' 或 'text'（纯文本兜底）。"""
+        if IS_WINDOWS:
+            html = read_clipboard_html_windows()
+            if html and html.strip():
+                return html, "html"
+        elif IS_MACOS:
+            html = read_clipboard_html_macos()
+            if html and html.strip():
+                return html, "html"
+        # 兜底：纯文本（无颜色信息，红/黑会全部判为黑）
+        try:
+            text = self.root.clipboard_get()
+        except Exception:
+            text = ""
+        return text, "text"
+
+    # ---- tab4 动作 ----
+    def _rt_set_list(self, text):
+        self.rt_list.delete(1.0, tk.END)
+        self.rt_list.insert(tk.END, text)
+
+    def _rt_set_result(self, text):
+        self.rt_result.delete(1.0, tk.END)
+        self.rt_result.insert(tk.END, text)
+
+    def _rt_extract(self):
+        self.rt_status.config(text="正在读取剪贴板...")
+
+        def run():
+            try:
+                content_text, kind = self._read_clipboard_content()
+                if not content_text or not content_text.strip():
+                    self.root.after(0, lambda: self.rt_status.config(text="剪贴板没有内容，请先从网页复制带颜色的升级清单"))
+                    return
+                lines = rt_extract_list_from_html(content_text)
+                file_lines = [l for l in lines if l.startswith(RT_COLOR_PREFIXES)]
+                if not file_lines:
+                    if kind == "text":
+                        msg = "剪贴板只有纯文本（拿不到颜色）：请从浏览器/富文本复制带样式的升级清单；若已是富文本仍失败，可截图反馈"
+                    else:
+                        msg = "未识别到 SVN 文件行：请确认清单里包含形如 https://.../svn/客户/路径(V版本) 的 URL"
+                    self.root.after(0, lambda: self.rt_status.config(text=msg))
+                    return
+                content = "\n".join(lines)
+                qc_count = sum(1 for l in lines if l.startswith("QC"))
+                degraded = "（纯文本，红/黑均按黑处理）" if kind == "text" else ""
+                self.root.after(0, lambda: (self._rt_set_list(content),
+                                            self.rt_status.config(text="提取完成：%d 个 QC，%d 个文件行%s" % (qc_count, len(file_lines), degraded))))
+            except Exception as e:
+                self.root.after(0, lambda: self.rt_status.config(text="提取失败: " + str(e)))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _rt_clear(self):
+        self._rt_set_list("")
+        self._rt_set_result("")
+        self.rt_status.config(text="就绪")
+
+    def _rt_copy_list(self):
+        text = self.rt_list.get(1.0, tk.END).strip()
+        if not text:
+            self.rt_status.config(text="清单为空，无可复制内容")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.rt_status.config(text="清单已复制到剪贴板")
+
+    def _rt_gen_human(self):
+        text = self.rt_list.get(1.0, tk.END).strip()
+        if not text:
+            self.rt_status.config(text="请先提取或填写清单")
+            return
+        try:
+            entries, customer, _raw = rt_parse_txt(text)
+            md = rt_build_human_md(entries)
+        except Exception as e:
+            self.rt_status.config(text="生成升级 Markdown 失败: " + str(e))
+            return
+        self._rt_set_result(md)
+        self._rt_result_default_name = "upgrade-file-list.md"
+        self.rt_status.config(text="已生成升级 Markdown（客户: %s，%d 个 QC）" % (customer, len(entries)))
+
+    def _rt_gen_ai(self):
+        text = self.rt_list.get(1.0, tk.END).strip()
+        if not text:
+            self.rt_status.config(text="请先提取或填写清单")
+            return
+        try:
+            entries, customer, raw = rt_parse_txt(text)
+            md = rt_build_ai_md(entries, customer, raw)
+        except Exception as e:
+            self.rt_status.config(text="生成 AI Markdown 失败: " + str(e))
+            return
+        self._rt_set_result(md)
+        self._rt_result_default_name = "upgrade-file-list-ai.md"
+        self.rt_status.config(text="已生成 AI Markdown（客户: %s，%d 个 QC）" % (customer, len(entries)))
+
+    def _rt_copy_result(self):
+        text = self.rt_result.get(1.0, tk.END).strip()
+        if not text:
+            self.rt_status.config(text="结果为空，无可复制内容")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.rt_status.config(text="结果已复制到剪贴板")
+
+    def _rt_save_result(self):
+        text = self.rt_result.get(1.0, tk.END).strip()
+        if not text:
+            self.rt_status.config(text="结果为空，无可保存内容")
+            return
+        init_dir = self.checkout_dir.get().strip() or os.path.expanduser("~/Desktop")
+        path = filedialog.asksaveasfilename(
+            title="保存 Markdown",
+            initialdir=init_dir if os.path.isdir(init_dir) else os.path.expanduser("~"),
+            initialfile=getattr(self, "_rt_result_default_name", "upgrade-file-list.md"),
+            defaultextension=".md",
+            filetypes=[("Markdown", "*.md"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text + ("\n" if not text.endswith("\n") else ""))
+            self.rt_status.config(text="已保存: " + path)
+        except OSError as e:
+            self.rt_status.config(text="保存失败: " + str(e))
+
+    def _browse_checkout(self):
+        d = filedialog.askdirectory(title="选择 SVN 拉取目标目录")
+        if d: self.checkout_dir.set(d)
+    def _browse_source(self):
+        d = filedialog.askdirectory(title="选择整理好的目录（来源）")
+        if d: self.source_dir.set(d)
+    def _browse_target(self):
+        d = filedialog.askdirectory(title="选择 SVN 拉取目录（目标）")
+        if d: self.target_dir.set(d)
+
+    def _log(self, w, m):
+        if w is None:
+            return
+        self.log_queue.put((w, m))
+
+    def _poll_log_queue(self):
+        try:
+            while True:
+                w, m = self.log_queue.get_nowait()
+                w.insert(tk.END, m); w.see(tk.END)
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_log_queue)
+
+    def _start_checkout(self):
+        url = self.svn_url.get().strip()
+        if not url: messagebox.showwarning("提示", "请先输入 SVN 仓库地址"); return
+        dst = self.checkout_dir.get().strip()
+        if not dst: messagebox.showwarning("提示", "请选择拉取目录"); return
+        self.btn_co.config(state=tk.DISABLED, text="正在拉取...")
+        self.log_co.delete(1.0, tk.END)
+
+        def run():
+            try:
+                rc, _ = self._run_svn(self.log_co, "checkout", url, dst)
+                if rc == 0:
+                    self._log(self.log_co, "\n--- 拉取完成 ---\n")
+                    self.root.after(0, lambda: self.target_dir.set(dst))
+                else:
+                    self._log(self.log_co, "\n--- 拉取失败，返回码: " + str(rc) + " ---\n")
+            except Exception as e:
+                self._log(self.log_co, "\n--- 错误: " + str(e) + " ---\n")
+            finally:
+                self.root.after(0, lambda: self.btn_co.config(state=tk.NORMAL, text="拉取代码"))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_close(self):
+        self._cleanup_temp_mounts()
+        self.root.destroy()
+
+    def _start_scan(self):
+        src = self.source_dir.get().strip()
+        tgt = self.target_dir.get().strip()
+        if not src or not tgt: messagebox.showwarning("提示", "请先选择来源目录和目标目录"); return
+        err = self._precheck_source(src)
+        if err: messagebox.showerror("错误", err); return
+        if not os.path.isdir(tgt): messagebox.showerror("错误", "目标目录不存在: " + tgt); return
+        self._clear_results()
+        self.btn_scan.config(state=tk.DISABLED, text="扫描中...")
+        self.lbl_st.config(text="正在扫描...")
+
+        def run():
+            try:
+                rsrc = self._resolve_source_path(src)
+            except Exception as e:
+                self.root.after(0, lambda: (self.lbl_st.config(text="挂载失败: " + str(e)),
+                                            self.btn_scan.config(state=tk.NORMAL, text="扫描预览")))
+                return
+            if not os.path.isdir(rsrc):
+                self.root.after(0, lambda: (self.lbl_st.config(text="来源目录不存在: " + rsrc),
+                                            self.btn_scan.config(state=tk.NORMAL, text="扫描预览")))
+                return
+            res = self._scan_cross_files(tgt, rsrc)
+            self.root.after(0, lambda: self._show_scan(res))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _show_scan(self, res):
+        self._xf = res; self._ck.clear()
+        self.tree.delete(*self.tree.get_children())
+        if not res:
+            self.lbl_st.config(text="未发现交叉文件"); self.lbl_cnt.config(text="共 0 个文件")
+            self.btn_ow.config(state=tk.DISABLED); self.btn_scan.config(state=tk.NORMAL, text="扫描预览")
+            return
+        for i, (r, sa, ta) in enumerate(res):
+            iid = "i" + str(i)
+            self.tree.insert("", tk.END, iid=iid, text=r, values=(sa, ta))
+            self._ck.add(iid)
+        self.lbl_st.config(text="扫描完成 - 点击条目切换勾选")
+        self.lbl_cnt.config(text="共 " + str(len(res)) + " 个文件 (全部默认勾选)")
+        self.btn_ow.config(state=tk.NORMAL)
+        self.btn_scan.config(state=tk.NORMAL, text="扫描预览")
+
+    def _on_click(self, evt):
+        for iid in self.tree.selection():
+            if iid in self._ck: self._ck.discard(iid)
+            else: self._ck.add(iid)
+        self.tree.selection_remove(*self.tree.selection())
+        self.lbl_cnt.config(text="已选 " + str(len(self._ck)) + " / " + str(len(self._xf)) + " 个")
+
+    def _start_quick_overwrite(self):
+        src = self.source_dir.get().strip()
+        tgt = self.target_dir.get().strip()
+        if not src or not tgt: messagebox.showwarning("提示", "请先选择来源目录和目标目录"); return
+        err = self._precheck_source(src)
+        if err: messagebox.showerror("错误", err); return
+        if not os.path.isdir(tgt): messagebox.showerror("错误", "目标目录不存在: " + tgt); return
+        self._clear_results()
+        self.btn_quick.config(state=tk.DISABLED, text="正在扫描...")
+        self.lbl_st.config(text="正在扫描待覆盖文件...")
+
+        def run():
+            try:
+                rsrc = self._resolve_source_path(src)
+                if not os.path.isdir(rsrc):
+                    self.root.after(0, lambda: self._quick_done(0, 0, "来源目录不存在: " + rsrc))
+                    return
+                res = self._scan_cross_files(tgt, rsrc)
+                if not res:
+                    self.root.after(0, lambda: self._quick_done(0, 0, "未找到匹配的交叉文件"))
+                    return
+                self.root.after(0, lambda: self._confirm_quick_overwrite(res))
+            except Exception as e:
+                self.root.after(0, lambda: self._quick_done(0, 0, "错误: " + str(e)))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _confirm_quick_overwrite(self, entries):
+        self._show_scan(entries)
+        if not messagebox.askyesno(
+                "确认一键覆盖",
+                "扫描到 %d 个交叉文件，确定全部覆盖？\n此操作会修改目标工作副本。" % len(entries)):
+            self.lbl_st.config(text="已取消一键覆盖；扫描结果已保留")
+            self.btn_quick.config(state=tk.NORMAL, text="一键覆盖（推荐）")
+            return
+        self.btn_quick.config(state=tk.DISABLED, text="正在覆盖...")
+        self.lbl_st.config(text="正在覆盖全部扫描文件...")
+
+        def run():
+            copied, errors = self._copy_cross_files(entries)
+            self.root.after(0, lambda: self._quick_done(len(copied), len(errors), ""))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _quick_done(self, ok, fail, err):
+        if err:
+            self.lbl_st.config(text=err); self.lbl_cnt.config(text="")
+        else:
+            msg = "覆盖完成! 成功 " + str(ok) + " 个"
+            if fail: msg += ", 失败 " + str(fail) + " 个"
+            self.lbl_st.config(text=msg); self.lbl_cnt.config(text="")
+        self.btn_quick.config(state=tk.NORMAL, text="一键覆盖（推荐）")
+
+    def _start_overwrite(self):
+        if not self._ck: messagebox.showinfo("提示", "请勾选要覆盖的文件"); return
+        if not messagebox.askyesno("确认", "确定覆盖 " + str(len(self._ck)) + " 个文件？\n此操作不可撤销！"): return
+        self.btn_ow.config(state=tk.DISABLED, text="覆盖中...")
+        self.lbl_st.config(text="正在覆盖...")
+
+        def run():
+            entries = [entry for index, entry in enumerate(self._xf)
+                       if ("i" + str(index)) in self._ck]
+            copied, errors = self._copy_cross_files(entries)
+            self.root.after(0, lambda: self._done(len(copied), len(errors)))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _done(self, ok, fail):
+        msg = "覆盖完成! 成功 " + str(ok) + " 个"
+        if fail: msg += ", 失败 " + str(fail) + " 个"
+        self.lbl_st.config(text=msg); self.lbl_cnt.config(text="")
+        self.btn_ow.config(state=tk.NORMAL, text="覆盖选中")
+        messagebox.showinfo("完成", msg)
+
+    def _clear_results(self):
+        self._xf = []; self._ck.clear()
+        self.tree.delete(*self.tree.get_children())
+        self.lbl_st.config(text="就绪"); self.lbl_cnt.config(text="共 0 个文件")
+        self.btn_ow.config(state=tk.DISABLED)
+
+    # ═══════════════ 全自动流程 + 文件路径导出 ═══════════════
+    def _start_auto_pipeline(self):
+        url = self.svn_url.get().strip()
+        dst = self.checkout_dir.get().strip()
+        src = self.source_dir.get().strip()
+        mode = self.mode_var.get()
+
+        if not url: messagebox.showwarning("提示", "请先输入 SVN 仓库地址"); return
+        if not dst: messagebox.showwarning("提示", "请选择 SVN 拉取目录"); return
+        if not src: messagebox.showwarning("提示", "请选择整理好的目录"); return
+        err = self._precheck_source(src)
+        if err: messagebox.showerror("错误", err); return
+
+        msg = self.auto_msg.get(1.0, tk.END).strip()
+        if not msg: messagebox.showwarning("提示", "请输入提交信息"); return
+
+        summary = (
+            "即将执行：SVN %s → 交叉覆盖 → SVN 提交\n\n"
+            "SVN 地址：%s\n拉取目录：%s\n来源目录：%s\n提交信息：%s\n\n"
+            "确认执行完整流程？" % (mode, url, dst, src, msg)
+        )
+        if not messagebox.askyesno("确认全自动流程", summary):
+            return
+        dst_exists = os.path.isdir(dst) and os.path.isdir(os.path.join(dst, ".svn"))
+        if dst_exists and mode == "checkout" and not messagebox.askyesno(
+                "确认删除已有工作副本",
+                "checkout 模式将先删除已有工作副本，再重新拉取：\n%s\n\n确定继续？" % dst):
+            return
+
+        self.btn_auto.config(state=tk.DISABLED, text="正在执行...")
+        self.log_auto.delete(1.0, tk.END)
+        self._clear_paths_display()
+
+        def run():
+            log = self.log_auto
+            overall_ok = True
+            try:
+                # Step 1
+                self._log(log, "【步骤 1/3】SVN 拉取\n")
+                self._log(log, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+                if dst_exists and mode == "update":
+                    self._log(log, "目录已存在，执行 svn update...\n")
+                    rc, _ = self._run_svn(log, "update", dst)
+                else:
+                    if dst_exists:
+                        self._log(log, "目录已存在但选择 checkout 模式，先删除再拉取...\n")
+                        shutil.rmtree(dst, ignore_errors=True)
+                    rc, _ = self._run_svn(log, "checkout", url, dst)
+                if rc != 0:
+                    self._log(log, "\n--- 步骤 1 失败，终止流程 ---\n")
+                    overall_ok = False
+                    return
+                self.root.after(0, lambda: self.target_dir.set(dst))
+                self._log(log, "\n--- 步骤 1 完成 ---\n\n")
+
+                # Step 2
+                self._log(log, "【步骤 2/3】交叉文件覆盖\n")
+                self._log(log, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+                try:
+                    rsrc = self._resolve_source_path(src, log)
+                except Exception as e:
+                    self._log(log, "来源共享挂载失败: " + str(e) + "\n--- 步骤 2 失败，终止流程 ---\n")
+                    overall_ok = False
+                    return
+                if not os.path.isdir(rsrc):
+                    self._log(log, "来源目录不存在: " + rsrc + "\n--- 步骤 2 失败，终止流程 ---\n")
+                    overall_ok = False
+                    return
+                res = self._scan_cross_files(dst, rsrc)
+                if not res:
+                    self._log(log, "未找到交叉文件，跳过覆盖\n\n")
+                else:
+                    def report(relative, success, error):
+                        message = "  [覆盖] " + relative if success else "  [失败] %s - %s" % (relative, error)
+                        self._log(log, message + "\n")
+
+                    copied, errors = self._copy_cross_files(res, on_result=report)
+                    self._log(log, "覆盖结果: 成功 " + str(len(copied)) + " 个")
+                    if errors: self._log(log, ", 失败 " + str(len(errors)) + " 个")
+                    self._log(log, "\n\n--- 步骤 2 完成 ---\n\n")
+                    if errors:
+                        self._log(log, "检测到覆盖失败，为避免提交不完整变更，终止流程。\n")
+                        overall_ok = False
+                        return
+
+                # Step 3
+                self._log(log, "【步骤 3/3】SVN 提交\n")
+                self._log(log, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+                if not self._unlock_svn_locks_before_commit(log, dst):
+                    self._log(log, "\n--- 提交前解锁失败，终止流程 ---\n")
+                    overall_ok = False
+                    return
+                self._log(log, "检查变更状态...\n")
+                _, status_out = self._run_svn(log, "status", dst)
+                changed = [l for l in status_out.split("\n") if l.strip() and ".svn" not in l]
+                if not changed:
+                    self._log(log, "无变更需要提交\n")
+                    # 即使本次无新增提交，也导出工作副本当前版本的文件路径，方便随时复制
+                    last_rev = self._get_wc_last_revision(dst)
+                    if last_rev:
+                        self._log(log, "（无新增提交，导出当前版本 %s 的文件路径）\n" % last_rev)
+                        self.root.after(0, lambda r=last_rev: self._load_and_show_commit_paths(r))
+                else:
+                    self._log(log, "共 " + str(len(changed)) + " 个文件有变更，正在提交...\n")
+                    rc, commit_out = self._run_svn(log, "commit", dst, "-m", msg)
+                    if rc == 0:
+                        self._log(log, "\n--- 提交成功！---\n")
+                        rev = self._parse_revision(commit_out)
+                        if rev:
+                            self._log(log, "版本号: " + str(rev) + "\n")
+                            self.root.after(0, lambda r=rev: self._load_and_show_commit_paths(r))
+                        overall_ok = True
+                    else:
+                        self._log(log, "\n--- 提交失败，返回码: " + str(rc) + " ---\n")
+                        overall_ok = False
+
+                self._log(log, "\n" + "=" * 45 + "\n")
+                self._log(log, "全自动流程结束\n")
+
+            except Exception as e:
+                self._log(log, "\n--- 流程异常: " + str(e) + " ---\n")
+                overall_ok = False
+            finally:
+                self.root.after(0, lambda: self._auto_done(overall_ok))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _load_and_show_commit_paths(self, rev):
+        dst = self.checkout_dir.get().strip()
+        if not dst or not os.path.isdir(dst):
+            return
+
+        def run():
+            try:
+                urls, _relative_paths = self._get_revision_urls(dst, rev)
+                if urls:
+                    self.root.after(0, lambda: self._display_commit_paths(urls))
+            except Exception as e:
+                self._log(self.log_auto, "\n[路径导出] 获取提交文件路径失败: " + str(e) + "\n")
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _display_commit_paths(self, urls):
+        self._commit_urls = urls
+        self.txt_paths.config(state=tk.NORMAL)
+        self.txt_paths.delete(1.0, tk.END)
+        self.txt_paths.insert(tk.END, "\n".join(urls))
+        self.txt_paths.config(state=tk.DISABLED)
+        self.lbl_paths_count.config(text="共 " + str(len(urls)) + " 个文件")
+        self.btn_copy_paths.config(state=tk.NORMAL)
+
+    def _copy_commit_paths(self):
+        if not self._commit_urls:
+            return
+        text = "\n".join(self._commit_urls)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.btn_copy_paths.config(text="已复制")
+        self.root.after(2000, lambda: self.btn_copy_paths.config(text="复制文件路径"))
+
+    def _clear_paths_display(self):
+        self._commit_urls = []
+        self.txt_paths.config(state=tk.NORMAL)
+        self.txt_paths.delete(1.0, tk.END)
+        self.txt_paths.config(state=tk.DISABLED)
+        self.lbl_paths_count.config(text="（暂无）")
+        self.btn_copy_paths.config(state=tk.DISABLED, text="复制文件路径")
+
+    def _auto_done(self, ok):
+        self.btn_auto.config(state=tk.NORMAL, text="一键执行：拉取 -> 覆盖 -> 提交")
+        if ok and self._commit_urls:
+            messagebox.showinfo("完成", "全自动流程执行完成！\n提交文件路径已导出。")
+        elif ok:
+            messagebox.showinfo("完成", "全自动流程执行完成！")
+
+    def sync_checkout_to_target(self, *args):
+        self.target_dir.set(self.checkout_dir.get())
+
+
+    def _build_tab5(self, t5):
+        """版本号路径生成 Tab"""
+        self._path_gen = svn_path_generator.SvnPathGeneratorTab(t5)
+        # 共享主程序的 SVN 凭据变量
+        self._path_gen.svn_url = self.svn_url
+        self._path_gen.svn_user = self.svn_user
+        self._path_gen.svn_pass = self.svn_pass
+        self._path_gen.build()
+        t5.columnconfigure(1, weight=1)
+
+    def _build_tab6(self, t6):
+        """标准文件获取 Tab"""
+        self._std_file = svn_standard_file_tab.SvnStandardFileTab(t6, engine=self)
+        # 共享主程序的 SVN 凭据变量
+        self._std_file.svn_user = self.svn_user
+        self._std_file.svn_pass = self.svn_pass
+        self._std_file.build()
+
+if __name__ == "__main__":
+    if not GUI_AVAILABLE:
+        sys.stderr.write("缺少 GUI 依赖（tkinter/ttkbootstrap），无法启动图形界面；终端模式请运行 svn_sync_cli.py\n")
+        sys.exit(1)
+    root = tk.Tk()
+    style = Style(theme="flatly")
+    app = SvnSyncTool(root)
+    if hasattr(app.checkout_dir, "trace_add"):
+        app.checkout_dir.trace_add("write", app.sync_checkout_to_target)
+    else:
+        app.checkout_dir.trace("w", app.sync_checkout_to_target)
+    root.mainloop()

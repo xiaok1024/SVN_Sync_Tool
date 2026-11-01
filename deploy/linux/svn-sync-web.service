@@ -1,0 +1,31 @@
+[Unit]
+Description=LZR 升级工具中心（SVN Sync Web）
+Documentation=https://github.com/xiaok1024/SVN_Sync_Tool
+After=network-online.target svn-sync-mounts.service
+Wants=svn-sync-mounts.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/svn-sync-tool
+# 静态 IP 显式钉死，不依赖 /etc/hosts 的主机名映射；--lan 会在此基础上并入自动探测结果
+Environment=SVN_SYNC_WEB_ALLOWED_HOSTS=192.168.30.178,lzr-ubuntu,127.0.0.1,localhost
+Environment=PYTHONUNBUFFERED=1
+# 来源配置优先读取 /opt/svn-sync-tool/conf/web-sources.toml；服务启动时读取一次。
+# 下面两项仅在该文件不存在时作为旧环境变量兼容配置。
+Environment=SVN_SYNC_WEB_MOUNT_ROOT=/mnt/ecology
+Environment=E9_SMB_CREDENTIALS_FILE=/root/.config/svn_sync_tool/smb-credentials.toml
+# HTTPS 走 8443；8081 保留为 HTTP→HTTPS 跳转并提供 /ca.crt 供首次安装信任
+ExecStart=/opt/svn-sync-tool/.venv-web/bin/python svn_sync_web.py --lan --port 8443 \
+    --ssl-certfile /etc/svn-sync-tool/tls/server.crt \
+    --ssl-keyfile /etc/svn-sync-tool/tls/server.key \
+    --ca-certfile /etc/svn-sync-tool/tls/ca.crt \
+    --redirect-port 8081
+Restart=always
+RestartSec=3
+# 明文 SVN 凭据落在 /root/.config/svn_sync_tool/，随进程属主
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

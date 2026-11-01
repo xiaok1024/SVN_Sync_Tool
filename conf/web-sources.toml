@@ -1,0 +1,61 @@
+# SVN_Sync_Tool Web 来源配置（默认配置）
+#
+# 默认位置：<当前项目>/conf/web-sources.toml，也可用环境变量
+#   SVN_SYNC_WEB_SOURCE_CONFIG 指向其他文件覆盖。
+#
+# 该文件只在 Web 服务启动时读取一次并缓存到进程内：
+#   修改后必须重启 Web 服务（python svn_sync_web.py）才会生效。
+#
+# 安全约束：
+#   - 本文件只保存来源路径和凭据文件路径，绝对不要写入 SVN / SMB 密码；
+#   - SMB 凭据单独放在 smb-credentials.toml，且不得加入 Git；
+#   - 生产环境请把 allowed_svn_prefixes 填成实际仓库前缀，避免任意地址被提交。
+
+[server]
+# Linux 常驻部署使用 SMB 挂载根，多共享按 <mount_root>/<主机>/<共享> 推导；
+# Windows 直接使用盘符或 UNC 时可留空。
+mount_root = ""
+# SMB 凭据文件路径（只写路径）。Windows 直连 UNC 时通常可以留空。
+smb_credentials_file = ""
+# 允许浏览器连接的 SVN 仓库前缀白名单；留空表示不限制（任意 http/https）。
+# 生产环境建议至少配置一条，例如：
+# allowed_svn_prefixes = ["https://svn.example.com/svn/"]
+allowed_svn_prefixes = [
+    "http://10.1.3.12/svn/",
+    "http://10.1.3.12:80/svn/",
+    "https://10.1.3.13/svn/",
+    "https://10.1.3.13:443/svn/",
+]
+
+# 本地导出：SVN 提交成功后，把本次提交的文件复制到本机目录。
+# 目录结构：<export_root>\<分组>\<客户>\ecology\<相对路径>
+# （即客户来源目录去掉共享根和 QC 编号段）
+# 例如客户来源目录
+#   \\192.168.7.215\ECOLOGY_customer\J\J江苏美思德化学股份\QC5081286\ecology
+#   -> D:\work\kbworknew\J\J江苏美思德化学股份\ecology\src\weaver\...
+# export_root 留空则不导出；overwrite=false 时保留已有同名文件。
+[workspace]
+export_root = 'D:\work\kbworknew'
+overwrite = true
+
+# 标准文件共享：默认来源根，标准文件提交与合并工作台都使用它。
+# TOML 单引号是字面量字符串，反斜杠不需要转义。
+[[profiles]]
+id = "e9-default"
+label = "E9 标准文件共享"
+role = "standard"
+# Windows 直接读取 UNC 来源；这是“标准文件来源”，不是本地 SVN 导出目录。
+standard_path = '\\192.168.7.215\ECOLOGY_customer'
+unc_prefix = '\\192.168.7.215\ECOLOGY_customer'
+
+# 历史文件共享：需要历史文件来源时取消下面注释。
+# 不写 extra_unc_prefixes 时，historical 角色默认包含三台历史共享。
+# [[profiles]]
+# id = "historical"
+# label = "E9 历史文件共享"
+# role = "historical"
+# standard_path = '\\192.168.7.108\ECOLOGY_customer'
+# unc_prefix = '\\192.168.7.108\ECOLOGY_customer'
+
+# Windows 盘符写法示例（本目录不存在时可改成实际盘符路径）：
+# standard_path = 'D:\E9标准文件'
