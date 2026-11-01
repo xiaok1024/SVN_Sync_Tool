@@ -1919,13 +1919,27 @@ class StandardJobManager:
         """
         if not self.export_root:
             return
+        # 客户来源目录固定为 共享根\分组\客户\QC编号\ecology。
+        # 本地导出按约定去掉 QC 编号段，落到
+        # <export_root>\<分组>\<客户>\ecology\<相对路径>：
+        #   \\192.168.7.215\ECOLOGY_customer\J\J江苏美思德\QC5081286\ecology
+        #   -> <export_root>\J\J江苏美思德\ecology\<相对路径>
         relative_parts = [
-            part for part in str(job.source_relative or "").split("/") if part
+            part for part in str(job.source_relative or "").split("/")
+            if part and part not in {".", ".."}
         ]
-        segment = relative_parts[-2] if len(relative_parts) >= 2 else job.job_id
-        if not re.fullmatch(r'[^<>:"/\\|?*\x00-\x1f]+', segment):
-            segment = job.job_id
-        target_root = self.export_root / segment / "ecology"
+        qc_index = None
+        if (len(relative_parts) >= 3
+                and re.fullmatch(r"QC\d+", relative_parts[-2], flags=re.I)):
+            qc_index = len(relative_parts) - 2
+        export_parts = [
+            part for index, part in enumerate(relative_parts) if index != qc_index
+        ]
+        if not export_parts or any(
+                not re.fullmatch(r'[^<>":/\\|?*\x00-\x1f]+', part)
+                for part in export_parts):
+            export_parts = [job.job_id]
+        target_root = self.export_root.joinpath(*export_parts)
         try:
             source_root = Path(job.wc_dir).resolve(strict=True)
         except OSError as exc:

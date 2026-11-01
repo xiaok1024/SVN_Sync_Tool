@@ -637,8 +637,14 @@ function updateStandardCounters() {
       ? "空清单 · 全部交集模式" : "该来源必须填写文件清单";
   }
   // 只有标准文件共享支持空清单；其他来源连确认框都不显示
-  standardElements.coverAllConfirmWrap.hidden = !(emptyList && allowsCoverAll);
-  if (!emptyList || !allowsCoverAll) standardElements.coverAllConfirm.checked = false;
+  const showCoverAll = emptyList && allowsCoverAll;
+  standardElements.coverAllConfirmWrap.hidden = !showCoverAll;
+  if (!showCoverAll) {
+    standardElements.coverAllConfirm.checked = false;
+  } else if (!standardElements.coverAllConfirm.dataset.userTouched) {
+    // 默认勾选「清单为空：覆盖全部交集文件」；用户手动取消后本页内不再自动勾回
+    standardElements.coverAllConfirm.checked = true;
+  }
   standardElements.messageCount.textContent = `${standardElements.commitMessage.value.length} / 500`;
 }
 
@@ -1259,7 +1265,10 @@ standardElements.fileList.addEventListener("input", updateStandardCounters);
 // 粘贴任务描述原文后立即清理，用户能看到最终生效的路径
 standardElements.customerPath.addEventListener("paste", () => window.setTimeout(normalizeCustomerPathField, 0));
 standardElements.customerPath.addEventListener("change", normalizeCustomerPathField);
-standardElements.coverAllConfirm.addEventListener("change", clearStandardErrors);
+standardElements.coverAllConfirm.addEventListener("change", () => {
+  standardElements.coverAllConfirm.dataset.userTouched = "1";
+  clearStandardErrors();
+});
 standardElements.copyUrlsButton.addEventListener("click", async () => {
   const count = standardState.resultUrls.length;
   const copied = await copyPlainText(standardState.resultUrls.join("\n"));

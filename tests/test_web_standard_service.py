@@ -1335,7 +1335,7 @@ class StandardJobSafetyTest(unittest.TestCase):
             web_standard_service._parse_workspace_config(
                 {"workspace": {"export_root": "relative/path"}})
 
-    def test_export_committed_files_writes_under_qc_ecology_dir(self):
+    def test_export_committed_files_mirrors_customer_dir_without_qc(self):
         with tempfile.TemporaryDirectory() as root, \
                 tempfile.TemporaryDirectory() as source, \
                 tempfile.TemporaryDirectory() as export_root:
@@ -1350,7 +1350,9 @@ class StandardJobSafetyTest(unittest.TestCase):
                 Path(wc, "src", "A.java").write_text("payload", encoding="utf-8")
                 job.commit_targets = ["src/A.java", "../evil.txt"]
                 manager._export_committed_files(job)
-                exported = Path(export_root, "QC5081286", "ecology", "src", "A.java")
+                # 客户来源目录 J/J江苏美思德化学股份/QC5081286/ecology
+                # 本地导出去掉 QC 编号段 -> <root>/J/J江苏美思德化学股份/ecology/…
+                exported = Path(export_root, "J", "J江苏美思德化学股份", "ecology", "src", "A.java")
                 self.assertEqual(exported.read_text(encoding="utf-8"), "payload")
                 self.assertFalse(Path(export_root, "evil.txt").exists())
                 self.assertFalse(Path(export_root).parent.joinpath("evil.txt").exists())
@@ -1362,7 +1364,7 @@ class StandardJobSafetyTest(unittest.TestCase):
                 tempfile.TemporaryDirectory() as source, \
                 tempfile.TemporaryDirectory() as export_root:
             Path(source, "ecology").mkdir()
-            existing = Path(export_root, "QC5081286", "ecology", "src", "A.java")
+            existing = Path(export_root, "J", "J客户", "ecology", "src", "A.java")
             existing.parent.mkdir(parents=True)
             existing.write_text("old", encoding="utf-8")
             manager = self.make_export_manager(root, source, export_root, overwrite=False)

@@ -28,11 +28,14 @@ allowed_svn_prefixes = [
 ]
 
 # 本地导出：SVN 提交成功后，把本次提交的文件复制到本机目录。
-# 目录结构：<export_root>\<QC编号>\ecology\<相对路径>
-# 例如：D:\work\kbwork\QC5081286\ecology\src\weaver\...
+# 目录结构：<export_root>\<分组>\<客户>\ecology\<相对路径>
+# （即客户来源目录去掉共享根和 QC 编号段）
+# 例如客户来源目录
+#   \\192.168.7.215\ECOLOGY_customer\J\J江苏美思德化学股份\QC5081286\ecology
+#   -> D:\work\kbworknew\J\J江苏美思德化学股份\ecology\src\weaver\...
 # export_root 留空则不导出；overwrite=false 时保留已有同名文件。
 [workspace]
-export_root = 'D:\work\kbwork'
+export_root = 'D:\work\kbworknew'
 overwrite = true
 
 # 标准文件共享：默认来源根，标准文件提交与合并工作台都使用它。

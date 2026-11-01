@@ -667,6 +667,15 @@ class WebSourceSafetyTest(unittest.TestCase):
         # 现有两个复制入口（版本号路径、标准文件提交）都走辅助函数
         self.assertGreaterEqual(javascript.count("await copyPlainText("), 2)
 
+    def test_cover_all_checkbox_defaults_to_checked_until_user_toggles(self):
+        """空清单 + 支持覆盖全部交集的来源，确认框默认勾选；
+        用户手动取消后本页内不再自动勾回，避免误覆盖全部交集。"""
+        root = Path(__file__).resolve().parents[1]
+        javascript = (root / "web" / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("const showCoverAll = emptyList && allowsCoverAll;", javascript)
+        self.assertIn("standardElements.coverAllConfirm.checked = true;", javascript)
+        self.assertIn("standardElements.coverAllConfirm.dataset.userTouched", javascript)
+
     def test_entry_requires_explicit_lan_mode(self):
         root = Path(__file__).resolve().parents[1]
         source = (root / "svn_sync_web.py").read_text(encoding="utf-8")
