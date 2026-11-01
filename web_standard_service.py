@@ -441,6 +441,30 @@ def _parse_source_config(payload, env):
     return tuple(profiles), allowed_svn_prefixes
 
 
+def _parse_workspace_config(payload):
+    """解析 SVN 提交成功后的本地导出配置。
+
+    ``export_root`` 为空表示不导出；该配置与来源列表一样只在服务启动时
+    读取一次，修改配置文件后必须重启 Web 服务才会生效。
+    """
+    if not isinstance(payload, dict):
+        return {"export_root": "", "overwrite": True}
+    workspace = payload.get("workspace", {})
+    if not isinstance(workspace, dict):
+        raise ValueError("来源配置 workspace 必须是 TOML 表")
+    raw_root = str(workspace.get("export_root", "") or "").strip()
+    export_root = ""
+    if raw_root:
+        expanded = os.path.expanduser(raw_root)
+        if not os.path.isabs(expanded):
+            raise ValueError("workspace.export_root 必须配置为绝对路径")
+        export_root = expanded
+    overwrite = workspace.get("overwrite", True)
+    if not isinstance(overwrite, bool):
+        raise ValueError("workspace.overwrite 必须是布尔值")
+    return {"export_root": export_root, "overwrite": overwrite}
+
+
 def _load_legacy_source_profiles(env):
     """旧环境变量兼容路径；仅在未找到来源配置文件时使用。"""
     raw = str(env.get("SVN_SYNC_WEB_SOURCE_PROFILES", "") or "").strip()
@@ -531,12 +555,14 @@ def load_source_config(environ=None, config_path=None, allow_default=True):
         return {
             "profiles": profiles,
             "allowed_svn_prefixes": allowed_svn_prefixes,
+            "workspace": _parse_workspace_config(payload),
             "config_path": str(path),
         }
 
     return {
         "profiles": _load_legacy_source_profiles(env),
         "allowed_svn_prefixes": (),
+        "workspace": _parse_workspace_config({}),
         "config_path": "",
     }
 
@@ -749,6 +775,8 @@ class StandardJobManager:
             require_password_stdin=True,
             engine_factory=WebSvnEngine,
             allow_file_urls=False,
+            export_root=None,
+            export_overwrite=True,
     ):
         self.profiles = {profile.profile_id: profile for profile in (profiles or [])}
         self.temp_root = Path(
@@ -764,6 +792,8 @@ class StandardJobManager:
         self.require_password_stdin = require_password_stdin
         self.engine_factory = engine_factory
         self.allow_file_urls = allow_file_urls
+        self.export_root = Path(export_root) if export_root else None
+        self.export_overwrite = bool(export_overwrite)
         self.jobs = {}
         self._jobs_lock = threading.RLock()
         self._capacity_lock = threading.Lock()
@@ -793,7 +823,13 @@ class StandardJobManager:
         source_config = load_source_config(env, allow_default=True)
         prefixes = (source_config["allowed_svn_prefixes"]
                     or read_allowed_svn_prefixes(env))
-        return cls(source_config["profiles"], allowed_svn_prefixes=prefixes)
+        workspace = source_config.get("workspace") or {}
+        return cls(
+            source_config["profiles"],
+            allowed_svn_prefixes=prefixes,
+            export_root=workspace.get("export_root", ""),
+            export_overwrite=workspace.get("overwrite", True),
+        )
 
     def start(self):
         with self._jobs_lock:
@@ -1875,6 +1911,66 @@ class StandardJobManager:
                 "job_queue_unavailable", "提交队列当前不可用，请重新创建任务", 503) from None
         return self.snapshot(job_id, access_token)
 
+    def _export_committed_files(self, job):
+        """把本次已提交的文件复制到本地导出目录。
+
+        只复制提交清单里真实存在的普通文件；导出失败不回滚 SVN 提交，
+        避免把“提交成功、本地复制失败”误报为提交失败。
+        """
+        if not self.export_root:
+            return
+        relative_parts = [
+            part for part in str(job.source_relative or "").split("/") if part
+        ]
+        segment = relative_parts[-2] if len(relative_parts) >= 2 else job.job_id
+        if not re.fullmatch(r'[^<>:"/\\|?*\x00-\x1f]+', segment):
+            segment = job.job_id
+        target_root = self.export_root / segment / "ecology"
+        try:
+            source_root = Path(job.wc_dir).resolve(strict=True)
+        except OSError as exc:
+            job.diagnostic("export_failed", level=logging.ERROR,
+                           reason="work_copy_missing", **exception_fields(exc))
+            job.event("本地导出失败：临时工作副本已不存在")
+            return
+        exported = 0
+        skipped = 0
+        for relative in job.commit_targets:
+            clean = str(relative or "").replace("\\", "/").strip("/")
+            parts = [part for part in clean.split("/") if part]
+            if not parts or any(part in {".", ".."} for part in parts):
+                skipped += 1
+                continue
+            source = source_root.joinpath(*parts)
+            try:
+                resolved_source = source.resolve(strict=True)
+            except OSError:
+                skipped += 1
+                continue
+            try:
+                inside = os.path.commonpath(
+                    [str(source_root), str(resolved_source)]) == str(source_root)
+            except ValueError:
+                inside = False
+            if not resolved_source.is_file() or not inside:
+                skipped += 1
+                continue
+            target = target_root.joinpath(*parts)
+            try:
+                if target.exists() and not self.export_overwrite:
+                    skipped += 1
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(resolved_source, target)
+            except OSError as exc:
+                skipped += 1
+                job.diagnostic("export_failed", level=logging.ERROR,
+                               path=clean, **exception_fields(exc))
+                continue
+            exported += 1
+        job.event("已导出 %d 个文件到 %s（跳过 %d 个）"
+                  % (exported, target_root, skipped))
+
     def _commit_job(self, job_id):
         job = self.jobs.get(job_id)
         if not job:
@@ -1913,8 +2009,16 @@ class StandardJobManager:
                     job.committed_urls = urls
                     job.committed_paths = paths
                     job.finished_at = time.time()
-                    job.event("SVN 提交成功，临时工作副本正在清理")
+                    job.event("SVN 提交成功")
                     self._clear_credentials(job)
+                try:
+                    self._export_committed_files(job)
+                except Exception as exc:
+                    job.diagnostic("export_failed", level=logging.ERROR,
+                                   **exception_fields(exc))
+                    job.event("本地导出失败；SVN 提交已成功，请手动核对本地目录")
+                with job.lock:
+                    job.event("临时工作副本正在清理")
                     self._delete_job_directory(job)
             except TimeoutError as exc:
                 commit_started = commit_started or bool(

@@ -27,13 +27,21 @@ allowed_svn_prefixes = [
     "https://10.1.3.13:443/svn/",
 ]
 
+# 本地导出：SVN 提交成功后，把本次提交的文件复制到本机目录。
+# 目录结构：<export_root>\<QC编号>\ecology\<相对路径>
+# 例如：D:\work\kbwork\QC5081286\ecology\src\weaver\...
+# export_root 留空则不导出；overwrite=false 时保留已有同名文件。
+[workspace]
+export_root = 'D:\work\kbwork'
+overwrite = true
+
 # 标准文件共享：默认来源根，标准文件提交与合并工作台都使用它。
 # TOML 单引号是字面量字符串，反斜杠不需要转义。
 [[profiles]]
 id = "e9-default"
 label = "E9 标准文件共享"
 role = "standard"
-# Windows 直接读取 UNC 来源；D:\work\kbwork 只有在已复制 QC 内容后才能作为来源根。
+# Windows 直接读取 UNC 来源；这是“标准文件来源”，不是本地 SVN 导出目录。
 standard_path = '\\192.168.7.215\ECOLOGY_customer'
 unc_prefix = '\\192.168.7.215\ECOLOGY_customer'
 

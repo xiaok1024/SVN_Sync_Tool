@@ -1293,6 +1293,111 @@ class StandardJobSafetyTest(unittest.TestCase):
                 manager.stop()
 
 
+
+    def make_export_manager(self, root, source, export_root, overwrite=True):
+        return StandardJobManager(
+            profiles=[SourceProfile("default", "测试来源", standard_path=source)],
+            temp_root=root,
+            min_free_bytes=0,
+            max_root_bytes=1024 * 1024 * 1024,
+            require_password_stdin=False,
+            export_root=export_root,
+            export_overwrite=overwrite,
+        )
+
+    def _make_export_job(self, manager, file_list, source_relative):
+        manager._executor.submit = mock.Mock()
+        created = manager.create_job(
+            svn_url="https://svn.example.com/svn/customer/ecology",
+            username="user",
+            password="password",
+            profile_id="default",
+            file_list=file_list,
+            commit_message="QC5081286 标准文件",
+        )
+        job = manager.jobs[created["task"]["id"]]
+        job.source_relative = source_relative
+        return job
+
+    def test_workspace_config_parses_export_root_and_overwrite(self):
+        with tempfile.TemporaryDirectory() as root:
+            export_root = Path(root, "导出根")
+            workspace = web_standard_service._parse_workspace_config(
+                {"workspace": {"export_root": str(export_root), "overwrite": False}})
+            self.assertEqual(workspace["export_root"], str(export_root))
+            self.assertFalse(workspace["overwrite"])
+            default = web_standard_service._parse_workspace_config({})
+            self.assertEqual(default["export_root"], "")
+            self.assertTrue(default["overwrite"])
+
+    def test_workspace_config_rejects_relative_export_root(self):
+        with self.assertRaisesRegex(ValueError, "绝对路径"):
+            web_standard_service._parse_workspace_config(
+                {"workspace": {"export_root": "relative/path"}})
+
+    def test_export_committed_files_writes_under_qc_ecology_dir(self):
+        with tempfile.TemporaryDirectory() as root, \
+                tempfile.TemporaryDirectory() as source, \
+                tempfile.TemporaryDirectory() as export_root:
+            Path(source, "ecology").mkdir()
+            manager = self.make_export_manager(root, source, export_root)
+            try:
+                job = self._make_export_job(
+                    manager, "src/A.java",
+                    "J/J江苏美思德化学股份/QC5081286/ecology")
+                wc = Path(job.wc_dir)
+                Path(wc, "src").mkdir(parents=True)
+                Path(wc, "src", "A.java").write_text("payload", encoding="utf-8")
+                job.commit_targets = ["src/A.java", "../evil.txt"]
+                manager._export_committed_files(job)
+                exported = Path(export_root, "QC5081286", "ecology", "src", "A.java")
+                self.assertEqual(exported.read_text(encoding="utf-8"), "payload")
+                self.assertFalse(Path(export_root, "evil.txt").exists())
+                self.assertFalse(Path(export_root).parent.joinpath("evil.txt").exists())
+            finally:
+                manager.stop()
+
+    def test_export_committed_files_skips_existing_when_overwrite_disabled(self):
+        with tempfile.TemporaryDirectory() as root, \
+                tempfile.TemporaryDirectory() as source, \
+                tempfile.TemporaryDirectory() as export_root:
+            Path(source, "ecology").mkdir()
+            existing = Path(export_root, "QC5081286", "ecology", "src", "A.java")
+            existing.parent.mkdir(parents=True)
+            existing.write_text("old", encoding="utf-8")
+            manager = self.make_export_manager(root, source, export_root, overwrite=False)
+            try:
+                job = self._make_export_job(
+                    manager, "src/A.java", "J/J客户/QC5081286/ecology")
+                wc = Path(job.wc_dir)
+                Path(wc, "src").mkdir(parents=True)
+                Path(wc, "src", "A.java").write_text("new", encoding="utf-8")
+                job.commit_targets = ["src/A.java"]
+                manager._export_committed_files(job)
+                self.assertEqual(existing.read_text(encoding="utf-8"), "old")
+            finally:
+                manager.stop()
+
+    def test_export_disabled_when_export_root_empty(self):
+        with tempfile.TemporaryDirectory() as root, \
+                tempfile.TemporaryDirectory() as source:
+            Path(source, "ecology").mkdir()
+            manager = self.make_manager(root, source)
+            self.assertIsNone(manager.export_root)
+            try:
+                job = self._make_export_job(
+                    manager, "src/A.java", "J/J客户/QC5081286/ecology")
+                wc = Path(job.wc_dir)
+                Path(wc, "src").mkdir(parents=True)
+                Path(wc, "src", "A.java").write_text("payload", encoding="utf-8")
+                job.commit_targets = ["src/A.java"]
+                manager._export_committed_files(job)
+                self.assertFalse(list(Path(root).glob("QC*")))
+            finally:
+                manager.stop()
+
+
+
 @unittest.skipUnless(shutil.which("svn") and shutil.which("svnadmin"), "需要本机 SVN CLI")
 class StandardJobLocalRepositoryIntegrationTest(unittest.TestCase):
     def test_sparse_allows_custom_and_inherited_properties(self):
