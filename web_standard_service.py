@@ -1657,6 +1657,7 @@ class StandardJobManager:
                 engine = self._new_engine(job)
                 profile = self.profiles[job.profile_id]
                 source_root = self._customer_source_path(job, profile)
+                self._sync_local_checkout(job, engine)
                 revision = None
                 if job.selection_mode == "intersection":
                     revision = get_repository_head_revision(engine, job.svn_url)
@@ -1918,23 +1919,21 @@ class StandardJobManager:
                 "job_queue_unavailable", "提交队列当前不可用，请重新创建任务", 503) from None
         return self.snapshot(job_id, access_token)
 
-    def _export_committed_files(self, job):
-        """把本次已提交的文件复制到本地导出目录。
+    @staticmethod
+    def _local_export_parts(job):
+        r"""按客户来源目录推导本地导出相对路径。
 
-        只复制提交清单里真实存在的普通文件；导出失败不回滚 SVN 提交，
-        避免把“提交成功、本地复制失败”误报为提交失败。
+        客户来源目录固定为 共享根\J\客户\QC编号\ecology，本地按约定去掉 QC 编号段：
+          \\192.168.7.215\ECOLOGY_customer\J\J江苏美思德\QC5081286\ecology
+          -> <export_root>\J\J江苏美思德\ecology
+        无法安全推导时返回空列表。
         """
-        if not self.export_root:
-            return
-        # 客户来源目录固定为 共享根\分组\客户\QC编号\ecology。
-        # 本地导出按约定去掉 QC 编号段，落到
-        # <export_root>\<分组>\<客户>\ecology\<相对路径>：
-        #   \\192.168.7.215\ECOLOGY_customer\J\J江苏美思德\QC5081286\ecology
-        #   -> <export_root>\J\J江苏美思德\ecology\<相对路径>
         relative_parts = [
             part for part in str(job.source_relative or "").split("/")
             if part and part not in {".", ".."}
         ]
+        if not relative_parts:
+            return []
         qc_index = None
         if (len(relative_parts) >= 3
                 and re.fullmatch(r"QC\d+", relative_parts[-2], flags=re.I)):
@@ -1945,7 +1944,82 @@ class StandardJobManager:
         if not export_parts or any(
                 not re.fullmatch(r'[^<>":/\\|?*\x00-\x1f]+', part)
                 for part in export_parts):
-            export_parts = [job.job_id]
+            return []
+        return export_parts
+
+    def _local_export_target(self, job):
+        """返回本地导出根目录，并保证不会越出 export_root。"""
+        if not self.export_root:
+            raise RuntimeError("未配置本地导出根目录")
+        parts = self._local_export_parts(job)
+        if not parts:
+            raise RuntimeError("无法从客户来源目录推导本地导出路径")
+        root = self.export_root.resolve()
+        target = root.joinpath(*parts)
+        try:
+            resolved = target.resolve()
+            inside = os.path.commonpath([str(root), str(resolved)]) == str(root)
+        except (OSError, ValueError):
+            inside = False
+        if not inside:
+            raise RuntimeError("本地导出路径超出配置根目录")
+        return target
+
+    def _sync_local_checkout(self, job, engine):
+        """把本次客户 SVN 目录检出或更新到本地导出目录。
+
+        本地尚未拉取时执行 checkout，已有工作副本时执行 update；
+        不论本次是否需要提交 SVN，都保证本地目录存在且与远程一致。
+        本步骤失败不中断标准文件对比预览，只记录诊断供人工处理；失败信息
+        只保留 SVN 输出，不经由任务错误体暴露服务端路径。
+        """
+        if not self.export_root:
+            return False
+        try:
+            target = Path(self._local_export_target(job))
+        except Exception as exc:
+            job.diagnostic("local_sync_skipped", level=logging.WARNING,
+                           **exception_fields(exc))
+            job.event("本地同步已跳过：无法从客户来源目录推导本地导出路径")
+            return False
+        action = "更新" if (target / ".svn").exists() else "拉取"
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with job.lock:
+                job.stage_label = "正在同步本地 SVN 目录"
+                job.event("正在%s本地目录 %s" % (action, target))
+            if action == "更新":
+                rc, output = engine._run_svn_bytes(
+                    "update", "--ignore-externals", str(target),
+                    force_utf8=True, timeout=600)
+            else:
+                # 目标目录可能已有历史导出的同名文件；--force 让其纳入本地工作副本，
+                # 由 SVN 决定是否需要更新，避免因目录非空而拉取失败。
+                rc, output = engine._run_svn_bytes(
+                    "checkout", "--force", "--ignore-externals",
+                    job.svn_url, str(target), force_utf8=True, timeout=600)
+        except Exception as exc:
+            job.diagnostic("local_sync_failed", level=logging.ERROR,
+                           target=str(target), **exception_fields(exc))
+            job.event("本地%s失败，不影响 SVN 预览与提交" % action)
+            return False
+        if rc != 0:
+            job.diagnostic("local_sync_failed", level=logging.ERROR, target=str(target),
+                           message=(output or "").strip())
+            job.event("本地%s失败，不影响 SVN 预览与提交" % action)
+            return False
+        job.event("本地目录%s完成：%s" % (action, target))
+        return True
+
+    def _export_committed_files(self, job):
+        """把本次已提交的文件复制到本地导出目录。
+
+        只复制提交清单里真实存在的普通文件；导出失败不回滚 SVN 提交，
+        避免把“提交成功、本地复制失败”误报为提交失败。
+        """
+        if not self.export_root:
+            return
+        export_parts = self._local_export_parts(job) or [job.job_id]
         target_root = self.export_root.joinpath(*export_parts)
         try:
             source_root = Path(job.wc_dir).resolve(strict=True)
@@ -2033,6 +2107,7 @@ class StandardJobManager:
                     job.event("SVN 提交成功")
                     self._clear_credentials(job)
                 try:
+                    self._sync_local_checkout(job, engine)
                     self._export_committed_files(job)
                 except Exception as exc:
                     job.diagnostic("export_failed", level=logging.ERROR,

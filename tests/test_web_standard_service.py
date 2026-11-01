@@ -20,6 +20,7 @@ from web_standard_service import (
     DEFAULT_HISTORICAL_UNC_PREFIXES,
     DEFAULT_STANDARD_UNC_PREFIX,
     SourceProfile,
+    StandardJob,
     StandardJobManager,
     StandardWebError,
     WebSvnEngine,
@@ -1183,6 +1184,131 @@ class StandardJobSafetyTest(unittest.TestCase):
                 self.assertEqual(task["cleanup"]["status"], "cleaned")
                 self.assertIsNone(job.password)
                 self.assertFalse(job.job_dir.exists())
+            finally:
+                manager.stop()
+
+    def test_local_sync_checkout_then_update_on_existing_working_copy(self):
+        """本地未拉取时 checkout，已有 .svn 工作副本时改为 update。"""
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as source:
+            Path(source, "ecology").mkdir()
+            export_root = Path(root, "export")
+
+            class RecordingEngine:
+                def __init__(self, cfg):
+                    self.cfg = cfg
+                    self.svn_user = "u"
+                    self.svn_pass = "p"
+                    self.calls = []
+
+                def _run_svn_bytes(self, *args, **kwargs):
+                    self.calls.append(args)
+                    if args and args[0] == "checkout" and len(args) >= 4:
+                        Path(args[-1], ".svn").mkdir(parents=True, exist_ok=True)
+                    return 0, ""
+
+                def release_credentials(self):
+                    pass
+
+            engine = RecordingEngine(None)
+            manager = StandardJobManager(
+                profiles=[SourceProfile("default", "测试来源", standard_path=source)],
+                temp_root=root,
+                min_free_bytes=0,
+                require_password_stdin=False,
+                export_root=str(export_root),
+            )
+            try:
+                def make_job(url, relative):
+                    return StandardJob(
+                        job_id="job-test", access_token_hash="x", created_at=time.time(),
+                        expires_at=time.time() + 60, svn_url=url, username="u", password="p",
+                        profile_id="default", source_relative=relative,
+                        source_unc_prefix=source, selection_mode="listed",
+                        relative_paths=["src/Test.java"], commit_message="QC1",
+                        job_dir=Path(root, "job"), wc_dir=Path(root, "job", "wc"),
+                        config_dir=Path(root, "job", "cfg"))
+
+                first = make_job("https://svn.example.com/svn/J客户",
+                                 "J/J客户/QC123/ecology")
+                self.assertTrue(manager._sync_local_checkout(first, engine))
+                target = export_root / "J" / "J客户" / "ecology"
+                self.assertTrue((target / ".svn").exists())
+                self.assertEqual([c[0] for c in engine.calls], ["checkout"])
+                self.assertIn("--force", engine.calls[0])
+                self.assertEqual(os.path.normcase(os.path.realpath(engine.calls[0][-1])),
+                                 os.path.normcase(os.path.realpath(str(target))))
+
+                second = make_job("https://svn.example.com/svn/J客户",
+                                  "J/J客户/QC123/ecology")
+                self.assertTrue(manager._sync_local_checkout(second, engine))
+                self.assertEqual(engine.calls[-1][0], "update")
+                self.assertEqual(os.path.normcase(os.path.realpath(engine.calls[-1][-1])),
+                                 os.path.normcase(os.path.realpath(str(target))))
+
+                skipped = make_job("https://svn.example.com/svn/x", ".")
+                self.assertFalse(manager._sync_local_checkout(skipped, engine))
+                self.assertEqual(engine.calls[-1][0], "update")
+            finally:
+                manager.stop()
+
+    def test_prepare_job_syncs_local_checkout_even_when_no_changes(self):
+        """即使清单为空、无需提交，也要先把本地目录 checkout 下来。"""
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as source:
+            customer_dir = Path(source, "J", "J客户", "QC123", "ecology")
+            customer_dir.mkdir(parents=True)
+            customer_path = str(customer_dir)
+            export_root = Path(root, "export")
+            holder = {}
+
+            class FakeEngine:
+                def __init__(self, _username, _password, _config):
+                    self.calls = []
+                    holder["engine"] = self
+
+                def _run_svn_bytes(self, *args, **kwargs):
+                    self.calls.append(args)
+                    if args and args[0] == "checkout" and len(args) >= 4:
+                        Path(args[-1], ".svn").mkdir(parents=True, exist_ok=True)
+                    if args and args[0] == "list":
+                        return 0, '<lists><list path="."/></lists>'
+                    if args and args[0] == "info":
+                        return 0, ('<info><entry revision="1"><repository>'
+                                   '<root>x</root><uuid>u</uuid></repository>'
+                                   '</entry></info>')
+                    return 0, ""
+
+                def release_credentials(self):
+                    pass
+
+            manager = StandardJobManager(
+                profiles=[SourceProfile("default", "测试来源", standard_path=source)],
+                temp_root=root,
+                min_free_bytes=0,
+                require_password_stdin=False,
+                engine_factory=FakeEngine,
+                export_root=str(export_root),
+            )
+            try:
+                created = manager.create_job(
+                    svn_url="https://svn.example.com/svn/J客户",
+                    username="user",
+                    password="password",
+                    profile_id="default",
+                    file_list="",
+                    cover_all_confirmed=True,
+                    customer_standard_path=customer_path,
+                    commit_message="QC123456 无变更",
+                )
+                job_id = created["task"]["id"]
+                task = wait_for_job(
+                    manager, job_id, created["task"]["access_token"],
+                    {"no_changes", "failed"},
+                )
+                self.assertEqual(task["status"], "no_changes", task.get("error"))
+                engine = holder["engine"]
+                self.assertEqual([c[0] for c in engine.calls].count("checkout"), 1)
+                target = export_root / "J" / "J客户" / "ecology"
+                self.assertTrue((target / ".svn").exists())
             finally:
                 manager.stop()
 

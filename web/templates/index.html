@@ -594,16 +594,16 @@
               </label>
             </fieldset>
 
-            <div class="panel-actions standard-form-actions">
-              <button class="button button-primary" id="combinedCreateStandardPreviewButton" type="submit" disabled>
-                <span class="button-label" data-default="创建提交预览">创建提交预览</span><span class="button-arrow" aria-hidden="true">→</span>
-              </button>
-              <button class="button button-secondary" id="combinedResetStandardFormButton" type="reset">清空</button>
-            </div>
           </form>
         </article>
 
         <article class="panel standard-task-panel" aria-labelledby="combinedStandard-task-title">
+          <div class="standard-task-actions panel-actions">
+            <button class="button button-primary" form="combinedStandardTaskForm" id="combinedCreateStandardPreviewButton" type="submit" disabled>
+              <span class="button-label" data-default="创建提交预览">创建提交预览</span><span class="button-arrow" aria-hidden="true">→</span>
+            </button>
+            <button class="button button-secondary" form="combinedStandardTaskForm" id="combinedResetStandardFormButton" type="reset">清空</button>
+          </div>
           <div class="panel-heading">
             <div>
               <p class="panel-kicker">TASK</p>

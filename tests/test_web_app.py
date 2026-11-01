@@ -122,6 +122,29 @@ class WebAppApiTest(unittest.TestCase):
         # 客户 SVN 地址落在升级清单提取之后（即下面那个 SVN 连接块里）
         self.assertLess(upgrade_at, combined.index('for="combinedStandardSvnUrl"'))
 
+    def test_combined_page_moves_actions_above_task_status(self):
+        """合并页把创建提交预览/清空按钮放到右侧任务状态面板上方。"""
+        combined = self.client.get("/").text.split(
+            'id="combinedStandardToolView"', 1)[1]
+        panel_at = combined.index(
+            '<article class="panel standard-task-panel" aria-labelledby="combinedStandard-task-title">')
+        create_at = combined.index('id="combinedCreateStandardPreviewButton"')
+        reset_at = combined.index('id="combinedResetStandardFormButton"')
+        status_at = combined.index('id="combinedStandard-task-title"')
+        form_at = combined.index('id="combinedStandardTaskForm"')
+        # 按钮已移出表单，必须依靠 form 属性继续触发表单提交/重置。
+        self.assertLess(form_at, create_at)
+        self.assertIn(
+            'form="combinedStandardTaskForm" id="combinedCreateStandardPreviewButton"',
+            combined)
+        self.assertIn(
+            'form="combinedStandardTaskForm" id="combinedResetStandardFormButton"',
+            combined)
+        # 按钮位于任务状态面板内、任务状态标题之前。
+        self.assertLess(panel_at, create_at)
+        self.assertLess(create_at, reset_at)
+        self.assertLess(reset_at, status_at)
+
     def test_allowed_hosts_only_come_from_loopback_and_environment(self):
         """旧开发机名和测试桩不该写死在生产白名单里。"""
         hosts = web_app._allowed_hosts()
