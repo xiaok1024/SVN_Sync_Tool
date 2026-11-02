@@ -11,8 +11,19 @@ set "HTTPS_PROXY="
 set "NO_PROXY=*"
 set "no_proxy=*"
 
+REM 端口：第一个参数，默认 8765
 set "PORT=%~1"
 if "%PORT%"=="" set "PORT=8765"
+
+REM 局域网开关：第二个参数传 local 则仅本机；默认开放局域网
+set "MODE=%~2"
+if /i "%MODE%"=="local" (
+  set "LAN_ARG="
+  set "BIND_DESC=仅本机（127.0.0.1）"
+) else (
+  set "LAN_ARG=--lan"
+  set "BIND_DESC=局域网（0.0.0.0）"
+)
 
 set "PY=%~dp0.venv-web\Scripts\python.exe"
 if not exist "%PY%" (
@@ -26,14 +37,25 @@ if not exist "%PY%" (
 
 if not exist "%~dp0run" mkdir "%~dp0run"
 
+REM 取本机局域网 IP 用于提示
+set "LANIP="
+for /f "tokens=2 delims=:" %%a in ('ipconfig ^| findstr /c:"IPv4"') do (
+  if not defined LANIP set "LANIP=%%a"
+)
+set "LANIP=%LANIP: =%"
+
 echo ============================================
 echo  SVN Sync Tool Web
-echo  URL : http://127.0.0.1:%PORT%/
-echo  停止: 关闭本窗口 或 运行 stop-web.bat
+echo  监听模式: %BIND_DESC%   端口: %PORT%
+echo.
+echo  本机访问 : http://127.0.0.1:%PORT%/
+if defined LANIP echo  内网访问 : http://%LANIP%:%PORT%/
+echo.
+echo  停止: 关闭本窗口
 echo ============================================
 echo.
 
-"%PY%" svn_sync_web.py --port %PORT% 1>>"%~dp0run\web-console.out.log" 2>>"%~dp0run\web-console.err.log"
+"%PY%" svn_sync_web.py --port %PORT% %LAN_ARG% 1>>"%~dp0run\web-console.out.log" 2>>"%~dp0run\web-console.err.log"
 
 echo.
 echo 服务已退出。日志: %~dp0run
