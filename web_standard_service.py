@@ -68,6 +68,14 @@ MAX_FILE_LINE_BYTES = 8192
 MAX_COMMIT_MESSAGE = 500
 SVN_WC_SIZE_MULTIPLIER = 2
 SVN_WC_FILE_OVERHEAD = 64 * 1024
+# 预览确认环节默认不设时限：preview_ttl <= 0 时视为「永久有效」。
+# 这是本部署的定制点——原始实现固定 15 分钟，等人确认时容易被超时清掉工作副本。
+PREVIEW_TTL_DISABLED = 0
+# 提交排队阶段的独立时限（秒）。与预览时限解耦，避免预览放开后提交排队也无限等待。
+COMMIT_QUEUE_TIMEOUT = 15 * 60
+# 「永久有效」哨兵值（year 2106）。沿用远未来时间戳而非 None，
+# 可让既有的 `time.time() > expires_at` 判断与 _iso() 转换全部无需改动。
+INFINITE_DEADLINE = float(2 ** 32)
 ACTIVE_STATES = {"queued", "preparing", "preview_ready", "commit_queued", "committing"}
 TERMINAL_STATES = {"committed", "no_changes", "failed", "expired", "cancelled", "commit_unknown"}
 DEFAULT_STANDARD_UNC_PREFIX = r"\\192.168.7.215\ECOLOGY_customer"
@@ -778,7 +786,9 @@ class StandardJobManager:
             allowed_svn_prefixes=(),
             max_workers=2,
             max_live_jobs=10,
-            preview_ttl=15 * 60,
+            max_preview_jobs=20,
+            preview_ttl=PREVIEW_TTL_DISABLED,
+            commit_queue_timeout=COMMIT_QUEUE_TIMEOUT,
             result_ttl=24 * 60 * 60,
             cleanup_interval=15,
             min_free_bytes=2 * 1024 * 1024 * 1024,
@@ -795,7 +805,9 @@ class StandardJobManager:
             temp_root or (Path(tempfile.gettempdir()) / "lzr-svn-standard-jobs-v1"))
         self.allowed_svn_prefixes = tuple(prefix.rstrip("/") for prefix in allowed_svn_prefixes if prefix)
         self.max_live_jobs = max_live_jobs
+        self.max_preview_jobs = max_preview_jobs
         self.preview_ttl = preview_ttl
+        self.commit_queue_timeout = commit_queue_timeout
         self.result_ttl = result_ttl
         self.cleanup_interval = cleanup_interval
         self.min_free_bytes = min_free_bytes
@@ -1023,6 +1035,22 @@ class StandardJobManager:
         job.password = None
         job.username = ""
 
+    def _deadline_for(self, state):
+        """给出某个状态下该任务的到期时刻（时间戳）。
+
+        只有**预览就绪、等待人工确认**这一环节返回 ``INFINITE_DEADLINE``，
+        即「人没点确认就一直等着」——这是本部署的定制点。
+
+        准备阶段（queued/preparing）与提交排队阶段（commit_queued/committing）
+        都是服务端在自动干活，一律使用 ``commit_queue_timeout``：
+        否则一旦检出或提交卡死，任务会永久占用执行槽与临时空间。
+        """
+        if state == "preview_ready":
+            if not self.preview_ttl or self.preview_ttl <= 0:
+                return INFINITE_DEADLINE
+            return time.time() + self.preview_ttl
+        return time.time() + self.commit_queue_timeout
+
     def _safe_error_message(self, job, value):
         message = redact_sensitive_text(str(value or ""), (job.password or "",))
         replacements = {
@@ -1144,9 +1172,21 @@ class StandardJobManager:
     def _check_capacity(self):
         self.cleanup_expired()
         with self._jobs_lock:
-            live_count = sum(1 for job in self.jobs.values() if job.state in ACTIVE_STATES)
+            jobs = list(self.jobs.values())
+        # 预览就绪的任务不占执行槽（只占用磁盘与内存），因此不计入
+        # max_live_jobs。否则「预览不再超时」会让堆积的预览永久占满配额，
+        # 导致新任务一律被拒。真正的资源保护交给下方的磁盘检查。
+        live_count = sum(
+            1 for job in jobs
+            if job.state in ACTIVE_STATES and job.state != "preview_ready")
         if live_count >= self.max_live_jobs:
             raise StandardWebError("too_many_jobs", "当前待处理任务较多，请稍后再试", 429)
+        preview_count = sum(1 for job in jobs if job.state == "preview_ready")
+        if preview_count >= self.max_preview_jobs:
+            raise StandardWebError(
+                "too_many_previews",
+                "待确认的提交预览过多（%d 个），请先提交或取消已有预览" % preview_count,
+                429)
         try:
             disk = shutil.disk_usage(self.temp_root)
         except OSError as exc:
@@ -1462,7 +1502,7 @@ class StandardJobManager:
             job_id=job_id,
             access_token_hash=_token_hash(access_token),
             created_at=created_at,
-            expires_at=created_at + self.preview_ttl,
+            expires_at=created_at + self.commit_queue_timeout,
             svn_url=clean_url,
             username=clean_username,
             password=clean_password,
@@ -1794,7 +1834,7 @@ class StandardJobManager:
                             "requested": len(job.relative_paths), "changed": 0,
                             "unchanged": len(unchanged), "missing": len(missing),
                         }
-                        job.expires_at = time.time() + self.preview_ttl
+                        job.expires_at = self._deadline_for("preview_ready")
                         job.event("预览已生成；仅允许两端同时存在的文件，任务未执行覆盖")
                         self._clear_credentials(job)
                         self._delete_job_directory(job)
@@ -1853,7 +1893,7 @@ class StandardJobManager:
                     job.stage_label = "提交预览已就绪"
                     job.progress = 72
                     job.can_commit = True
-                    job.expires_at = time.time() + self.preview_ttl
+                    job.expires_at = self._deadline_for("preview_ready")
                     job.event("提交预览已生成，等待用户确认")
                 if _directory_size(job.job_dir) > self.max_job_bytes:
                     raise RuntimeError("临时工作副本超过单任务容量限制")
@@ -1945,8 +1985,8 @@ class StandardJobManager:
             job.progress = 78
             job.can_commit = False
             # 用户在有效预览内确认后，从此刻起获得完整的一段提交排队时间，
-            # 不沿用可能只剩几秒的预览到期时间。
-            job.expires_at = time.time() + self.preview_ttl
+            # 不沿用预览阶段的到期时间（预览可能是「永久」，不能带进提交队列）。
+            job.expires_at = self._deadline_for("commit_queued")
             job.event("用户已确认预览，提交请求已进入队列")
         try:
             self._executor.submit(self._commit_job, job_id)
@@ -2246,6 +2286,13 @@ class StandardJobManager:
         return self.snapshot(job_id, access_token)
 
     def cleanup_expired(self):
+        """回收到期任务。
+
+        注意：预览就绪的任务其 ``expires_at`` 为 ``INFINITE_DEADLINE``
+        （见 ``_deadline_for``），因此下方的 ``now > job.expires_at`` 永不成立——
+        即「等人确认」阶段不会被超时清理。准备与提交排队阶段仍按
+        ``commit_queue_timeout`` 正常过期。
+        """
         now = time.time()
         remove_ids = []
         with self._jobs_lock:
