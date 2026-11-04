@@ -871,38 +871,86 @@ function applyAutoCustomerPath(text) {
   return true;
 }
 
-/** 从升级清单里挑出命中服务端白名单的客户 SVN 仓库地址。
- *  客户仓库地址 = 白名单前缀 + 前缀后的第一段路径（仓库名）。例如
- *  https://10.1.3.13/svn/J江苏美思德化学股份/src/x/Y.java
- *  -> https://10.1.3.13/svn/J江苏美思德化学股份
+/** 还原升级清单里常见的 URL 转义和不可见空白。 */
+function normalizeCustomerSvnText(value) {
+  return String(value || "")
+    .replace(/[\u200b\u00a0]/g, " ")
+    .replace(/\\\//g, "/")
+    .replace(/\\:/g, ":");
+}
+
+/** 从任意 SVN 文件 URL 中提取 /svn/<仓库名> 的仓库名。 */
+function extractCustomerSvnRepository(value) {
+  const match = normalizeCustomerSvnText(value)
+    .match(/https?:\/\/[^/\s"'<>|)]+\/svn\/([^/\s"'<>|?#)]+)/i);
+  return match ? match[1] : "";
+}
+
+/** 从服务端白名单中挑选与清单 URL 同协议、且未显式写默认端口的地址。 */
+function pickCustomerSvnPrefix(value) {
+  const prefixes = (standardState.allowedSvnPrefixes || []).filter(Boolean);
+  if (!prefixes.length) return "";
+  let sourceProtocol = "";
+  try {
+    const sourceMatch = normalizeCustomerSvnText(value)
+      .match(/https?:\/\/[^/\s"'<>|)]+\/svn\//i);
+    if (sourceMatch) sourceProtocol = new URL(sourceMatch[0]).protocol;
+  } catch (_error) {
+    return "";
+  }
+  if (!sourceProtocol) return "";
+  const sameScheme = prefixes.filter((prefix) => {
+    try {
+      return new URL(String(prefix)).protocol === sourceProtocol;
+    } catch (_error) {
+      return false;
+    }
+  });
+  if (!sameScheme.length) return "";
+  return sameScheme.find((prefix) => {
+    try {
+      return !new URL(String(prefix)).port;
+    } catch (_error) {
+      return false;
+    }
+  }) || sameScheme[0];
+}
+
+/** 从升级清单里挑出客户 SVN 仓库地址。
+ *  优先匹配服务端白名单；若清单使用其他 IP，则按 /svn/<仓库名> 自动替换为
+ *  同协议的白名单地址。例如：
+ *  https://192.168.0.71/svn/F福建路港/docs/index.jsp
+ *  -> https://10.1.3.13/svn/F福建路港
  *  升级清单里常出现 https\:// 这类转义写法，这里先还原成 https:// */
 function extractCustomerSvnUrl(value) {
   const prefixes = (standardState.allowedSvnPrefixes || []).filter(Boolean);
   if (!prefixes.length) return "";
-  const raw = String(value || "")
-    .replace(/[\u200b\u00a0]/g, " ")
-    .replace(/\\\//g, "/")
-    .replace(/\\:/g, ":");
+  const raw = normalizeCustomerSvnText(value);
   const haystack = raw.toLowerCase();
   const ordered = prefixes.slice().sort((left, right) => right.length - left.length);
   for (const prefix of ordered) {
-    const needle = String(prefix).toLowerCase();
+    const normalizedPrefix = String(prefix).replace(/\/+$/, "");
+    const needle = normalizedPrefix.toLowerCase();
     let from = 0;
     while (true) {
       const index = haystack.indexOf(needle, from);
       if (index < 0) break;
-      const rest = raw.slice(index + prefix.length);
+      const rest = raw.slice(index + normalizedPrefix.length);
       if (rest.startsWith("/")) {
         let segment = rest.slice(1).split("/")[0] || "";
         segment = segment.split(/[\\?#\s"'<>|)]/, 1)[0] || "";
         if (segment && segment !== "." && segment !== "..") {
-          return `${prefix}/${segment}`;
+          return `${normalizedPrefix}/${segment}`;
         }
       }
       from = index + needle.length;
     }
   }
-  return "";
+  const repository = extractCustomerSvnRepository(raw);
+  const replacementPrefix = pickCustomerSvnPrefix(raw);
+  return repository && replacementPrefix
+    ? `${replacementPrefix.replace(/\/+$/, "")}/${repository}`
+    : "";
 }
 
 /** 粘贴升级清单时自动填写客户 SVN 地址；用户手动改过的值不会被覆盖。 */
